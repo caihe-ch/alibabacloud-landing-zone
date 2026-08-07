@@ -48,11 +48,13 @@ scripts/plan-upgrade.sh \
   --env-file "$CANDIDATE_ENV"
 
 TARGET_COMMIT=$(jq -r '.upgrade.toCommit' "$MANIFEST")
+PROJECT_PREFIX=$(git -C "$SOURCE" rev-parse --show-prefix)
 git -C "$SOURCE" worktree add --detach "$TARGET_WORKTREE" "$TARGET_COMMIT"
+TARGET_SOURCE="$TARGET_WORKTREE/${PROJECT_PREFIX%/}"
 
 scripts/build-release.sh \
   --manifest "$MANIFEST" \
-  --source-dir "$TARGET_WORKTREE" \
+  --source-dir "$TARGET_SOURCE" \
   --output-dir "$RELEASE_DIR"
 
 scripts/initialize-and-verify.sh runtime-config \
@@ -92,7 +94,10 @@ scripts/initialize-and-verify.sh acceptance --manifest "$MANIFEST"
 scripts/sanitize-evidence.sh --input "$MANIFEST" --output "$SANITIZED_REPORT"
 ```
 
-Do not run the new-deployment `database` or `business-init` subcommands during
+`SOURCE` is the AutoWonder project directory. It may be a standalone repository
+root or a monorepo subdirectory; the project-relative path is preserved in the
+detached target worktree. Do not run the new-deployment `database` or
+`business-init` subcommands during
 an upgrade. Remove the temporary target worktree only after its build and hashes
 are recorded; keep the sealed release until acceptance and rollback retention
 requirements are satisfied.
@@ -175,9 +180,10 @@ V2__description.sql
 V3__description.sql
 ```
 
-`V` is uppercase, the numeric version is unique and strictly increasing, and a
-merged migration is never modified, renamed, or deleted. Only migrations added
-between the active and target commits are eligible for the upgrade.
+`V` is uppercase, the positive numeric version is unique and strictly
+increasing, and optional zero padding such as `V036` is accepted. A merged
+migration is never modified, renamed, or deleted. Only migrations added between
+the active and target commits are eligible for the upgrade.
 
 Before confirmation, report for every new migration:
 

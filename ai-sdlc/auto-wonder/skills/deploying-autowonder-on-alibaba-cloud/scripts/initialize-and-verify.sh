@@ -227,7 +227,7 @@ trap release_lock EXIT"
 
     while IFS= read -r migration; do
       version=$(jq -er '.version | select(type == "number" and . > 0 and floor == .)' <<<"$migration") || die "invalid migration version"
-      file=$(jq -er '.file | select(test("^docs/migration/V[1-9][0-9]*__[a-z0-9]+(?:_[a-z0-9]+)*\\.sql$"))' <<<"$migration") || die "invalid migration file"
+      file=$(jq -er '.file | select(test("^docs/migration/V0*[1-9][0-9]*__[a-z0-9]+(?:_[a-z0-9]+)*\\.sql$"))' <<<"$migration") || die "invalid migration file"
       expected_sha=$(jq -er '.sha256 | select(test("^[0-9a-f]{64}$"))' <<<"$migration") || die "invalid migration checksum"
       filename=${file##*/}
       migration_remote+="
