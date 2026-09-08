@@ -14,6 +14,7 @@ import com.aliyun.autowonder.dispatch.DispatchPauseService;
 import com.aliyun.autowonder.dispatch.HandoffResult;
 import com.aliyun.autowonder.dispatch.HandoffService;
 import com.aliyun.autowonder.executor.ExecutorService;
+import com.aliyun.autowonder.executor.ProviderModelCatalogService;
 import com.aliyun.autowonder.guidance.GuidanceService;
 import com.aliyun.autowonder.guidance.InteractionWorkflowService;
 import com.aliyun.autowonder.skill.RuntimeMcpConnectionTestService;
@@ -45,10 +46,16 @@ public class InboundFrameRouter {
     private final ExecutorService executorService;
     private ScheduledTaskCapabilityGuard capabilityGuard;
     private ConversationTurnEventService conversationTurnEventService;
+    private ProviderModelCatalogService providerModelCatalogService;
 
     @Autowired(required = false)
     public void setConversationTurnEventService(ConversationTurnEventService service) {
         this.conversationTurnEventService = service;
+    }
+
+    @Autowired(required = false)
+    public void setProviderModelCatalogService(ProviderModelCatalogService service) {
+        this.providerModelCatalogService = service;
     }
 
     @Autowired
@@ -172,8 +179,9 @@ public class InboundFrameRouter {
                 if (executorService != null) {
                     executorService.persistHeartbeatIfNeeded(es.getExecutorId(), es.getTenantId());
                 }
+                java.util.List<Long> reportedRunningDispatchIds = runningDispatchIds(json);
                 dispatchService.renewActiveLeases(es.getTenantId(), es.getExecutorId(),
-                        runningDispatchIds(json));
+                        reportedRunningDispatchIds);
                 drainScheduler.request(es.getAgentId());
                 if (agentConversationService != null && activeConversationTurnIds != null) {
                     if (es.consumeReplacementRecoveryPending()) {
@@ -183,6 +191,10 @@ public class InboundFrameRouter {
                         agentConversationService.recoverStaleTurnsForExecutor(es.getTenantId(),
                                 es.getExecutorId(), activeConversationTurnIds);
                     }
+                }
+                if (providerModelCatalogService != null && reportedRunningDispatchIds != null
+                        && reportedRunningDispatchIds.isEmpty()) {
+                    providerModelCatalogService.requestRefreshForExecutor(es.getExecutorId());
                 }
                 break;
             case "TASK_ACK":
@@ -391,6 +403,11 @@ public class InboundFrameRouter {
                                             json.getJSONArray("tools").toJavaList(java.util.Map.class));
                 }
                 break;
+            case "QODER_MODEL_CATALOG_RESULT":
+                if (providerModelCatalogService != null) {
+                    providerModelCatalogService.complete(es.getTenantId(), es.getExecutorId(), json);
+                }
+                break;
             case "ARTIFACT_UPLOADED":
                 log.info("inbound ARTIFACT_UPLOADED dispatchId={} name={} type={}",
                         json.getLong("dispatchId"), json.getString("name"), json.getString("artifactType"));
@@ -467,16 +484,24 @@ public class InboundFrameRouter {
     }
 
     private java.util.List<Long> runningDispatchIds(JSONObject json) {
-        java.util.List<Long> ids = new java.util.ArrayList<>();
-        com.alibaba.fastjson.JSONArray raw = json.getJSONArray("runningDispatchIds");
-        if (raw == null) {
-            return ids;
+        if (!json.containsKey("runningDispatchIds")) {
+            return null;
         }
-        for (int i = 0; i < raw.size() && ids.size() < 50; i++) {
-            Long id = raw.getLong(i);
-            if (id != null) {
-                ids.add(id);
+        Object value = json.get("runningDispatchIds");
+        if (!(value instanceof com.alibaba.fastjson.JSONArray raw)) {
+            return null;
+        }
+        java.util.List<Long> ids = new java.util.ArrayList<>();
+        for (int i = 0; i < raw.size() && i < 50; i++) {
+            Object valueAtIndex = raw.get(i);
+            if (!(valueAtIndex instanceof Number number)) {
+                return null;
             }
+            long id = number.longValue();
+            if (id <= 0) {
+                return null;
+            }
+            ids.add(id);
         }
         return ids;
     }

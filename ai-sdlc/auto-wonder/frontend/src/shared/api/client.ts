@@ -78,6 +78,10 @@ function isAuthEntryRequest(config?: InternalAxiosRequestConfig): boolean {
 }
 
 async function synchronizeWorkspaceAfterFailure(code: string): Promise<void> {
+  if (code === ErrorCodes.ORG_DELETED_OR_DISABLED) {
+    leaveUnusableWorkspace();
+    return;
+  }
   if (code === ErrorCodes.WORKSPACE_NOT_MEMBER) {
     await refreshCurrentMembership();
     return;
@@ -90,13 +94,16 @@ async function synchronizeWorkspaceAfterFailure(code: string): Promise<void> {
 let refreshPromise: Promise<string | null> | null = null;
 
 async function performRefresh(): Promise<string | null> {
-  const rt = useAuthStore.getState().refreshToken;
+  const { refreshToken: rt, currentWorkspace } = useAuthStore.getState();
   if (!rt) return null;
   try {
     const resp = await fetch('/api/auth/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken: rt }),
+      // The workspace lives as a claim inside the access token, so it must be re-declared here.
+      // Otherwise the refreshed token is detached from the workspace, the next workspace-scoped
+      // call returns WORKSPACE_NOT_MEMBER, and RouteGuard bounces the user to /workspaces.
+      body: JSON.stringify({ refreshToken: rt, workspaceId: currentWorkspace?.id ?? null }),
     });
     if (!resp.ok) return null;
     const body = await resp.json();
@@ -126,6 +133,28 @@ function redirectToLogin(): void {
     // jsdom may throw "Not implemented: navigation" or "Invalid base URL"
     // when assigning a relative href — safe to ignore in tests.
   }
+}
+
+function redirectToWorkspaceSelect(): void {
+  try {
+    const loc = (typeof window !== 'undefined' ? window.location : null) as
+      | { pathname?: string; href?: string }
+      | null;
+    if (!loc || loc.pathname === '/workspaces') return;
+    loc.href = '/workspaces';
+  } catch {
+    // Same jsdom navigation caveat as redirectToLogin.
+  }
+}
+
+// F6.3: the workspace this access token was issued for is deleted or disabled, so every
+// workspace-scoped call from here on is rejected. Dropping the binding also stops the next
+// refresh from re-declaring a dead workspaceId. The tokens themselves stay: RouteGuard would
+// send a tokenless user to /login rather than to the select page, and /api/workspaces/mine is
+// exempt from the workspace check, so the select page still renders and the user can re-enter.
+function leaveUnusableWorkspace(): void {
+  useAuthStore.getState().clearCurrentWorkspace();
+  redirectToWorkspaceSelect();
 }
 
 async function handleUnauthorized(

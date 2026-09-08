@@ -120,6 +120,190 @@ class DispatchServiceRecoveryTest {
         verify(dispatchDao, never()).insert(any());
     }
 
+    @Test
+    void terminalInteractionDispatchDoesNotBlockContinueOfLatestFormalExecution() {
+        DispatchDO source = dispatch(55L, DispatchStatus.FAILED, 2);
+        DispatchDO interaction = dispatch(57L, DispatchStatus.SUCCEEDED, 1);
+        interaction.setResumeMode("COMMENT_INTERACTION");
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source, interaction));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:55")).thenReturn(null);
+        when(dispatchDao.findMaxAttempt(100L, 200L, 300L)).thenReturn(2);
+        doAnswer(invocation -> {
+            DispatchDO inserted = invocation.getArgument(0);
+            inserted.setId(56L);
+            return null;
+        }).when(dispatchDao).insert(any(DispatchDO.class));
+
+        DispatchDO recovery = service.continueDispatch(100L, 200L, 55L, 9L);
+
+        assertEquals(55L, recovery.getResumeFromDispatchId());
+        assertEquals("continue:55", recovery.getIdempotencyKey());
+    }
+
+    @Test
+    void sameStepStaleRowForwardsContinueToLatestFailedRework() {
+        DispatchDO stale = dispatch(55L, DispatchStatus.FAILED, 2);
+        DispatchDO rework = dispatch(58L, DispatchStatus.FAILED, 3);
+        rework.setResumeMode("COMMENT_REWORK");
+        when(dispatchDao.findById(55L)).thenReturn(stale);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(stale, rework));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:58")).thenReturn(null);
+        when(dispatchDao.findMaxAttempt(100L, 200L, 300L)).thenReturn(3);
+        doAnswer(invocation -> {
+            DispatchDO inserted = invocation.getArgument(0);
+            inserted.setId(59L);
+            return null;
+        }).when(dispatchDao).insert(any(DispatchDO.class));
+
+        DispatchDO recovery = service.continueDispatch(100L, 200L, 55L, 9L);
+
+        assertEquals(58L, recovery.getResumeFromDispatchId());
+        assertEquals("continue:58", recovery.getIdempotencyKey());
+        assertEquals(4, recovery.getAttempt());
+        verify(dispatchDao, never()).updateStatus(eq(55L), anyLong(), anyString(),
+                any(), any(), any(), any(), any(), anyInt(), anyLong());
+    }
+
+    @Test
+    void staleNonTerminalInteractionBehindNewerFormalDispatchDoesNotBlockContinue() {
+        DispatchDO source = dispatch(55L, DispatchStatus.FAILED, 2);
+        DispatchDO stuckInteraction = dispatch(57L, DispatchStatus.PAUSED, 1);
+        stuckInteraction.setResumeMode("COMMENT_INTERACTION");
+        DispatchDO rework = dispatch(58L, DispatchStatus.FAILED, 3);
+        rework.setResumeMode("COMMENT_REWORK");
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source, stuckInteraction, rework));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:58")).thenReturn(null);
+        when(dispatchDao.findMaxAttempt(100L, 200L, 300L)).thenReturn(3);
+        doAnswer(invocation -> {
+            DispatchDO inserted = invocation.getArgument(0);
+            inserted.setId(59L);
+            return null;
+        }).when(dispatchDao).insert(any(DispatchDO.class));
+
+        DispatchDO recovery = service.continueDispatch(100L, 200L, 55L, 9L);
+
+        assertEquals(58L, recovery.getResumeFromDispatchId());
+    }
+
+    @Test
+    void forwardingConvergesOnExistingRecoveryOfLatestExecution() {
+        DispatchDO stale = dispatch(55L, DispatchStatus.FAILED, 2);
+        DispatchDO rework = dispatch(58L, DispatchStatus.FAILED, 3);
+        rework.setResumeMode("COMMENT_REWORK");
+        when(dispatchDao.findById(55L)).thenReturn(stale);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(stale, rework));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:58"))
+                .thenReturn(dispatch(59L, DispatchStatus.PENDING, 4));
+
+        DispatchDO recovery = service.continueDispatch(100L, 200L, 55L, 9L);
+
+        assertEquals(59L, recovery.getId());
+        verify(dispatchDao, never()).insert(any());
+    }
+
+    @Test
+    void crossStepStaleRowContinueRejectedWithLatestDispatchInfo() {
+        DispatchDO stale = dispatch(55L, DispatchStatus.FAILED, 2);
+        DispatchDO newer = dispatch(58L, DispatchStatus.FAILED, 1);
+        newer.setSdlcStepId(400L);
+        when(dispatchDao.findById(55L)).thenReturn(stale);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(stale, newer));
+
+        com.aliyun.autowonder.common.error.BizException error =
+                assertThrows(com.aliyun.autowonder.common.error.BizException.class,
+                        () -> service.continueDispatch(100L, 200L, 55L, 9L));
+
+        assertEquals("10409", error.getCode());
+        assertTrue(error.getMessage().contains("dispatchId=58"), error.getMessage());
+        assertTrue(error.getMessage().contains("stepId=400"), error.getMessage());
+    }
+
+    @Test
+    void inFlightInteractionBlocksContinue() {
+        DispatchDO source = dispatch(55L, DispatchStatus.FAILED, 2);
+        DispatchDO interaction = dispatch(57L, DispatchStatus.RUNNING, 1);
+        interaction.setResumeMode("COMMENT_INTERACTION");
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source, interaction));
+
+        com.aliyun.autowonder.common.error.BizException error =
+                assertThrows(com.aliyun.autowonder.common.error.BizException.class,
+                        () -> service.continueDispatch(100L, 200L, 55L, 9L));
+
+        assertEquals("10409", error.getCode());
+        assertTrue(error.getMessage().contains("正在处理评论交互"), error.getMessage());
+    }
+
+    @Test
+    void continueRejectsWhenResolvedTargetAlreadySucceeded() {
+        DispatchDO source = dispatch(55L, DispatchStatus.SUCCEEDED, 2);
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:55")).thenReturn(null);
+
+        com.aliyun.autowonder.common.error.BizException error =
+                assertThrows(com.aliyun.autowonder.common.error.BizException.class,
+                        () -> service.continueDispatch(100L, 200L, 55L, 9L));
+
+        assertTrue(error.getMessage().contains("仍在线或已成功"), error.getMessage());
+        verify(dispatchDao, never()).insert(any());
+    }
+
+    @Test
+    void continueRejectsWhenTargetCancelTransitionLosesCasRace() {
+        DispatchDO source = dispatch(55L, DispatchStatus.RUNNING, 1);
+        source.setGmtModified(new Date(System.currentTimeMillis() - 180_000L));
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:55")).thenReturn(null);
+        when(dispatchDao.updateStatus(eq(55L), eq(100L), eq(DispatchStatus.CANCELED),
+                any(), any(), any(), any(), eq(DispatchFailureReason.MANUAL_CONTINUE),
+                eq(0), anyLong())).thenReturn(0);
+
+        com.aliyun.autowonder.common.error.BizException error =
+                assertThrows(com.aliyun.autowonder.common.error.BizException.class,
+                        () -> service.continueDispatch(100L, 200L, 55L, 9L));
+
+        assertTrue(error.getMessage().contains("执行状态已变化"), error.getMessage());
+        verify(dispatchDao, never()).insert(any());
+    }
+
+    @Test
+    void interactionSourceStillContinuesWhenItIsTheLatestExecution() {
+        DispatchDO source = dispatch(55L, DispatchStatus.FAILED, 1);
+        source.setResumeMode("COMMENT_INTERACTION");
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source));
+        when(dispatchDao.findByIdempotencyKey(100L, "continue:55")).thenReturn(null);
+        when(dispatchDao.findMaxAttempt(100L, 200L, 300L)).thenReturn(1);
+        doAnswer(invocation -> {
+            DispatchDO inserted = invocation.getArgument(0);
+            inserted.setId(56L);
+            return null;
+        }).when(dispatchDao).insert(any(DispatchDO.class));
+
+        DispatchDO recovery = service.continueDispatch(100L, 200L, 55L, 9L);
+
+        assertEquals(55L, recovery.getResumeFromDispatchId());
+    }
+
+    @Test
+    void interactionSourceStillRejectedWhenNotLatest() {
+        DispatchDO source = dispatch(55L, DispatchStatus.FAILED, 1);
+        source.setResumeMode("COMMENT_INTERACTION");
+        DispatchDO newer = dispatch(57L, DispatchStatus.FAILED, 2);
+        when(dispatchDao.findById(55L)).thenReturn(source);
+        when(dispatchDao.listByWorkitem(100L, 200L)).thenReturn(List.of(source, newer));
+
+        com.aliyun.autowonder.common.error.BizException error =
+                assertThrows(com.aliyun.autowonder.common.error.BizException.class,
+                        () -> service.continueDispatch(100L, 200L, 55L, 9L));
+
+        assertTrue(error.getMessage().contains("最新一次执行"), error.getMessage());
+    }
+
     private DispatchDO dispatch(long id, String status, int attempt) {
         DispatchDO dispatch = new DispatchDO();
         dispatch.setId(id);

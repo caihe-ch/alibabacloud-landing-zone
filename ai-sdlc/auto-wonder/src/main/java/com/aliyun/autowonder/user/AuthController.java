@@ -41,7 +41,8 @@ public class AuthController {
 
     @PostMapping("/refresh")
     public Result<RefreshResponse> refresh(@RequestBody RefreshRequest req) {
-        String accessToken = userService.refreshAccessToken(req.getRefreshToken());
+        String accessToken = userService.refreshAccessToken(
+                req.getRefreshToken(), req.getWorkspaceId());
         return Result.ok(new RefreshResponse(accessToken));
     }
 }

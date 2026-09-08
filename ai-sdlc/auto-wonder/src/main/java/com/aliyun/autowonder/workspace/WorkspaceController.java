@@ -14,8 +14,11 @@ import com.aliyun.autowonder.workspace.dto.CurrentMembershipVO;
 import com.aliyun.autowonder.workspace.dto.MemberCandidateVO;
 import com.aliyun.autowonder.workspace.dto.MemberVO;
 import com.aliyun.autowonder.workspace.dto.RejectAccessRequestBody;
+import com.aliyun.autowonder.workspace.dto.RecycleBinItemVO;
+import com.aliyun.autowonder.workspace.dto.RestoreWorkspaceRequest;
 import com.aliyun.autowonder.workspace.dto.SubmitAccessRequestBody;
 import com.aliyun.autowonder.workspace.dto.WorkspaceListItemVO;
+import com.aliyun.autowonder.workspace.dto.WorkspaceUpdateRequest;
 import com.aliyun.autowonder.workspace.dto.WorkspaceVO;
 import com.aliyun.autowonder.workspace.dto.SwitchWorkspaceResponse;
 import com.aliyun.autowonder.workspace.dto.TransferOwnerRequest;
@@ -69,6 +72,37 @@ public class WorkspaceController {
         int p = Math.max(page, 1);
         int sz = Math.min(Math.max(size, 1), 100);
         return Result.ok(accessRequestService.listAll(keyword, p, sz, currentUserId()));
+    }
+
+    // No @RequireWorkspaceAccess on any of the four lifecycle endpoints below: that aspect checks
+    // the caller's *token* workspace, and after a delete the token points at a workspace that no
+    // longer passes AuthFilter. Restore and the recycle bin would be permanently unreachable, so
+    // permission is enforced by the service against the *target* workspace's owner_id and members.
+    @PutMapping("/{id}")
+    public Result<WorkspaceVO> update(
+            @PathVariable("id") Long id,
+            @RequestBody WorkspaceUpdateRequest req) {
+        return Result.ok(workspaceService.updateWorkspace(id, req, currentUserId()));
+    }
+
+    @DeleteMapping("/{id}")
+    public Result<WorkspaceVO> delete(@PathVariable("id") Long id) {
+        return Result.ok(workspaceService.deleteWorkspace(id, currentUserId()));
+    }
+
+    @GetMapping("/recycle-bin")
+    public Result<PageResult<RecycleBinItemVO>> recycleBin(
+            @RequestParam(value = "keyword", required = false) String keyword,
+            @RequestParam(value = "page", defaultValue = "1") int page,
+            @RequestParam(value = "size", defaultValue = "20") int size) {
+        return Result.ok(workspaceService.pageRecycleBin(keyword, page, size, currentUserId()));
+    }
+
+    @PostMapping("/{id}/restore")
+    public Result<WorkspaceVO> restore(
+            @PathVariable("id") Long id,
+            @RequestBody(required = false) RestoreWorkspaceRequest req) {
+        return Result.ok(workspaceService.restoreWorkspace(id, req, currentUserId()));
     }
 
     @PostMapping("/{id}/access-requests")

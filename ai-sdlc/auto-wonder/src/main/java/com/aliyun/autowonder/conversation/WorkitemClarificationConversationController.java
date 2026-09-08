@@ -7,6 +7,7 @@ import com.aliyun.autowonder.context.AutoWonderContext;
 import com.aliyun.autowonder.conversation.dto.ClarificationConversationRequest;
 import com.aliyun.autowonder.conversation.dto.ClarificationConversationVO;
 import com.aliyun.autowonder.conversation.dto.ClarificationTurnRequest;
+import com.aliyun.autowonder.conversation.dto.ElicitationReplyRequest;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -81,6 +82,34 @@ public class WorkitemClarificationConversationController {
         long tenantId = currentWorkspaceId();
         service.cancelTurn(tenantId, workitemId, conversationId, turnId);
         return Result.ok(null);
+    }
+
+    /** 回答会驱动挂起的 Agent 继续本轮，属于写操作。 */
+    @PostMapping("/{conversationId}/elicitations/{requestId}/reply")
+    @RequireWorkspaceAccess(value = WorkspaceAccessLevel.READ_WRITE, action = "回答工单澄清问题卡片")
+    public Result<Void> replyElicitation(
+            @PathVariable Long workitemId,
+            @PathVariable Long conversationId,
+            @PathVariable String requestId,
+            @RequestBody ElicitationReplyRequest request) {
+        long tenantId = currentWorkspaceId();
+        service.replyElicitation(tenantId, workitemId, conversationId, requestId,
+                request.getAction(), request.getContent());
+        return Result.ok(null);
+    }
+
+    /**
+     * 按轮次取全事件，供历史轮次「查看执行详情」按需加载。
+     * 现有 GET /events 只支持 afterId 且上限 200，无法按轮次取全。
+     */
+    @GetMapping("/{conversationId}/turns/{turnId}/events")
+    public Result<List<AgentConversationTurnEventDO>> turnEvents(
+            @PathVariable Long workitemId,
+            @PathVariable Long conversationId,
+            @PathVariable Long turnId) {
+        long tenantId = currentWorkspaceId();
+        service.verifyConversationBelongsToWorkitem(tenantId, workitemId, conversationId);
+        return Result.ok(turnEventService.listEventsByTurn(tenantId, conversationId, turnId));
     }
 
     private long currentWorkspaceId() {

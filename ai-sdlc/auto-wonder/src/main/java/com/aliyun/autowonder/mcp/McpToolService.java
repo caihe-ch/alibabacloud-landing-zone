@@ -24,6 +24,13 @@ import com.aliyun.autowonder.dispatch.DispatchDao;
 import com.aliyun.autowonder.dispatch.DispatchPauseService;
 import com.aliyun.autowonder.dispatch.DispatchRuntimeEventDao;
 import com.aliyun.autowonder.dispatch.ExecutionSourceType;
+import com.aliyun.autowonder.executor.ExecutorLaunchCommandService;
+import com.aliyun.autowonder.executor.ExecutorLaunchOptionsService;
+import com.aliyun.autowonder.executor.ExecutorService;
+import com.aliyun.autowonder.executor.dto.CreateExecutorRequest;
+import com.aliyun.autowonder.executor.dto.CreatedExecutorVO;
+import com.aliyun.autowonder.executor.dto.ExecutorVO;
+import com.aliyun.autowonder.executor.dto.IssuedExecutorVO;
 import com.aliyun.autowonder.guidance.GuidanceService;
 import com.aliyun.autowonder.audit.AuditLogRecord;
 import com.aliyun.autowonder.audit.AuditLogService;
@@ -110,6 +117,7 @@ public class McpToolService {
     private static final String LIST_WORKITEM_COMMENTS = "autowonder.list_workitem_comments";
     private static final String UPLOAD_WORKITEM_DOCUMENT = "autowonder.upload_workitem_document";
     private static final String WORKITEM_CLI_UPLOAD_TOKEN = "autowonder.workitem_cli_upload_token";
+    private static final String WORKITEM_CLI_DOWNLOAD_TOKEN = "autowonder.workitem_cli_download_token";
     private static final String LIST_WORKITEM_DOCUMENTS = "autowonder.list_workitem_documents";
     private static final String DELETE_WORKITEM_DOCUMENT = "autowonder.delete_workitem_document";
     private static final String TRANSITION_WORKITEM = "autowonder.transition_workitem";
@@ -183,6 +191,25 @@ public class McpToolService {
     private static final String TRANSITION_SCHEDULED_TASK = "autowonder.transition_scheduled_task";
     private static final String GET_SCHEDULED_TASK_RUN = "autowonder.get_scheduled_task_run";
     private static final String ADD_SCHEDULED_TASK_RUN_COMMENT = "autowonder.add_scheduled_task_run_comment";
+    private static final String LIST_EXECUTORS = "autowonder.list_executors";
+    private static final String GET_EXECUTOR = "autowonder.get_executor";
+    private static final String LIST_EXECUTOR_CLIENT_KINDS = "autowonder.list_executor_client_kinds";
+    private static final String GET_EXECUTOR_LAUNCH_OPTIONS = "autowonder.get_executor_launch_options";
+    private static final String CREATE_EXECUTOR = "autowonder.create_executor";
+    private static final String GET_EXECUTOR_TOKEN = "autowonder.get_executor_token";
+    private static final String DELETE_EXECUTOR = "autowonder.delete_executor";
+    private static final String BUILD_EXECUTOR_LAUNCH_COMMAND = "autowonder.build_executor_launch_command";
+    /**
+     * Static half of the executor {@code model} description. {@link #applyExecutorModelDescriptions} appends the
+     * ids Redis currently holds, because usable model ids rotate and must never be hardcoded by a caller.
+     */
+    private static final String EXECUTOR_MODEL_DESCRIPTION =
+            "Optional. Qoder model id; ignored for non-Qoder executors. Model ids are assembled server-side from "
+                    + "the provider catalog that Redis refreshes automatically, so never hardcode one: omit this "
+                    + "argument and the server resolves a currently usable id, or call "
+                    + "autowonder.get_executor_launch_options for the live list with labels and defaults. An id "
+                    + "the catalog no longer offers is resolved to the catalog default, exactly like the executor "
+                    + "page, and the resolved value is returned in the response.";
     private static final Set<String> TRANSITION_SCHEDULED_TASK_ACTIONS = Set.of(
             "enable", "pause", "archive", "run-now", "pause-run", "resume-run", "cancel-run");
     private static final Set<String> SCHEDULED_TASK_LIST_STATUSES = Set.of(
@@ -193,6 +220,12 @@ public class McpToolService {
      */
     private static final Set<String> DISPATCH_FORBIDDEN_SCHEDULED_TASK_TOOLS = Set.of(
             CREATE_SCHEDULED_TASK, LIST_SCHEDULED_TASKS, UPDATE_SCHEDULED_TASK, TRANSITION_SCHEDULED_TASK);
+    /**
+     * Executor tokens are long-lived credentials and creating or deleting an executor changes which
+     * machines may connect, so dispatch credentials keep read-only visibility of the executor list.
+     */
+    private static final Set<String> DISPATCH_FORBIDDEN_EXECUTOR_TOOLS = Set.of(
+            CREATE_EXECUTOR, GET_EXECUTOR_TOKEN, DELETE_EXECUTOR, BUILD_EXECUTOR_LAUNCH_COMMAND);
     private static final String MEMORY_SCOPE_AGENT = "AGENT";
     private static final Set<String> MEMORY_SCOPES = Set.of(MEMORY_SCOPE_AGENT, "SQUAD", "ORG");
     /**
@@ -223,6 +256,8 @@ public class McpToolService {
                             workspaceTool(WorkspaceAccessLevel.READ_WRITE)),
                     Map.entry(WORKITEM_CLI_UPLOAD_TOKEN,
                             workspaceTool(WorkspaceAccessLevel.READ_WRITE)),
+                    Map.entry(WORKITEM_CLI_DOWNLOAD_TOKEN,
+                            workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
                     Map.entry(LIST_WORKITEM_DOCUMENTS,
                             workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
                     Map.entry(DELETE_WORKITEM_DOCUMENT,
@@ -368,7 +403,23 @@ public class McpToolService {
                     Map.entry(GET_SCHEDULED_TASK_RUN,
                             workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
                     Map.entry(ADD_SCHEDULED_TASK_RUN_COMMENT,
-                            workspaceTool(WorkspaceAccessLevel.READ_WRITE)));
+                            workspaceTool(WorkspaceAccessLevel.READ_WRITE)),
+                    Map.entry(LIST_EXECUTORS,
+                            workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
+                    Map.entry(GET_EXECUTOR,
+                            workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
+                    Map.entry(LIST_EXECUTOR_CLIENT_KINDS,
+                            workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
+                    Map.entry(GET_EXECUTOR_LAUNCH_OPTIONS,
+                            workspaceTool(WorkspaceAccessLevel.READ_ONLY)),
+                    Map.entry(CREATE_EXECUTOR,
+                            workspaceTool(WorkspaceAccessLevel.ADMIN)),
+                    Map.entry(GET_EXECUTOR_TOKEN,
+                            workspaceTool(WorkspaceAccessLevel.ADMIN)),
+                    Map.entry(DELETE_EXECUTOR,
+                            workspaceTool(WorkspaceAccessLevel.ADMIN)),
+                    Map.entry(BUILD_EXECUTOR_LAUNCH_COMMAND,
+                            workspaceTool(WorkspaceAccessLevel.ADMIN)));
 
     private static final String WORKSPACE_ID_DESCRIPTION =
             "Required. Target workspace id. Use autowonder.list_projects to discover the "
@@ -387,6 +438,7 @@ public class McpToolService {
     private final DispatchDao dispatchDao;
     private final RequirementDocumentService requirementDocumentService;
     private final WorkitemCliUploadTokenService workitemCliUploadTokenService;
+    private final WorkitemCliDownloadTokenService workitemCliDownloadTokenService;
     private final MemoryService memoryService;
     private final RepoService repoService;
     private final SquadService squadService;
@@ -412,6 +464,12 @@ public class McpToolService {
     private ArtifactService artifactService;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private DispatchRuntimeEventDao dispatchRuntimeEventDao;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ExecutorService executorService;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ExecutorLaunchOptionsService executorLaunchOptionsService;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ExecutorLaunchCommandService executorLaunchCommandService;
 
     @org.springframework.beans.factory.annotation.Autowired
     public McpToolService(WorkspaceService workspaceService, WorkitemService workitemService,
@@ -422,13 +480,14 @@ public class McpToolService {
                           PlatformSkillCatalog platformSkillCatalog, DispatchDao dispatchDao,
                           RequirementDocumentService requirementDocumentService,
                           WorkitemCliUploadTokenService workitemCliUploadTokenService,
+                          WorkitemCliDownloadTokenService workitemCliDownloadTokenService,
                           MemoryService memoryService, RepoService repoService,
                           SquadService squadService,
                           DispatchPauseService dispatchPauseService,
                           ScheduledTaskCapabilityGuard capabilityGuard) {
         this(workspaceService, workitemService, guidanceService, skillService, skillPackageService, sdlcService,
                 agentService, statusTemplateService, platformSkillCatalog, dispatchDao,
-                requirementDocumentService, workitemCliUploadTokenService,
+                requirementDocumentService, workitemCliUploadTokenService, workitemCliDownloadTokenService,
                 memoryService, repoService, squadService, dispatchPauseService);
         this.capabilityGuard = capabilityGuard;
     }
@@ -441,6 +500,7 @@ public class McpToolService {
                           PlatformSkillCatalog platformSkillCatalog, DispatchDao dispatchDao,
                           RequirementDocumentService requirementDocumentService,
                           WorkitemCliUploadTokenService workitemCliUploadTokenService,
+                          WorkitemCliDownloadTokenService workitemCliDownloadTokenService,
                           MemoryService memoryService, RepoService repoService,
                           SquadService squadService,
                           DispatchPauseService dispatchPauseService) {
@@ -456,6 +516,7 @@ public class McpToolService {
         this.dispatchDao = dispatchDao;
         this.requirementDocumentService = requirementDocumentService;
         this.workitemCliUploadTokenService = workitemCliUploadTokenService;
+        this.workitemCliDownloadTokenService = workitemCliDownloadTokenService;
         this.memoryService = memoryService;
         this.repoService = repoService;
         this.squadService = squadService;
@@ -611,7 +672,29 @@ public class McpToolService {
                         schema(required("id"),
                                 prop("id", "integer", "Required. Initial workitem id used for the preflight write-access "
                                         + "check and the first generated upload command; not bound into the token."))),
-                tool(LIST_WORKITEM_DOCUMENTS, "List requirement/design context attachment documents uploaded to an AutoWonder workitem.",
+                tool(WORKITEM_CLI_DOWNLOAD_TOKEN, "Mint a 30-minute, user-level, read-only token for the AutoWonder CLI "
+                                + "`workitem download` command. Long-lived personal, dispatch, and conversation "
+                                + "credentials can mint it. The token is not bound to an organization or workitem and can "
+                                + "be reused until it expires for any workitem the user can currently read; every download "
+                                + "re-checks live read membership. Use it to fetch requirement/design document bodies to "
+                                + "local disk instead of pulling them through MCP, which keeps large or binary attachments "
+                                + "out of this conversation's context. id is the initial workitem id, used for the preflight "
+                                + "check and the first exact command; it is not bound into the token. Returns the token, "
+                                + "expiry, deployment server URL, recommended runtime version, and ready-to-run POSIX and "
+                                + "PowerShell commands, e.g.: " + workitemCliDownloadTokenService.commandTemplate() + ". "
+                                + "Standard flow: 1) call list_workitem_documents to see document names and ids; "
+                                + "2) call this tool; 3) run the returned CLI command (repeat --file to pick specific "
+                                + "documents, or omit it to download all) to save them under --output-dir; "
+                                + "4) read the local files with your own file tools.",
+                        schema(required("id"),
+                                prop("id", "integer", "Required. Initial workitem id used for the preflight read-access "
+                                        + "check and the first generated download command; not bound into the token."))),
+                tool(LIST_WORKITEM_DOCUMENTS, "List requirement/design context attachment documents uploaded to an AutoWonder "
+                                + "workitem. Returns metadata only (id, name, type, size, created time) and never the "
+                                + "document body. To read a document's actual contents without loading them into this MCP "
+                                + "context, mint a download token with autowonder.workitem_cli_download_token and run the "
+                                + "returned CLI `workitem download` command to save the files locally, then open them with "
+                                + "your own file tools.",
                         schema(required("id"), prop("id", "integer"))),
                 tool(DELETE_WORKITEM_DOCUMENT, "Delete an uploaded requirement/design context attachment document from an AutoWonder workitem.",
                         schema(required("id", "artifactId"), prop("id", "integer"), prop("artifactId", "integer"))),
@@ -990,7 +1073,82 @@ public class McpToolService {
                         + "as the running digital worker.",
                         schema(required("runId", "contentMd"),
                                 prop("runId", "integer", "Required. Scheduled task run id."),
-                                prop("contentMd", "string", "Required. Markdown comment content.")))
+                                prop("contentMd", "string", "Required. Markdown comment content."))),
+                tool(LIST_EXECUTORS, "List executors in the given workspace, optionally filtered by digital worker. "
+                        + "Returns the same fields the executor page table shows: id, agentId, agentName, name, "
+                        + "clientKind, live status (ONLINE/BUSY/OFFLINE), lastConnectIp, lastHeartbeat and gmtCreate.",
+                        schema(prop("agentId", "integer",
+                                "Optional. Filter by owning digital worker id; omit to list every executor "
+                                        + "in the workspace."))),
+                tool(GET_EXECUTOR, "Get one executor by id, including its live status, last connect IP "
+                        + "and last heartbeat.",
+                        schema(required("id"),
+                                prop("id", "integer", "Required. Executor id."))),
+                tool(LIST_EXECUTOR_CLIENT_KINDS, "List the executor client kinds an operator may create. "
+                        + "Only the Qoder CLI family is offered, exactly like the executor page's create dialog; "
+                        + "legacy kinds such as CLAUDE_CODE still appear in autowonder.list_executors "
+                        + "but cannot be created.",
+                        schema()),
+                tool(GET_EXECUTOR_LAUNCH_OPTIONS, "Get every selectable launch value the executor page offers for one "
+                        + "client kind: models (from the live provider catalog, or the built-in list while no snapshot "
+                        + "exists yet), reasoning efforts, context windows, memory modes, and the defaults each form "
+                        + "pre-fills. Values are assembled server-side, so never hardcode them.",
+                        schema(required("clientKind"),
+                                enumProp("clientKind", ExecutorLaunchOptionsService.creatableClientKindValues(),
+                                        "Required. Executor client kind; only the Qoder CLI family is supported."))),
+                tool(CREATE_EXECUTOR, "Create an executor for a digital worker and return its one-time plaintext token. "
+                        + "Validation and defaults match the executor page's create dialog: agentId and name are "
+                        + "required, clientKind is limited to the Qoder CLI family, and memoryMode, "
+                        + "reasoningEffort and contextWindow fall back to the values that dialog pre-fills. The "
+                        + "model id is resolved server-side from the provider catalog Redis refreshes, so omit it "
+                        + "unless you deliberately want a specific one. "
+                        + "Launch options are not persisted, so pass them to autowonder.build_executor_launch_command "
+                        + "to generate the startup command.",
+                        schema(required("agentId", "name", "clientKind"),
+                                prop("agentId", "integer", "Required. Owning digital worker id."),
+                                prop("name", "string", "Required. Executor name, e.g. dev-machine-01."),
+                                enumProp("clientKind", ExecutorLaunchOptionsService.creatableClientKindValues(),
+                                        "Required. Executor client kind; only the Qoder CLI family can be created."),
+                                enumProp("memoryMode", ExecutorLaunchOptionsService.memoryModeValues(),
+                                        "Optional. Memory mode; defaults to platform, the value the page pre-selects."),
+                                prop("model", "string", EXECUTOR_MODEL_DESCRIPTION),
+                                enumProp("reasoningEffort", ExecutorLaunchOptionsService.reasoningEffortValues(),
+                                        "Optional. Reasoning effort; defaults to the chosen model's default."),
+                                enumProp("contextWindow", ExecutorLaunchOptionsService.contextWindowValues(),
+                                        "Optional. Context window; defaults to the chosen model's default."))),
+                tool(GET_EXECUTOR_TOKEN, "Reveal an executor's plaintext connection token, the same value the page's "
+                        + "eye icon shows. Requires workspace ADMIN. Treat it as a secret: anyone holding it can "
+                        + "connect an executor as this digital worker.",
+                        schema(required("id"),
+                                prop("id", "integer", "Required. Executor id."))),
+                tool(DELETE_EXECUTOR, "Delete an executor. Mirrors the page's delete action: the row is soft-deleted, "
+                        + "its live presence is cleared and any connected WebSocket session is closed, so the executor "
+                        + "stops receiving dispatches immediately.",
+                        schema(required("id"),
+                                prop("id", "integer", "Required. Executor id."))),
+                tool(BUILD_EXECUTOR_LAUNCH_COMMAND, "Build the startup command for an existing executor, identical to "
+                        + "what the executor page copies to the clipboard. The token, client kind, MCP address and "
+                        + "runtime version are resolved server-side; memoryMode defaults to what the page pre-fills, "
+                        + "the model id comes from the provider catalog Redis refreshes automatically, and "
+                        + "autowonder.get_executor_launch_options lists the current "
+                        + "choices. debug=true appends --debug and tees the full log: use it only for troubleshooting, "
+                        + "because a long run can fill the disk.",
+                        schema(required("id"),
+                                prop("id", "integer", "Required. Executor id."),
+                                enumProp("memoryMode", ExecutorLaunchOptionsService.memoryModeValues(),
+                                        "Optional. Memory mode; defaults to platform."),
+                                prop("model", "string", EXECUTOR_MODEL_DESCRIPTION),
+                                enumProp("reasoningEffort", ExecutorLaunchOptionsService.reasoningEffortValues(),
+                                        "Optional. Reasoning effort; ignored for non-Qoder executors."),
+                                enumProp("contextWindow", ExecutorLaunchOptionsService.contextWindowValues(),
+                                        "Optional. Context window; ignored for non-Qoder executors."),
+                                enumProp("os", List.of("posix", "windows"),
+                                        "Optional. Target OS, used for shell quoting; defaults to posix."),
+                                prop("debug", "boolean",
+                                        "Optional. Append --debug and tee the full log; defaults to false."),
+                                enumProp("shell", List.of("bash", "powershell"),
+                                        "Optional. Debug shell; defaults to bash on posix and powershell on windows. "
+                                                + "Only used when debug=true.")))
         );
     }
 
@@ -1009,7 +1167,7 @@ public class McpToolService {
             if (readDesc != null) {
                 tools = applyWorkspaceIdDescriptions(tools, readDesc, writeDesc);
             }
-            return tools;
+            return applyExecutorModelDescriptions(tools);
         }
         tools = listTools().stream()
                 .filter(tool -> scopeLevel.allows(toolAccess(tool.getName()).level()))
@@ -1017,7 +1175,7 @@ public class McpToolService {
         WorkspaceVO scopedWorkspace = workspaceService.getCurrent(principal.workspaceId());
         String workspaceName = scopedWorkspace != null ? scopedWorkspace.getName() : String.valueOf(principal.workspaceId());
         String desc = "Workspace: " + principal.workspaceId() + "=" + workspaceName;
-        return applyWorkspaceIdDescriptions(tools, desc, desc);
+        return applyExecutorModelDescriptions(applyWorkspaceIdDescriptions(tools, desc, desc));
     }
 
     private String compactWorkspaceDescription(List<WorkspaceVO> workspaces, boolean writeOnly) {
@@ -1057,8 +1215,49 @@ public class McpToolService {
         return tools;
     }
 
-    @SuppressWarnings("unchecked")
+    /**
+     * Appends the model ids Redis currently holds to every executor {@code model} argument, so a caller learns the
+     * usable ids without hardcoding one. Falls back to the static wording while no live snapshot exists.
+     */
+    private List<McpToolVO> applyExecutorModelDescriptions(List<McpToolVO> tools) {
+        ExecutorLaunchOptionsService options = executorLaunchOptionsService;
+        if (options == null) {
+            return tools;
+        }
+        String live = liveModelIdSuffix(options);
+        if (live == null) {
+            return tools;
+        }
+        for (McpToolVO tool : tools) {
+            String name = tool.getName();
+            if (CREATE_EXECUTOR.equals(name) || BUILD_EXECUTOR_LAUNCH_COMMAND.equals(name)) {
+                replacePropertyDescription(tool, "model", EXECUTOR_MODEL_DESCRIPTION + live);
+            }
+        }
+        return tools;
+    }
+
+    private static String liveModelIdSuffix(ExecutorLaunchOptionsService options) {
+        List<String> parts = new ArrayList<>();
+        addProviderModelIds(parts, options, "qoder", ExecutorLaunchOptionsService.PROVIDER_QODER);
+        addProviderModelIds(parts, options, "qodercn", ExecutorLaunchOptionsService.PROVIDER_QODER_CN);
+        return parts.isEmpty() ? null : " Current ids — " + String.join("; ", parts) + ".";
+    }
+
+    private static void addProviderModelIds(List<String> parts, ExecutorLaunchOptionsService options,
+            String label, String provider) {
+        List<String> ids = options.liveModelIds(provider);
+        if (!ids.isEmpty()) {
+            parts.add(label + ": " + String.join(", ", ids));
+        }
+    }
+
     private void replaceWorkspaceIdDescription(McpToolVO tool, String description) {
+        replacePropertyDescription(tool, "workspaceId", description);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void replacePropertyDescription(McpToolVO tool, String property, String description) {
         Map<String, Object> schema = tool.getInputSchema();
         if (schema == null) {
             return;
@@ -1067,14 +1266,14 @@ public class McpToolService {
         if (properties == null) {
             return;
         }
-        Map<String, Object> workspaceId = (Map<String, Object>) properties.get("workspaceId");
-        if (workspaceId == null) {
+        Map<String, Object> existing = (Map<String, Object>) properties.get(property);
+        if (existing == null) {
             return;
         }
-        Map<String, Object> newWorkspaceId = new LinkedHashMap<>(workspaceId);
-        newWorkspaceId.put("description", description);
+        Map<String, Object> replaced = new LinkedHashMap<>(existing);
+        replaced.put("description", description);
         Map<String, Object> newProperties = new LinkedHashMap<>(properties);
-        newProperties.put("workspaceId", newWorkspaceId);
+        newProperties.put(property, replaced);
         Map<String, Object> newSchema = new LinkedHashMap<>(schema);
         newSchema.put("properties", newProperties);
         tool.setInputSchema(newSchema);
@@ -1177,7 +1376,9 @@ public class McpToolService {
 
     private Object invoke(ToolExecutionContext context, String name,
                           Map<String, Object> safeArgs) {
-        if (isDispatchCredential(context) && DISPATCH_FORBIDDEN_SCHEDULED_TASK_TOOLS.contains(name)) {
+        if (isDispatchCredential(context)
+                && (DISPATCH_FORBIDDEN_SCHEDULED_TASK_TOOLS.contains(name)
+                || DISPATCH_FORBIDDEN_EXECUTOR_TOOLS.contains(name))) {
             throw new BizException(ErrorCode.NO_PERMISSION);
         }
         return switch (name) {
@@ -1271,6 +1472,10 @@ public class McpToolService {
             }
             case WORKITEM_CLI_UPLOAD_TOKEN -> {
                 yield workitemCliUploadTokenService.mint(context.credentialType(),
+                        context.userId(), requiredLong(safeArgs, "id"));
+            }
+            case WORKITEM_CLI_DOWNLOAD_TOKEN -> {
+                yield workitemCliDownloadTokenService.mint(context.credentialType(),
                         context.userId(), requiredLong(safeArgs, "id"));
             }
             case LIST_WORKITEM_DOCUMENTS -> {
@@ -1629,8 +1834,88 @@ public class McpToolService {
             case ADD_SCHEDULED_TASK_RUN_COMMENT -> {
                 yield addScheduledTaskRunComment(context, safeArgs);
             }
+            case LIST_EXECUTORS -> {
+                ExecutorService executors = requireExecutorDependency(executorService);
+                Long agentId = lng(safeArgs, "agentId");
+                yield agentId == null
+                        ? executors.listAll(context.workspaceId())
+                        : executors.listByAgent(agentId, context.workspaceId());
+            }
+            case GET_EXECUTOR -> requireExecutorDependency(executorService)
+                    .getDetail(requiredLong(safeArgs, "id"), context.workspaceId());
+            case LIST_EXECUTOR_CLIENT_KINDS -> ExecutorLaunchOptionsService.creatableClientKinds();
+            case GET_EXECUTOR_LAUNCH_OPTIONS -> requireExecutorDependency(executorLaunchOptionsService)
+                    .launchOptions(requiredString(safeArgs, "clientKind"));
+            case CREATE_EXECUTOR -> createExecutor(context, safeArgs);
+            case GET_EXECUTOR_TOKEN -> {
+                long executorId = requiredLong(safeArgs, "id");
+                yield Map.of("id", executorId, "token", requireExecutorDependency(executorService)
+                        .getToken(executorId, context.workspaceId()));
+            }
+            case DELETE_EXECUTOR -> {
+                requireExecutorDependency(executorService)
+                        .delete(requiredLong(safeArgs, "id"), context.workspaceId(), context.userId());
+                yield Map.of("deleted", true);
+            }
+            case BUILD_EXECUTOR_LAUNCH_COMMAND -> buildExecutorLaunchCommand(context, safeArgs);
             default -> throw new BizException(ErrorCode.MCP_TOOL_NOT_FOUND);
         };
+    }
+
+    private <T> T requireExecutorDependency(T dependency) {
+        if (dependency == null) {
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "执行器能力不可用");
+        }
+        return dependency;
+    }
+
+    /**
+     * The launch values are validated like the create dialog but not persisted, mirroring the page
+     * where they only live in the dialog and in the operator's browser storage.
+     */
+    private CreatedExecutorVO createExecutor(ToolExecutionContext context, Map<String, Object> args) {
+        ExecutorLaunchOptionsService options = requireExecutorDependency(executorLaunchOptionsService);
+        String clientKind = options.requireCreatableClientKind(requiredString(args, "clientKind"));
+        long agentId = requiredLong(args, "agentId");
+        String name = requiredString(args, "name");
+        String provider = ExecutorLaunchOptionsService.resolveProvider(clientKind);
+        // 与页面一致：先校验全部启动选项再落库，否则非法取值会留下一个已创建的执行器和已签发的 Token。
+        String memoryMode = options.resolveMemoryMode(str(args, "memoryMode"));
+        String model = options.resolveModel(provider, str(args, "model"),
+                ExecutorLaunchOptionsService.AUTO_MODEL);
+        String reasoningEffort = options.resolveReasoningEffort(model, str(args, "reasoningEffort"));
+        String contextWindow = options.resolveContextWindow(str(args, "contextWindow"));
+
+        CreateExecutorRequest request = new CreateExecutorRequest();
+        request.setName(name);
+        request.setClientKind(clientKind);
+        IssuedExecutorVO issued = requireExecutorDependency(executorService)
+                .create(agentId, request, context.workspaceId(), context.userId());
+        return new CreatedExecutorVO(issued.getId(), issued.getAgentId(), issued.getName(), issued.getToken(),
+                clientKind, memoryMode, model, reasoningEffort, contextWindow);
+    }
+
+    private Object buildExecutorLaunchCommand(ToolExecutionContext context, Map<String, Object> args) {
+        ExecutorService executors = requireExecutorDependency(executorService);
+        ExecutorLaunchOptionsService options = requireExecutorDependency(executorLaunchOptionsService);
+        long executorId = requiredLong(args, "id");
+        ExecutorVO executor = executors.getDetail(executorId, context.workspaceId());
+        String token = executors.getToken(executorId, context.workspaceId());
+        String clientKind = executor.getClientKind();
+        String provider = ExecutorLaunchOptionsService.resolveProvider(clientKind);
+        String memoryMode = options.resolveMemoryMode(str(args, "memoryMode"));
+        String model = null;
+        String reasoningEffort = null;
+        String contextWindow = null;
+        if (ExecutorLaunchOptionsService.isQoderFamily(provider)) {
+            model = options.resolveModel(provider, str(args, "model"),
+                    ExecutorLaunchOptionsService.DEFAULT_MODEL);
+            reasoningEffort = options.resolveReasoningEffort(model, str(args, "reasoningEffort"));
+            contextWindow = options.resolveContextWindow(str(args, "contextWindow"));
+        }
+        return requireExecutorDependency(executorLaunchCommandService).build(token, executorId, clientKind,
+                memoryMode, model, reasoningEffort, contextWindow, str(args, "os"),
+                bool(args, "debug", false), str(args, "shell"));
     }
 
     private CommentVO addDispatchAgentComment(ToolExecutionContext context,
@@ -2237,6 +2522,18 @@ public class McpToolService {
                     prop("maxFiles", "integer", "Maximum attachments per workitem."),
                     prop("maxFileSizeBytes", "integer", "Maximum bytes per attachment."),
                     prop("maxTotalSizeBytes", "integer", "Maximum total bytes per workitem."));
+            case WORKITEM_CLI_DOWNLOAD_TOKEN -> schema(
+                    prop("token", "string", "The awdownload_ token; pass it to the CLI via AUTOWONDER_DOWNLOAD_TOKEN or --token."),
+                    prop("tokenType", "string", "Always Bearer."),
+                    prop("expiresInSeconds", "integer", "Token lifetime in seconds; always 1800."),
+                    prop("expiresAt", "string", "ISO-8601 UTC expiry instant."),
+                    prop("serverUrl", "string", "Deployment public base URL used by the download command."),
+                    prop("runtimeVersion", "string", "Recommended AutoWonder runtime npm package version."),
+                    prop("tokenEnvName", "string", "Environment variable name that carries the token."),
+                    prop("command", "string", "Ready-to-run POSIX command including the token export."),
+                    prop("powershellCommand", "string", "Ready-to-run PowerShell command including the token export."),
+                    arrayProp("supportedExtensions", Map.of("type", "string"),
+                            "Downloadable attachment extensions."));
             case LIST_WORKITEM_DOCUMENTS -> listOutputSchema(artifactSchema());
             case DELETE_WORKITEM_DOCUMENT -> schema(prop("deleted", "boolean", "Whether the document was deleted."));
             case LIST_STATUS_TEMPLATES -> listOutputSchema(statusTemplateSchema());
@@ -2317,6 +2614,16 @@ public class McpToolService {
                     arrayProp("comments", commentSchema(), "Run comments; present when includeComments is true."),
                     arrayProp("derivedWorkitems", workitemSchema(), "Workitems created by the run; present when includeDerivedWorkitems is true."));
             case ADD_SCHEDULED_TASK_RUN_COMMENT -> commentSchema();
+            case LIST_EXECUTORS -> listOutputSchema(executorSchema());
+            case GET_EXECUTOR -> executorSchema();
+            case LIST_EXECUTOR_CLIENT_KINDS -> listOutputSchema(selectOptionSchema());
+            case GET_EXECUTOR_LAUNCH_OPTIONS -> executorLaunchOptionsSchema();
+            case CREATE_EXECUTOR -> createdExecutorSchema();
+            case GET_EXECUTOR_TOKEN -> schema(required("id", "token"),
+                    prop("id", "integer", "Executor id the token belongs to."),
+                    prop("token", "string", "Plaintext connection token; treat it as a secret."));
+            case DELETE_EXECUTOR -> schema(prop("deleted", "boolean", "Whether the executor was deleted."));
+            case BUILD_EXECUTOR_LAUNCH_COMMAND -> executorLaunchCommandSchema();
             default -> schema();
         };
     }
@@ -2333,19 +2640,19 @@ public class McpToolService {
         return schema(prop("id", "integer", "Workitem id."),
                 prop("workType", "string", "Workitem type."),
                 prop("title", "string", "Workitem title."),
-                prop("contentMd", "string", "Markdown content."),
-                prop("templateId", "integer", "Status template id."),
-                prop("statusNodeId", "integer", "Current status node id."),
-                prop("statusName", "string", "Current status name."),
+                nullableProp("contentMd", "string", "Markdown content; null when the workitem has no body."),
+                nullableProp("templateId", "integer", "Status template id."),
+                nullableProp("statusNodeId", "integer", "Current status node id."),
+                nullableProp("statusName", "string", "Current status name; null when the node cannot be resolved."),
                 nullableProp("sdlcId", "integer", "Bound SDLC flow id."),
                 nullableProp("sdlcName", "string", "Bound SDLC flow name."),
-                prop("assigneeType", "string", "Assignee type."),
-                prop("assigneeRef", "integer", "Assignee reference id."),
-                prop("assigneeName", "string", "Assignee account name."),
-                prop("assigneeDisplayName", "string", "Assignee display name."),
-                prop("creatorId", "integer", "Creator user id."),
-                prop("creatorName", "string", "Creator account name."),
-                prop("creatorDisplayName", "string", "Creator display name."),
+                nullableProp("assigneeType", "string", "Assignee type; null when unassigned."),
+                nullableProp("assigneeRef", "integer", "Assignee reference id; null when unassigned."),
+                nullableProp("assigneeName", "string", "Assignee account name; null when the assignee cannot be resolved."),
+                nullableProp("assigneeDisplayName", "string", "Assignee display name; null when the assignee cannot be resolved."),
+                nullableProp("creatorId", "integer", "Creator user id."),
+                nullableProp("creatorName", "string", "Creator account name; null when the creator cannot be resolved."),
+                nullableProp("creatorDisplayName", "string", "Creator display name; null when the creator cannot be resolved."),
                 prop("priority", "integer", "Priority value."),
                 prop("version", "integer", "Optimistic lock version."),
                 timestampProp("gmtCreate", "Creation time."),
@@ -2661,6 +2968,82 @@ public class McpToolService {
                 prop("version", "integer", "Optimistic lock version."),
                 timestampProp("gmtCreate", "Creation time."),
                 timestampProp("gmtModified", "Last modified time."));
+    }
+
+    private Map<String, Object> executorSchema() {
+        return schema(prop("id", "integer", "Executor id."),
+                prop("agentId", "integer", "Owning digital worker id."),
+                nullableProp("agentName", "string", "Owning digital worker name."),
+                prop("name", "string", "Executor name."),
+                prop("clientKind", "string", "Client kind, for example QODER_CLI or QODER_CN_CLI."),
+                prop("status", "string", "Live status driven by heartbeats: ONLINE, BUSY or OFFLINE."),
+                nullableProp("lastConnectIp", "string", "IP of the most recent WebSocket connection."),
+                timestampProp("lastHeartbeat", "Most recent heartbeat time."),
+                timestampProp("gmtCreate", "Creation time."));
+    }
+
+    private Map<String, Object> selectOptionSchema() {
+        return schema(required("value", "label"),
+                prop("value", "string", "Value to pass back to the tool that consumes this option."),
+                prop("label", "string", "Human-readable label shown on the executor page."),
+                nullableProp("description", "string", "Optional hint shown next to the option."));
+    }
+
+    private Map<String, Object> executorLaunchOptionsSchema() {
+        return schema(required("clientKind", "provider", "models", "reasoningEfforts", "contextWindows",
+                        "memoryModes", "defaultModel", "defaultCreateModel", "defaultReasoningEffort",
+                        "defaultContextWindow", "defaultMemoryMode"),
+                prop("clientKind", "string", "Canonical client kind these options belong to."),
+                prop("provider", "string", "Runtime provider passed as --provider, for example qoder or qodercn."),
+                arrayProp("models", selectOptionSchema(),
+                        "Selectable models: the live provider catalog when a snapshot exists, "
+                                + "otherwise the built-in list the page also falls back to."),
+                arrayProp("reasoningEfforts", selectOptionSchema(), "Selectable reasoning efforts."),
+                arrayProp("contextWindows", selectOptionSchema(), "Selectable context windows."),
+                arrayProp("memoryModes", selectOptionSchema(), "Selectable memory modes."),
+                prop("defaultModel", "string", "Model pre-filled by the launch-command form."),
+                prop("defaultCreateModel", "string", "Model pre-filled by the create-executor form."),
+                prop("defaultReasoningEffort", "string", "Reasoning effort pre-filled for defaultModel."),
+                prop("defaultContextWindow", "string", "Context window pre-filled by both forms."),
+                prop("defaultMemoryMode", "string", "Memory mode pre-filled by both forms."),
+                timestampProp("modelCatalogLastSuccessfulAt",
+                        "When the live provider model catalog was last refreshed; "
+                                + "null while only the built-in list is known."));
+    }
+
+    private Map<String, Object> createdExecutorSchema() {
+        return schema(required("id", "agentId", "name", "token", "clientKind", "memoryMode", "model",
+                        "reasoningEffort", "contextWindow"),
+                prop("id", "integer", "New executor id."),
+                prop("agentId", "integer", "Owning digital worker id."),
+                prop("name", "string", "Executor name."),
+                prop("token", "string", "One-time plaintext connection token; treat it as a secret."),
+                prop("clientKind", "string", "Canonical client kind."),
+                prop("memoryMode", "string", "Validated memory mode to pass to build_executor_launch_command."),
+                prop("model", "string", "Validated Qoder model to pass to build_executor_launch_command."),
+                prop("reasoningEffort", "string", "Validated reasoning effort."),
+                prop("contextWindow", "string", "Validated context window."));
+    }
+
+    private Map<String, Object> executorLaunchCommandSchema() {
+        return schema(required("executorId", "clientKind", "provider", "memoryMode", "wsUrl", "runtimeVersion",
+                        "os", "debug", "command"),
+                prop("executorId", "integer", "Executor the command connects."),
+                prop("clientKind", "string", "Executor client kind."),
+                prop("provider", "string", "Runtime provider passed as --provider."),
+                prop("memoryMode", "string", "Memory mode passed as --memory-mode."),
+                nullableProp("model", "string", "Model passed as --model; null for non-Qoder executors."),
+                nullableProp("reasoningEffort", "string",
+                        "Value passed as --reasoning-effort; null for non-Qoder executors."),
+                nullableProp("contextWindow", "string",
+                        "Value passed as --context-window; null for non-Qoder executors."),
+                prop("wsUrl", "string", "Executor WebSocket URL derived from the platform MCP address."),
+                prop("runtimeVersion", "string", "autowonder runtime version pinned by npx."),
+                prop("os", "string", "Target OS used for shell quoting: posix or windows."),
+                prop("debug", "boolean", "Whether --debug and log teeing were added."),
+                nullableProp("shell", "string", "Debug shell, bash or powershell; null when debug is false."),
+                nullableProp("logFileName", "string", "Debug log file name; null when debug is false."),
+                prop("command", "string", "Ready-to-paste startup command, including the plaintext token."));
     }
 
     private Map<String, Object> repoSchema() {

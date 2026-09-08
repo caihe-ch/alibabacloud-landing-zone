@@ -1,6 +1,31 @@
 import { http, HttpResponse } from 'msw';
 
 export const handlers = [
+  // 多个页面（技能、执行器等）会无条件拉取执行器列表；全局兜底为空列表，
+  // 避免个别用例未 mock 时请求落入 unhandled → 拦截器 401 处理清空 auth store。
+  http.get('/api/executors', () => {
+    return HttpResponse.json({
+      success: true,
+      code: '0',
+      message: '',
+      data: [],
+      traceId: null,
+    });
+  }),
+  http.get('/api/executor-model-catalogs/qoder', () => HttpResponse.json({
+    success: true,
+    code: '0',
+    message: '',
+    data: { provider: 'qoder', models: [], lastSuccessfulAt: null },
+    traceId: null,
+  })),
+  http.get('/api/executor-model-catalogs/qodercn', () => HttpResponse.json({
+    success: true,
+    code: '0',
+    message: '',
+    data: { provider: 'qodercn', models: [], lastSuccessfulAt: null },
+    traceId: null,
+  })),
   http.get('/api/capabilities/scheduled-task', () => {
     return HttpResponse.json({
       success: true,
@@ -68,6 +93,26 @@ export const handlers = [
   http.get('/api/memories/reviews/count', () => HttpResponse.json({
     success: true, code: '0', message: '', data: 0, traceId: 'trace-memory-review-count',
   })),
+  // 品牌配置页的「平台管理员」Tab 会拉取管理员名册与候选人；全局兜底为"无管理员且无权管理"，
+  // 避免个别用例未 mock 时请求落入 unhandled → 拦截器 401 处理清空 auth store。
+  http.get('/api/platform/admins', () => {
+    return HttpResponse.json({
+      success: true,
+      code: '0',
+      message: '',
+      data: { admins: [], canManage: false },
+      traceId: 'trace-platform-admins',
+    });
+  }),
+  http.get('/api/platform/admins/candidates', () => {
+    return HttpResponse.json({
+      success: true,
+      code: '0',
+      message: '',
+      data: [],
+      traceId: 'trace-platform-admin-candidates',
+    });
+  }),
   http.post('/api/auth/login', () => {
     return HttpResponse.json({
       success: true,
@@ -103,6 +148,15 @@ export const handlers = [
       message: '',
       data: [],
       traceId: 'trace-agents-list',
+    });
+  }),
+  http.get('/api/squads', () => {
+    return HttpResponse.json({
+      success: true,
+      code: '0',
+      message: '',
+      data: [],
+      traceId: 'trace-squads-list',
     });
   }),
   http.get('/api/agents/reviews/count', () => {

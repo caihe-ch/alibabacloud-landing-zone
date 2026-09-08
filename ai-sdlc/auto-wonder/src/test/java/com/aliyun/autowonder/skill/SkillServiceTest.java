@@ -13,6 +13,7 @@ import com.aliyun.autowonder.user.UserDao;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.util.Date;
 
@@ -117,6 +118,85 @@ class SkillServiceTest {
 
         BizException ex = assertThrows(BizException.class, () -> service.create(req, 1L, 2L));
         assertEquals(ErrorCode.SKILL_DUPLICATE_NAME.getCode(), ex.getCode());
+        verify(skillDao, never()).releaseSoftDeletedName(anyLong(), anyString(), anyString());
+        verify(skillDao, never()).insert(any());
+    }
+
+    @Test
+    void createReleasesSoftDeletedNameBeforeInsertUsingTrimmedName() {
+        when(skillDao.findByTypeAndName(1L, "MCP", "revived")).thenReturn(null);
+
+        CreateSkillRequest req = new CreateSkillRequest();
+        req.setType("MCP");
+        req.setName("  revived  ");
+
+        service.create(req, 1L, 2L);
+
+        InOrder inOrder = inOrder(skillDao);
+        inOrder.verify(skillDao).findByTypeAndName(1L, "MCP", "revived");
+        inOrder.verify(skillDao).releaseSoftDeletedName(1L, "MCP", "revived");
+        inOrder.verify(skillDao).insert(argThat(row -> "revived".equals(row.getName())));
+    }
+
+    @Test
+    void createFromPackageReferenceReleasesSoftDeletedNameBeforeInsert() {
+        when(skillDao.findByTypeAndName(1L, "SKILL", "packaged")).thenReturn(null);
+
+        CreateSkillRequest req = new CreateSkillRequest();
+        req.setType("SKILL");
+        req.setName("packaged");
+        service.createFromPackageReference(req,
+                new SkillService.PackageReference("oss://skills/packaged.zip", "packaged.zip", 12L, "md5"), 1L, 2L);
+
+        InOrder inOrder = inOrder(skillDao);
+        inOrder.verify(skillDao).releaseSoftDeletedName(1L, "SKILL", "packaged");
+        inOrder.verify(skillDao).insert(argThat(row -> "packaged".equals(row.getName())));
+    }
+
+    @Test
+    void createFromPackageReferenceDuplicateNameThrowsAndDoesNotRelease() {
+        SkillDO existing = new SkillDO();
+        existing.setId(99L);
+        existing.setName("dup");
+        // 只按 trim 后的 "dup" 打桩：若判重仍用未 trim 原值则打桩不命中，用例会因未抛异常而失败
+        when(skillDao.findByTypeAndName(1L, "SKILL", "dup")).thenReturn(existing);
+
+        CreateSkillRequest req = new CreateSkillRequest();
+        req.setType("SKILL");
+        req.setName("  dup  ");
+
+        BizException ex = assertThrows(BizException.class, () -> service.createFromPackageReference(req,
+                new SkillService.PackageReference("oss://skills/dup.zip", "dup.zip", 12L, "md5"), 1L, 2L));
+
+        assertEquals(ErrorCode.SKILL_DUPLICATE_NAME.getCode(), ex.getCode());
+        verify(skillDao).findByTypeAndName(1L, "SKILL", "dup");
+        // 存在在用同名技能时绝不能释放名称槽位（会改写在用行）、绝不能写入
+        verify(skillDao, never()).releaseSoftDeletedName(anyLong(), anyString(), anyString());
+        verify(skillDao, never()).insert(any());
+    }
+
+    @Test
+    void createPropagatesInsertFailureAfterReleaseAndRetrySucceeds() {
+        when(skillDao.findByTypeAndName(1L, "MCP", "flaky")).thenReturn(null);
+        // 首次释放命中遗留软删除行返回 1，重试时该行已墓碑化返回 0
+        when(skillDao.releaseSoftDeletedName(1L, "MCP", "flaky")).thenReturn(1).thenReturn(0);
+        doThrow(new RuntimeException("insert failed")).doNothing().when(skillDao).insert(any());
+
+        CreateSkillRequest req = new CreateSkillRequest();
+        req.setType("MCP");
+        req.setName("flaky");
+
+        RuntimeException ex = assertThrows(RuntimeException.class, () -> service.create(req, 1L, 2L));
+        assertEquals("insert failed", ex.getMessage());
+
+        InOrder inOrder = inOrder(skillDao);
+        inOrder.verify(skillDao).releaseSoftDeletedName(1L, "MCP", "flaky");
+        inOrder.verify(skillDao).insert(any());
+
+        // 释放与 INSERT 非原子（create 未标注 @Transactional），但槽位已释放且释放幂等 → 重试即可成功
+        assertNotNull(service.create(req, 1L, 2L));
+        verify(skillDao, times(2)).releaseSoftDeletedName(1L, "MCP", "flaky");
+        verify(skillDao, times(2)).insert(any());
     }
 
     @Test

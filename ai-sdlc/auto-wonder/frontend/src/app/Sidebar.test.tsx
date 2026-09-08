@@ -41,9 +41,23 @@ function childKeys(item: ItemType | null | undefined) {
 }
 
 describe('Sidebar helpers', () => {
-  it('shows scheduled tasks under delivery', () => {
-    const group = NAV_GROUPS.find((item) => item.key === 'delivery');
-    expect(group?.items.map((item) => item.key)).toContain('/scheduled-tasks');
+  it('shows 定时任务 between 工单 and 执行记录 under the delivery group', () => {
+    const deliveryGroup = NAV_GROUPS.find((item) => item.key === 'delivery');
+    const workersGroup = NAV_GROUPS.find((item) => item.key === 'workers-group');
+    const scheduledTaskItem = deliveryGroup?.items.find((item) => item.key === '/scheduled-tasks');
+
+    expect(deliveryGroup?.items.map((item) => item.key)).toEqual(['/workitems', '/scheduled-tasks', '/executions']);
+    expect(scheduledTaskItem?.label).toBe('定时任务');
+    expect(workersGroup?.items.map((item) => item.key)).not.toContain('/scheduled-tasks');
+    expect(resolveSelectedNavKey('/scheduled-tasks')).toBe('/scheduled-tasks');
+  });
+
+  it('gates the 定时任务 delivery entry behind the scheduled task capability', () => {
+    const unavailableGroup = buildMenuItems(undefined, false, false).find((item) => item?.key === 'delivery');
+    const availableGroup = buildMenuItems(undefined, false, true).find((item) => item?.key === 'delivery');
+
+    expect(childKeys(unavailableGroup)).toEqual(['/workitems', '/executions']);
+    expect(childKeys(availableGroup)).toEqual(['/workitems', '/scheduled-tasks', '/executions']);
   });
 
   it('places insights and audit logs in a dedicated group instead of config', () => {
@@ -144,7 +158,7 @@ describe('Sidebar helpers', () => {
     expect(screen.getByText('审计日志')).toBeInTheDocument();
   });
 
-  it('hides scheduled tasks until the capability request is ready', async () => {
+  it('hides 定时任务 until the capability request is ready', async () => {
     let resolveCapability: (() => void) | undefined;
     server.use(
       http.get('/api/capabilities/scheduled-task', async () => {
@@ -162,7 +176,7 @@ describe('Sidebar helpers', () => {
     expect(await screen.findByText('定时任务')).toBeInTheDocument();
   });
 
-  it('hides scheduled tasks when the capability is unavailable', async () => {
+  it('hides 定时任务 when the capability is unavailable', async () => {
     server.use(
       http.get('/api/capabilities/scheduled-task', () => HttpResponse.json({ success: true, code: '0', message: '', data: { available: false, mode: 'LEGACY', clusterReady: false, reason: 'DATABASE_UPGRADE_REQUIRED' } })),
     );
@@ -171,10 +185,11 @@ describe('Sidebar helpers', () => {
     render(<TestWrapper queryClient={queryClient}><Sidebar /></TestWrapper>);
 
     await waitFor(() => expect(queryClient.getQueryState(scheduledTaskCapabilityQueryKey)?.status).toBe('success'));
+    expect(screen.getByText('工单')).toBeInTheDocument();
     expect(screen.queryByText('定时任务')).not.toBeInTheDocument();
   });
 
-  it('hides scheduled tasks when the capability request fails', async () => {
+  it('hides 定时任务 when the capability request fails', async () => {
     server.use(
       http.get('/api/capabilities/scheduled-task', () => HttpResponse.json({ success: false, code: '10000', message: 'failed', data: null }, { status: 500 })),
     );
@@ -183,10 +198,11 @@ describe('Sidebar helpers', () => {
     render(<TestWrapper queryClient={queryClient}><Sidebar /></TestWrapper>);
 
     await waitFor(() => expect(queryClient.getQueryState(scheduledTaskCapabilityQueryKey)?.status).toBe('error'));
+    expect(screen.getByText('工单')).toBeInTheDocument();
     expect(screen.queryByText('定时任务')).not.toBeInTheDocument();
   });
 
-  it('hides scheduled tasks while stale cached readiness is revalidated', async () => {
+  it('hides 定时任务 while stale cached readiness is revalidated', async () => {
     let resolveCapability: (() => void) | undefined;
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(scheduledTaskCapabilityQueryKey, readyCapability, { updatedAt: 0 });
@@ -205,13 +221,14 @@ describe('Sidebar helpers', () => {
     expect(await screen.findByText('定时任务')).toBeInTheDocument();
   });
 
-  it('keeps scheduled tasks hidden when stale cached readiness fails revalidation', async () => {
+  it('keeps 定时任务 hidden when stale cached readiness fails revalidation', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(scheduledTaskCapabilityQueryKey, readyCapability, { updatedAt: 0 });
     server.use(http.get('/api/capabilities/scheduled-task', () => HttpResponse.error()));
 
     render(<TestWrapper queryClient={queryClient}><Sidebar /></TestWrapper>);
 
+    expect(screen.getByText('工单')).toBeInTheDocument();
     expect(screen.queryByText('定时任务')).not.toBeInTheDocument();
     await waitFor(() => expect(queryClient.getQueryState(scheduledTaskCapabilityQueryKey)?.status).toBe('error'));
     expect(screen.queryByText('定时任务')).not.toBeInTheDocument();

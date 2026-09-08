@@ -22,6 +22,8 @@ public class AuditLogService {
 
     private static final Logger log = LoggerFactory.getLogger(AuditLogService.class);
     private static final int MAX_DETAIL_JSON_CHARS = 4000;
+    // audit_log.module / action / target_type are VARCHAR(64); longer values lose the whole row.
+    private static final int MAX_COLUMN_CHARS = 64;
 
     private final AuditLogDao auditLogDao;
     private final UserDao userDao;
@@ -81,9 +83,9 @@ public class AuditLogService {
         AuditLogDO logDO = new AuditLogDO();
         logDO.setTenantId(record.getTenantId());
         logDO.setActorId(record.getActorId());
-        logDO.setModule(record.getModule());
-        logDO.setAction(record.getAction());
-        logDO.setTargetType(record.getTargetType());
+        logDO.setModule(clampColumn(record.getModule()));
+        logDO.setAction(clampColumn(record.getAction()));
+        logDO.setTargetType(clampColumn(record.getTargetType()));
         logDO.setTargetId(record.getTargetId());
         logDO.setDetailJson(buildDetail(record));
         return logDO;
@@ -127,6 +129,13 @@ public class AuditLogService {
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private String clampColumn(String value) {
+        if (value == null || value.length() <= MAX_COLUMN_CHARS) {
+            return value;
+        }
+        return value.substring(0, MAX_COLUMN_CHARS);
     }
 
     private AuditLogVO toVO(AuditLogDO log) {

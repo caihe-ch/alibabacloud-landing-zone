@@ -26,4 +26,6 @@ public interface SkillDao {
                    @Param("version") Integer version, @Param("modifierId") Long modifierId);
     SkillDO findByTypeAndName(@Param("tenantId") Long tenantId,
                               @Param("type") String type, @Param("name") String name);
+    int releaseSoftDeletedName(@Param("tenantId") Long tenantId,
+                               @Param("type") String type, @Param("name") String name);
 }

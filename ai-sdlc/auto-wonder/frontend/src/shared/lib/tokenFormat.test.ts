@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatTokenCount, formatCredits, formatWithCommas } from './tokenFormat';
+import { formatTokenCount, formatCredits, formatCreditsFixed, formatWithCommas } from './tokenFormat';
 
 describe('formatTokenCount', () => {
   it('returns "0" for null/undefined/negative', () => {
@@ -50,6 +50,30 @@ describe('formatCredits', () => {
     expect(formatCredits(2.39)).toBe('2.39');
     expect(formatCredits(3.0)).toBe('3');
     expect(formatCredits(0.10)).toBe('0.1');
+  });
+});
+
+describe('formatCreditsFixed', () => {
+  it('returns "0.00" for null/undefined/zero/negative/non-finite', () => {
+    expect(formatCreditsFixed(null)).toBe('0.00');
+    expect(formatCreditsFixed(undefined)).toBe('0.00');
+    expect(formatCreditsFixed(0)).toBe('0.00');
+    expect(formatCreditsFixed(-1)).toBe('0.00');
+    expect(formatCreditsFixed(Number.NaN)).toBe('0.00');
+    expect(formatCreditsFixed(Number.POSITIVE_INFINITY)).toBe('0.00');
+  });
+
+  it('always keeps two decimals', () => {
+    expect(formatCreditsFixed(20)).toBe('20.00');
+    expect(formatCreditsFixed(1.5)).toBe('1.50');
+    expect(formatCreditsFixed(82.61)).toBe('82.61');
+    expect(formatCreditsFixed(0.1)).toBe('0.10');
+  });
+
+  it('rounds sub-cent values to two decimals instead of a placeholder', () => {
+    expect(formatCreditsFixed(0.004)).toBe('0.00');
+    expect(formatCreditsFixed(0.009)).toBe('0.01');
+    expect(formatCreditsFixed(1234.5678)).toBe('1234.57');
   });
 });
 

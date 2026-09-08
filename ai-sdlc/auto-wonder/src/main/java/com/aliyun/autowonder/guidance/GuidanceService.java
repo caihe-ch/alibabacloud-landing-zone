@@ -28,6 +28,7 @@ import com.aliyun.autowonder.workitem.dto.TimelineItemVO;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.util.HtmlUtils;
 
 import java.util.List;
 import java.util.Objects;
@@ -36,12 +37,21 @@ import java.util.HashSet;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class GuidanceService {
     private static final String FORMAL_WORKFLOW_ACKNOWLEDGEMENT = "收到，已转入正式工作流程。";
     private static final Set<String> ACTIVE_TURN_STATUSES = Set.of(
             "PENDING", "PACKAGING", "DISPATCHED", "ACKED", "RUNNING", "PAUSING", "PAUSE_FAILED");
+    private static final Pattern HTML_TAG_PATTERN = Pattern.compile("(?s)<[^>]*>");
+    private static final Pattern HTML_MENTION_PATTERN = Pattern.compile(
+            "(?is)<span\\b(?=[^>]*\\bdata-type\\s*=\\s*['\"]mention['\"])[^>]*>(.*?)</span>");
+    private static final Pattern AONE_WORKER_SUFFIX_PATTERN = Pattern.compile("\\(WORKER_[^)]+\\)$");
+    private static final Pattern TEXT_MENTION_PATTERN = Pattern.compile("@([^\\s\\u00a0@]+)");
+    private static final Pattern TRAILING_MENTION_PUNCTUATION_PATTERN =
+            Pattern.compile("[,，。.!！?？;；:：]+$");
 
     private final GuidanceDao guidanceDao;
     private final WorkitemDao workitemDao;
@@ -82,7 +92,7 @@ public class GuidanceService {
         List<Long> targetAgentIds = explicitTargetAgentIds == null ? List.of()
                 : explicitTargetAgentIds.stream().filter(Objects::nonNull).distinct().toList();
         if (targetAgentIds.isEmpty()) {
-            targetAgentIds = resolveLeadingMention(workspaceId, workitemId, contentMd);
+            targetAgentIds = resolveMention(workspaceId, workitemId, contentMd);
         }
         for (Long targetAgentId : targetAgentIds) {
             create(workspaceId, workitemId, commentId, targetAgentId, creatorId, contentMd);
@@ -125,50 +135,147 @@ public class GuidanceService {
         return guidance;
     }
 
-    private List<Long> resolveLeadingMention(long workspaceId, long workitemId, String contentMd) {
+    private List<Long> resolveMention(long workspaceId, long workitemId, String contentMd) {
         if (contentMd == null) {
             return List.of();
         }
-        String content = contentMd.stripLeading();
-        if (!content.startsWith("@")) {
-            return List.of();
+        for (String mentionName : mentionNames(contentMd)) {
+            List<Long> matches = workitemService.getParticipants(workitemId, workspaceId).stream()
+                    .filter(Objects::nonNull)
+                    .filter(ParticipantVO::isAgent)
+                    .filter(participant -> participant.getUserId() != null && participant.getName() != null)
+                    .filter(participant -> mentionName.equals(participant.getName().trim()))
+                    .map(ParticipantVO::getUserId)
+                    .distinct()
+                    .toList();
+            if (matches.size() == 1) {
+                return matches;
+            }
+            List<AgentDO> tenantMatches = safeList(agentDao.findByExactName(workspaceId, mentionName)).stream()
+                    .filter(agent -> agent != null && Objects.equals(agent.getTenantId(), workspaceId)
+                            && agent.getId() != null)
+                    .toList();
+            if (tenantMatches.size() == 1) {
+                return List.of(tenantMatches.get(0).getId());
+            }
         }
-        String mentionName = leadingMentionName(content);
-        if (mentionName == null || mentionName.isBlank()) {
-            return List.of();
-        }
-        List<Long> matches = workitemService.getParticipants(workitemId, workspaceId).stream()
-                .filter(Objects::nonNull)
-                .filter(ParticipantVO::isAgent)
-                .filter(participant -> participant.getUserId() != null && participant.getName() != null)
-                .filter(participant -> mentionName.equals(participant.getName().trim()))
-                .map(ParticipantVO::getUserId)
-                .distinct()
-                .toList();
-        if (matches.size() == 1) {
-            return matches;
-        }
-        List<AgentDO> tenantMatches = safeList(agentDao.findByExactName(workspaceId, mentionName)).stream()
-                .filter(agent -> agent != null && Objects.equals(agent.getTenantId(), workspaceId)
-                        && agent.getId() != null)
-                .toList();
-        return tenantMatches.size() == 1 ? List.of(tenantMatches.get(0).getId()) : List.of();
+        return resolveKnownPlainTextMention(workspaceId, htmlText(contentMd));
     }
 
-    private String leadingMentionName(String content) {
-        if (content == null || !content.startsWith("@")) {
+    /**
+     * Plain text has no mention boundary metadata. Match the known agent names so
+     * Chinese instructions may follow the mention without an intervening space,
+     * for example {@code 请@Terraform-PD数字人处理一下}.
+     */
+    private List<Long> resolveKnownPlainTextMention(long workspaceId, String content) {
+        if (content == null || !content.contains("@")) {
+            return List.of();
+        }
+        int earliest = Integer.MAX_VALUE;
+        int longestName = -1;
+        List<Long> matchedAgentIds = new ArrayList<>();
+        for (AgentDO agent : safeList(agentDao.listByTenant(workspaceId))) {
+            if (agent == null || !Objects.equals(agent.getTenantId(), workspaceId)
+                    || agent.getId() == null || agent.getName() == null || agent.getName().isBlank()) {
+                continue;
+            }
+            int index = textMentionIndex(content, agent.getName().trim());
+            if (index < 0) {
+                continue;
+            }
+            int nameLength = agent.getName().trim().length();
+            if (index < earliest || (index == earliest && nameLength > longestName)) {
+                earliest = index;
+                longestName = nameLength;
+                matchedAgentIds.clear();
+            }
+            if (index == earliest && nameLength == longestName) {
+                matchedAgentIds.add(agent.getId());
+            }
+        }
+        return matchedAgentIds.stream().distinct().count() == 1
+                ? List.of(matchedAgentIds.get(0)) : List.of();
+    }
+
+    private int textMentionIndex(String content, String agentName) {
+        String token = "@" + agentName;
+        for (int index = content.indexOf(token); index >= 0; index = content.indexOf(token, index + 1)) {
+            int end = index + token.length();
+            if (end >= content.length() || isTextMentionBoundary(content.charAt(end))) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    private boolean isTextMentionBoundary(char ch) {
+        return Character.isWhitespace(ch) || Character.isSpaceChar(ch)
+                || Character.UnicodeScript.of(ch) == Character.UnicodeScript.HAN
+                || !Character.isLetterOrDigit(ch);
+    }
+
+    private List<String> mentionNames(String contentMd) {
+        List<String> names = new ArrayList<>();
+        Matcher richTextMention = HTML_MENTION_PATTERN.matcher(contentMd);
+        while (richTextMention.find()) {
+            String mentionName = normalizeMentionName(htmlText(richTextMention.group(1)));
+            if (mentionName != null) {
+                names.add(mentionName);
+            }
+        }
+        if (!names.isEmpty()) {
+            return names;
+        }
+        Matcher textMention = TEXT_MENTION_PATTERN.matcher(htmlText(contentMd));
+        while (textMention.find()) {
+            String mentionName = normalizeMentionName("@" + textMention.group(1));
+            if (mentionName != null) {
+                names.add(mentionName);
+            }
+        }
+        return names;
+    }
+
+    private String normalizeMentionName(String mention) {
+        if (mention == null) {
             return null;
         }
-        int start = 1;
-        int end = start;
-        while (end < content.length()) {
-            char ch = content.charAt(end);
-            if (Character.isWhitespace(ch)) {
-                break;
-            }
-            end++;
+        String name = mention.strip();
+        if (!name.startsWith("@")) {
+            return null;
         }
-        return end > start ? content.substring(start, end).trim() : null;
+        name = AONE_WORKER_SUFFIX_PATTERN.matcher(name.substring(1).strip()).replaceFirst("").strip();
+        name = TRAILING_MENTION_PUNCTUATION_PATTERN.matcher(name).replaceFirst("").strip();
+        return name.isBlank() ? null : name;
+    }
+
+    private String mentionComparableContent(String contentMd) {
+        if (contentMd == null) {
+            return "";
+        }
+        String content = contentMd.stripLeading();
+        if (!content.startsWith("<")) {
+            return content;
+        }
+        Matcher mention = HTML_MENTION_PATTERN.matcher(content);
+        if (mention.find() && htmlText(content.substring(0, mention.start())).isBlank()) {
+            String displayName = htmlText(mention.group(1)).strip();
+            if (displayName.startsWith("@")) {
+                String agentName = AONE_WORKER_SUFFIX_PATTERN.matcher(displayName.substring(1).strip())
+                        .replaceFirst("")
+                        .strip();
+                if (!agentName.isBlank()) {
+                    String trailingText = htmlText(content.substring(mention.end())).strip();
+                    return "@" + agentName + (trailingText.isBlank() ? "" : " " + trailingText);
+                }
+            }
+        }
+        return htmlText(content).stripLeading();
+    }
+
+    private String htmlText(String content) {
+        String withoutTags = HTML_TAG_PATTERN.matcher(content == null ? "" : content).replaceAll("");
+        return HtmlUtils.htmlUnescape(withoutTags).replace('\u00a0', ' ');
     }
 
     private <T> List<T> safeList(List<T> rows) {
@@ -255,7 +362,7 @@ public class GuidanceService {
         if (contentMd == null || agentName == null || agentName.isBlank()) {
             return false;
         }
-        return contentMd.strip().equals("@" + agentName.strip());
+        return mentionComparableContent(contentMd).strip().equals("@" + agentName.strip());
     }
 
     private boolean hasWorkerHistory(List<DispatchDO> dispatches, long targetAgentId) {

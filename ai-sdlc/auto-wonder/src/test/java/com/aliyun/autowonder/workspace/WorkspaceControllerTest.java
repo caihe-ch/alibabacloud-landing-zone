@@ -9,11 +9,15 @@ import com.aliyun.autowonder.workspace.dto.AccessRequestVO;
 import com.aliyun.autowonder.workspace.dto.AddMemberRequest;
 import com.aliyun.autowonder.workspace.dto.CreateWorkspaceRequest;
 import com.aliyun.autowonder.workspace.dto.RejectAccessRequestBody;
+import com.aliyun.autowonder.workspace.dto.RecycleBinItemVO;
+import com.aliyun.autowonder.workspace.dto.RestoreWorkspaceRequest;
 import com.aliyun.autowonder.workspace.dto.SubmitAccessRequestBody;
 import com.aliyun.autowonder.workspace.dto.TransferOwnerRequest;
 import com.aliyun.autowonder.workspace.dto.UpdateMemberAccessRequest;
 import com.aliyun.autowonder.workspace.dto.UpdateMemberIdentityTagsRequest;
 import com.aliyun.autowonder.workspace.dto.WorkspaceListItemVO;
+import com.aliyun.autowonder.workspace.dto.WorkspaceUpdateRequest;
+import com.aliyun.autowonder.workspace.dto.WorkspaceVO;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -34,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -294,6 +299,110 @@ class WorkspaceControllerTest {
         assertArrayEquals(new String[]{"/{id}/access-requests/{requestId}/cancel"},
                 cancel.getAnnotation(PostMapping.class).value());
         assertNull(cancel.getAnnotation(RequireWorkspaceAccess.class));
+    }
+
+    @Test
+    void lifecycleRoutesUseTheRequiredMethodsAndPaths() throws Exception {
+        Method update = method("update", Long.class, WorkspaceUpdateRequest.class);
+        assertArrayEquals(new String[]{"/{id}"}, update.getAnnotation(PutMapping.class).value());
+
+        Method delete = method("delete", Long.class);
+        assertArrayEquals(new String[]{"/{id}"}, delete.getAnnotation(DeleteMapping.class).value());
+
+        Method recycleBin = method("recycleBin", String.class, int.class, int.class);
+        assertArrayEquals(new String[]{"/recycle-bin"},
+                recycleBin.getAnnotation(GetMapping.class).value());
+
+        Method restore = method("restore", Long.class, RestoreWorkspaceRequest.class);
+        assertArrayEquals(new String[]{"/{id}/restore"},
+                restore.getAnnotation(PostMapping.class).value());
+    }
+
+    @Test
+    void lifecycleRoutesAreNotWorkspaceScoped() throws Exception {
+        // @RequireWorkspaceAccess checks the caller's *token* workspace. After a delete that
+        // workspace no longer passes AuthFilter, so restore and the recycle bin would be
+        // permanently unreachable; the service enforces permission against the target
+        // workspace's owner_id and members instead.
+        assertNull(method("update", Long.class, WorkspaceUpdateRequest.class)
+                .getAnnotation(RequireWorkspaceAccess.class));
+        assertNull(method("delete", Long.class).getAnnotation(RequireWorkspaceAccess.class));
+        assertNull(method("recycleBin", String.class, int.class, int.class)
+                .getAnnotation(RequireWorkspaceAccess.class));
+        assertNull(method("restore", Long.class, RestoreWorkspaceRequest.class)
+                .getAnnotation(RequireWorkspaceAccess.class));
+    }
+
+    @Test
+    void lifecycleRoutesResolveTheCallerWithoutATokenWorkspace() {
+        // Deliberately leaves currentWorkspaceId unset: reading it would throw
+        // WORKSPACE_NOT_MEMBER for exactly the caller who just deleted their workspace.
+        AutoWonderContext.get().setUserId(42L);
+        WorkspaceVO workspace = new WorkspaceVO();
+        when(workspaceService.updateWorkspace(anyLong(), any(), anyLong())).thenReturn(workspace);
+        when(workspaceService.deleteWorkspace(anyLong(), anyLong())).thenReturn(workspace);
+        when(workspaceService.restoreWorkspace(anyLong(), any(), anyLong())).thenReturn(workspace);
+        when(workspaceService.pageRecycleBin(anyString(), anyInt(), anyInt(), anyLong()))
+                .thenReturn(new PageResult<>(Collections.<RecycleBinItemVO>emptyList(), 0L, 1, 20));
+
+        assertNull(AutoWonderContext.get().getCurrentWorkspaceId());
+        assertSame(workspace, controller.update(31L, new WorkspaceUpdateRequest()).getData());
+        assertSame(workspace, controller.delete(31L).getData());
+        assertSame(workspace, controller.restore(31L, new RestoreWorkspaceRequest()).getData());
+        controller.recycleBin("星云", 1, 20);
+    }
+
+    @Test
+    void updateAndDeleteForwardTheTargetIdTheBodyAndTheCaller() {
+        AutoWonderContext.get().setUserId(42L);
+        WorkspaceUpdateRequest body = new WorkspaceUpdateRequest();
+        body.setName("新名称");
+        body.setVersion(3);
+
+        controller.update(31L, body);
+        verify(workspaceService).updateWorkspace(31L, body, 42L);
+
+        controller.delete(31L);
+        verify(workspaceService).deleteWorkspace(31L, 42L);
+    }
+
+    @Test
+    void restoreForwardsTheBodyAndToleratesAnAbsentOne() {
+        AutoWonderContext.get().setUserId(42L);
+        RestoreWorkspaceRequest body = new RestoreWorkspaceRequest();
+        body.setNewName("星云工坊 2");
+
+        controller.restore(31L, body);
+        verify(workspaceService).restoreWorkspace(31L, body, 42L);
+
+        // @RequestBody(required = false): the common path restores under the stored name.
+        controller.restore(32L, null);
+        verify(workspaceService).restoreWorkspace(32L, null, 42L);
+    }
+
+    @Test
+    void recycleBinForwardsKeywordPageAndSizeAndLeavesClampingToTheService() {
+        AutoWonderContext.get().setUserId(42L);
+        when(workspaceService.pageRecycleBin(anyString(), anyInt(), anyInt(), anyLong()))
+                .thenReturn(new PageResult<>(Collections.<RecycleBinItemVO>emptyList(), 0L, 1, 20));
+
+        controller.recycleBin("星云", 0, 500);
+
+        // Unlike listAllWorkspaces, the controller does not clamp: pageRecycleBin already
+        // normalises both bounds, and clamping twice would hide the service contract.
+        verify(workspaceService).pageRecycleBin("星云", 0, 500, 42L);
+    }
+
+    @Test
+    void recycleBinReturnsTheServicePageUnchanged() {
+        AutoWonderContext.get().setUserId(42L);
+        PageResult<RecycleBinItemVO> page =
+                new PageResult<>(Collections.singletonList(new RecycleBinItemVO()), 1L, 1, 20);
+        when(workspaceService.pageRecycleBin(null, 1, 20, 42L)).thenReturn(page);
+
+        Result<PageResult<RecycleBinItemVO>> result = controller.recycleBin(null, 1, 20);
+
+        assertSame(page, result.getData());
     }
 
     private static void assertAccess(Method method, WorkspaceAccessLevel level, String action) {

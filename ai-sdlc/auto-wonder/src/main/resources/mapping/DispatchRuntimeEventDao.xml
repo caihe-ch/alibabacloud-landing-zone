@@ -87,6 +87,12 @@
 		ORDER BY COALESCE(seq, id) ASC, id ASC
     </select>
 
+    <select id="listByDispatchInArrivalOrder" resultMap="runtimeEventMap">
+        SELECT <include refid="cols"/> FROM dispatch_runtime_event
+        WHERE tenant_id = #{tenantId} AND dispatch_id = #{dispatchId}
+        ORDER BY id ASC
+    </select>
+
     <select id="findLatestByDispatchAndType" resultMap="runtimeEventMap">
         SELECT <include refid="cols"/> FROM dispatch_runtime_event
         WHERE tenant_id = #{tenantId}

@@ -43,4 +43,10 @@
     <select id="findByTypeAndName" resultType="com.aliyun.autowonder.skill.SkillDO">
         SELECT * FROM skill WHERE tenant_id = #{tenantId} AND type = #{type} AND name = #{name} AND is_deleted = 0 LIMIT 1
     </select>
+    <!-- 软删除行可能仍占用 uk_type_name 名称槽位（历史数据未墓碑化、迁移未执行、旧实例写入），
+         写入同名前释放该槽位，避免 INSERT 撞唯一键被兜底成 409 数据冲突 -->
+    <update id="releaseSoftDeletedName">
+        UPDATE skill SET name = CONCAT('#deleted-', id)
+        WHERE tenant_id = #{tenantId} AND type = #{type} AND name = #{name} AND is_deleted = 1
+    </update>
 </mapper>

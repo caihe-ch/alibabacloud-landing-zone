@@ -86,7 +86,7 @@ public class ExecutorService {
             throw new BizException(ErrorCode.EXECUTOR_NOT_FOUND);
         }
         String plaintext = tokenService.resolve(e.getTokenRef());
-        if (plaintext == null) {
+        if (plaintext == null || plaintext.isBlank()) {
             throw new BizException(ErrorCode.EXECUTOR_TOKEN_NOT_RETRIEVABLE);
         }
         return plaintext;
@@ -112,6 +112,14 @@ public class ExecutorService {
             log.warn("failed to persist executor heartbeat executorId={} tenantId={}",
                     executorId, tenantId, e);
         }
+    }
+
+    public ExecutorVO getDetail(long id, long tenantId) {
+        ExecutorDO e = executorDao.findById(id);
+        if (e == null || e.getTenantId() == null || e.getTenantId() != tenantId) {
+            throw new BizException(ErrorCode.EXECUTOR_NOT_FOUND);
+        }
+        return toVO(e);
     }
 
     public List<ExecutorVO> listByAgent(long agentId, long tenantId) {

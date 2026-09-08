@@ -76,7 +76,8 @@ describe('ScheduledTaskCreatePage', () => {
       }),
     );
     renderPage();
-    const expected = new Date('2026-08-12T18:00:00Z').toLocaleString('zh-CN');
-    expect(await screen.findByText(expected)).toBeInTheDocument();
+    // ScheduleEditor 把服务端下发的未来执行时间按本地时区展示（zh-CN 格式化），不再直接渲染 ISO 串
+    expect(await screen.findByText(new Date('2026-08-12T18:00:00Z').toLocaleString('zh-CN'))).toBeInTheDocument();
+    expect(screen.getByText(new Date('2026-08-13T18:00:00Z').toLocaleString('zh-CN'))).toBeInTheDocument();
   });
 });

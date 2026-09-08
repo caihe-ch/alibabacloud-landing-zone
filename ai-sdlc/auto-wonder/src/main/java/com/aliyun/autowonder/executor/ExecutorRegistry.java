@@ -52,12 +52,25 @@ public class ExecutorRegistry {
     }
 
     public void updateRunningDispatches(long executorId, List<Long> dispatchIds) {
-        ArrayList<Long> bounded = dispatchIds == null ? new ArrayList<>()
-                : new ArrayList<>(new LinkedHashSet<>(dispatchIds));
+        if (dispatchIds == null) {
+            redisManager.del(runningDispatchesKey(executorId));
+            return;
+        }
+        ArrayList<Long> bounded = new ArrayList<>(new LinkedHashSet<>(dispatchIds));
         if (bounded.size() > 50) {
             bounded = new ArrayList<>(bounded.subList(0, 50));
         }
         redisManager.set(runningDispatchesKey(executorId), bounded, RUNNING_DISPATCH_TTL_SECONDS);
+    }
+
+    /** True only when the latest heartbeat explicitly reported an empty dispatch collection. */
+    public boolean hasNoReportedRunningDispatches(long executorId) {
+        try {
+            Object value = redisManager.get(runningDispatchesKey(executorId));
+            return value instanceof Collection<?> running && running.isEmpty();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public boolean isDispatchActive(long executorId, long dispatchId) {

@@ -40,6 +40,7 @@ class WorkspaceAccessAnnotationCoverageTest {
             "com.aliyun.autowonder.aiusage.DaemonTaskUsageController",
             "com.aliyun.autowonder.artifact.DaemonArtifactController",
             "com.aliyun.autowonder.artifact.WorkitemCliUploadController",
+            "com.aliyun.autowonder.artifact.WorkitemCliDownloadController",
             "com.aliyun.autowonder.artifact.ScheduledTaskCliUploadController",
             "com.aliyun.autowonder.controller.HealthCheckController",
             "com.aliyun.autowonder.controller.HelloWorldController",
@@ -61,6 +62,13 @@ class WorkspaceAccessAnnotationCoverageTest {
                     + "com.aliyun.autowonder.branding.dto.UpdatePlatformBrandingRequest)",
             "com.aliyun.autowonder.branding.PlatformBrandingController#uploadLogo("
                     + "org.springframework.web.multipart.MultipartFile)",
+            // Platform-admin management authorizes through SystemAdminService.requireSystemAdmin;
+            // it is global, not workspace-scoped, so it stays outside the access ladder.
+            "com.aliyun.autowonder.access.PlatformAdminController#list()",
+            "com.aliyun.autowonder.access.PlatformAdminController#candidates(java.lang.String)",
+            "com.aliyun.autowonder.access.PlatformAdminController#add("
+                    + "com.aliyun.autowonder.access.dto.AddPlatformAdminRequest)",
+            "com.aliyun.autowonder.access.PlatformAdminController#remove(java.lang.Long)",
             "com.aliyun.autowonder.im.PlatformImChannelConfigController#list()",
             "com.aliyun.autowonder.im.PlatformImChannelConfigController#updateDingTalk("
                     + "com.aliyun.autowonder.im.dto.UpdateDingTalkChannelRequest)",
@@ -81,6 +89,18 @@ class WorkspaceAccessAnnotationCoverageTest {
                     + "java.lang.Long, com.aliyun.autowonder.workspace.dto.SubmitAccessRequestBody)",
             "com.aliyun.autowonder.workspace.WorkspaceController#cancelAccessRequest("
                     + "java.lang.Long, java.lang.Long)",
+            // Workspace lifecycle endpoints are addressed by path id from the workspace-select
+            // page, and after a delete the caller's token workspace no longer passes AuthFilter.
+            // @RequireWorkspaceAccess resolves against that token workspace, so annotating restore
+            // or the recycle bin would make them permanently unreachable (F5.2). WorkspaceService
+            // enforces owner / active-ADMIN / platform-admin against the target workspace instead.
+            "com.aliyun.autowonder.workspace.WorkspaceController#update("
+                    + "java.lang.Long, com.aliyun.autowonder.workspace.dto.WorkspaceUpdateRequest)",
+            "com.aliyun.autowonder.workspace.WorkspaceController#delete(java.lang.Long)",
+            "com.aliyun.autowonder.workspace.WorkspaceController#recycleBin("
+                    + "java.lang.String, int, int)",
+            "com.aliyun.autowonder.workspace.WorkspaceController#restore("
+                    + "java.lang.Long, com.aliyun.autowonder.workspace.dto.RestoreWorkspaceRequest)",
             "com.aliyun.autowonder.im.UserImIdentityController#list()",
             "com.aliyun.autowonder.im.UserImIdentityController#updateDingTalk("
                     + "com.aliyun.autowonder.im.dto.UpdateUserImIdentityRequest)",
@@ -133,6 +153,7 @@ class WorkspaceAccessAnnotationCoverageTest {
         assertAccess(ExecutorController.class, "create", WorkspaceAccessLevel.ADMIN);
         assertAccess(ExecutorController.class, "list", WorkspaceAccessLevel.READ_ONLY);
         assertAccess(ExecutorController.class, "listAll", WorkspaceAccessLevel.READ_ONLY);
+        assertAccess(ExecutorController.class, "getModelCatalog", WorkspaceAccessLevel.READ_ONLY);
         assertAccess(ExecutorController.class, "getToken", WorkspaceAccessLevel.ADMIN);
         assertAccess(ExecutorController.class, "delete", WorkspaceAccessLevel.ADMIN);
 
@@ -215,6 +236,18 @@ class WorkspaceAccessAnnotationCoverageTest {
         assertExempt(PlatformBrandingController.class, "uploadLogo");
         assertExempt(PlatformImChannelConfigController.class, "list");
         assertExempt(PlatformImChannelConfigController.class, "updateDingTalk");
+        assertExempt(PlatformAdminController.class, "list");
+        assertExempt(PlatformAdminController.class, "candidates");
+        assertExempt(PlatformAdminController.class, "add");
+        assertExempt(PlatformAdminController.class, "remove");
+    }
+
+    @Test
+    void workspaceLifecycleEndpointsStayOutsideWorkspaceAccessLadder() {
+        assertExempt(WorkspaceController.class, "update");
+        assertExempt(WorkspaceController.class, "delete");
+        assertExempt(WorkspaceController.class, "recycleBin");
+        assertExempt(WorkspaceController.class, "restore");
     }
 
     private boolean isControllerExemptFromWorkspaceAccess(Class<?> controller) {

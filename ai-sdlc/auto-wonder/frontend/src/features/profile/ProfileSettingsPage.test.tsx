@@ -103,6 +103,34 @@ function stubMemoryMcpTools() {
   );
 }
 
+function stubExecutorMcpTools() {
+  const executorTools = [
+    'autowonder.list_executors',
+    'autowonder.get_executor',
+    'autowonder.list_executor_client_kinds',
+    'autowonder.get_executor_launch_options',
+    'autowonder.create_executor',
+    'autowonder.get_executor_token',
+    'autowonder.delete_executor',
+    'autowonder.build_executor_launch_command',
+  ].map((name) => ({
+    name,
+    description: `Executor tool ${name}.`,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  }));
+  server.use(
+    http.get('/api/mcp/tokens', () => HttpResponse.json(mcpPayload([]))),
+    http.get('/api/mcp/tokens/tools', () => HttpResponse.json(mcpPayload([
+      ...executorTools,
+      {
+        name: 'autowonder.list_repos',
+        description: 'List repositories.',
+        inputSchema: { type: 'object', properties: {}, required: [] },
+      },
+    ]))),
+  );
+}
+
 describe('ProfileSettingsPage', () => {
   beforeEach(() => {
     document.body.innerHTML = '';
@@ -404,6 +432,25 @@ describe('ProfileSettingsPage', () => {
     expect(screen.getByText('autowonder.create_memory')).toBeInTheDocument();
     expect(screen.getByText('autowonder.search_memories')).toBeInTheDocument();
     expect(screen.queryByText('其他能力')).not.toBeInTheDocument();
+  });
+
+  it('groups executor MCP tools under executor management', async () => {
+    stubExecutorMcpTools();
+
+    renderPage('/profile/settings?tab=mcp');
+
+    await userEvent.click(await screen.findByRole('tab', { name: '工具' }));
+
+    expect(await screen.findByText('执行器管理')).toBeInTheDocument();
+    expect(screen.getByText('8 个工具')).toBeInTheDocument();
+    expect(screen.getByText('autowonder.list_executors')).toBeInTheDocument();
+    expect(screen.getByText('autowonder.create_executor')).toBeInTheDocument();
+    expect(screen.getByText('autowonder.get_executor_launch_options')).toBeInTheDocument();
+    expect(screen.getByText('autowonder.build_executor_launch_command')).toBeInTheDocument();
+
+    expect(screen.getByText('其他能力')).toBeInTheDocument();
+    expect(screen.getByText('1 个工具')).toBeInTheDocument();
+    expect(screen.getByText('autowonder.list_repos')).toBeInTheDocument();
   });
 
   it('uses a wider shell for MCP tab than for IM tab', async () => {

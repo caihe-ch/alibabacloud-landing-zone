@@ -105,3 +105,19 @@ baseline, merge history, decisions, and verification evidence.
 The published `docs/` tree follows the
 [community documentation policy](docs-policy.md); detailed Alibaba Cloud
 deployment and operations guidance is maintained inside the deployment Skill.
+
+## Community-Specific Defaults
+
+Four defaults differ from the internal upstream product, which sets all four to
+`false`. `AUTOWONDER_COMMUNITY_EDITION` defaults to `true` and is reported as
+`communityEdition` by `GET /api/platform/branding/public`. When it is `true` the
+frontend hides the 「更多客户端接入」 panel of the new-MCP-token dialog, which
+lists integration snippets for client runtimes the community edition does not
+ship. Set it to `false` only to restore that panel; nothing else depends on it.
+
+`AUTOWONDER_SCHEDULED_TASK_ENABLED`,
+`AUTOWONDER_SCHEDULED_TASK_SCANNER_ENABLED` and
+`AUTOWONDER_SCHEDULED_TASK_CLUSTER_READY` also default to `true`. A fresh install
+is ready immediately, but an upgrade of a deployment already serving traffic must
+set all three to `false` until every node runs the new schema. Follow
+[scheduled-task-operations.md](../scheduled-task-operations.md).

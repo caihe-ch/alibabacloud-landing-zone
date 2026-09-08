@@ -840,6 +840,154 @@ class AgentConversationServiceTest {
         verify(transport, never()).send(any(), any(), any(), any(), any());
     }
 
+    /**
+     * spec §4.6：执行器重启 / 掉线时卡片必须失效。重投意味着执行器侧的挂起
+     * requestId 早已不存在，用户回答会落库成功但答案进黑洞。
+     */
+    @Test
+    void recoverStaleTurnCancelsPendingCardsOnRedeliver() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        java.util.List<AgentConversationElicitationDO> settled = canceledCards();
+        when(elicitationService.settlePendingForTurn(1L, 77L, 55L)).thenReturn(settled);
+        Date cutoff = new Date(1_000L);
+        AgentConversationDO conv = existingConversationWithSession();
+        AgentConversationTurnDO stale = processingInboundTurn(77L);
+        when(turnDao.listStaleProcessingInboundByExecutor(1L, 9L, cutoff, 100))
+                .thenReturn(java.util.List.of(stale));
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(stale);
+
+        svc.recoverStaleTurnsForExecutor(1L, 9L, java.util.Set.of(), true, cutoff, 100);
+        // 状态转移在事务内，副作用还没出门。
+        verify(elicitationService).settlePendingForTurn(1L, 77L, 55L);
+        verify(elicitationService, never()).notifyCanceled(any());
+
+        commitTransactionSynchronizations();
+
+        verify(elicitationService).notifyCanceled(settled);
+    }
+
+    /**
+     * 事务回滚时卡片状态跟着回到 PENDING，此时绝不能已经把 cancel 帧发给执行器 ——
+     * 否则执行器侧 requestId 已取消，用户之后的回答会被服务端接受却永远投不进去。
+     */
+    @Test
+    void recoverStaleTurnSendsNoCardCancelWhenTransactionRollsBack() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        when(elicitationService.settlePendingForTurn(1L, 77L, 55L)).thenReturn(canceledCards());
+        Date cutoff = new Date(1_000L);
+        AgentConversationDO conv = existingConversationWithSession();
+        AgentConversationTurnDO stale = processingInboundTurn(77L);
+        when(turnDao.listStaleProcessingInboundByExecutor(1L, 9L, cutoff, 100))
+                .thenReturn(java.util.List.of(stale));
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(stale);
+
+        svc.recoverStaleTurnsForExecutor(1L, 9L, java.util.Set.of(), true, cutoff, 100);
+        rollbackTransactionSynchronizations();
+
+        verify(elicitationService, never()).notifyCanceled(any());
+    }
+
+    @Test
+    void recoverStaleTurnCancelsPendingCardsWhenDeliveryAttemptsAreExhausted() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        java.util.List<AgentConversationElicitationDO> settled = canceledCards();
+        when(elicitationService.settlePendingForTurn(1L, 77L, 55L)).thenReturn(settled);
+        Date cutoff = new Date(1_000L);
+        AgentConversationDO conv = existingConversationWithSession();
+        AgentConversationTurnDO stale = processingInboundTurn(77L);
+        stale.setDispatchAttempt(3);
+        when(turnDao.listStaleProcessingInboundByExecutor(1L, 9L, cutoff, 100))
+                .thenReturn(java.util.List.of(stale));
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(stale);
+        when(turnDao.updateInboundStatusIfProcessing(eq(1L), eq(77L), eq(55L),
+                eq("FAILED"), anyString())).thenReturn(1);
+
+        svc.recoverStaleTurnsForExecutor(1L, 9L, java.util.Set.of(), true, cutoff, 100);
+        commitTransactionSynchronizations();
+
+        verify(elicitationService).settlePendingForTurn(1L, 77L, 55L);
+        verify(elicitationService).notifyCanceled(settled);
+    }
+
+    /**
+     * 抢不到轮次终态说明别人已经把这一轮结掉了，这次恢复什么都不该做 —— 包括不能
+     * 把卡片 cancel 掉，否则卡片没了而轮次还在别人手里正常跑。
+     */
+    @Test
+    void recoverStaleTurnLeavesCardsAloneWhenTurnFinalizationIsLost() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        Date cutoff = new Date(1_000L);
+        AgentConversationDO conv = existingConversationWithSession();
+        AgentConversationTurnDO stale = processingInboundTurn(77L);
+        stale.setDispatchAttempt(3);
+        when(turnDao.listStaleProcessingInboundByExecutor(1L, 9L, cutoff, 100))
+                .thenReturn(java.util.List.of(stale));
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(stale);
+        when(turnDao.updateInboundStatusIfProcessing(eq(1L), eq(77L), eq(55L),
+                eq("FAILED"), anyString())).thenReturn(0);
+
+        svc.recoverStaleTurnsForExecutor(1L, 9L, java.util.Set.of(), true, cutoff, 100);
+        commitTransactionSynchronizations();
+
+        verify(elicitationService, never()).settlePendingForTurn(anyLong(), anyLong(), anyLong());
+    }
+
+    /** 执行器仍在跑这一轮时挂起请求还活着，取消卡片会把正常的问答打断。 */
+    @Test
+    void recoverStaleTurnLeavesCardsAloneWhenRuntimeStillActive() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        Date cutoff = new Date(1_000L);
+        when(turnDao.listStaleProcessingInboundByExecutor(1L, 9L, cutoff, 100))
+                .thenReturn(java.util.List.of(processingInboundTurn(77L)));
+        when(convDao.findById(1L, 77L)).thenReturn(existingConversationWithSession());
+
+        svc.recoverStaleTurnsForExecutor(1L, 9L, java.util.Set.of(55L), true, cutoff, 100);
+        commitTransactionSynchronizations();
+
+        verify(elicitationService, never()).settlePendingForTurn(anyLong(), anyLong(), anyLong());
+    }
+
+    /** 卡片联动失败不能让轮次恢复停摆，否则轮次永久卡在 PROCESSING。 */
+    @Test
+    void recoverStaleTurnProceedsWhenCardLinkageFails() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        doThrow(new IllegalStateException("db down")).when(elicitationService)
+                .settlePendingForTurn(anyLong(), anyLong(), anyLong());
+        Date cutoff = new Date(1_000L);
+        AgentConversationDO conv = existingConversationWithSession();
+        AgentConversationTurnDO stale = processingInboundTurn(77L);
+        stale.setContent("stuck");
+        when(turnDao.listStaleProcessingInboundByExecutor(1L, 9L, cutoff, 100))
+                .thenReturn(java.util.List.of(stale));
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(stale);
+
+        svc.recoverStaleTurnsForExecutor(1L, 9L, java.util.Set.of(), true, cutoff, 100);
+        commitTransactionSynchronizations();
+
+        verify(transport).send(eq(conv), eq(55L), eq("stuck"), anyString(), any());
+    }
+
+    private java.util.List<AgentConversationElicitationDO> canceledCards() {
+        AgentConversationElicitationDO record = new AgentConversationElicitationDO();
+        record.setTenantId(1L);
+        record.setConversationId(77L);
+        record.setTurnId(55L);
+        record.setRequestId("req-1");
+        record.setStatus("CANCELED");
+        return java.util.List.of(record);
+    }
+
     @Test
     void dingtalkTurnInjectsSenderContextIntoTransportContentButStoresOriginalContent() {
         when(turnDao.findByExternalMsgId(1L, "msg-2")).thenReturn(null);
@@ -988,7 +1136,7 @@ class AgentConversationServiceTest {
     @Test
     void requestTurnCancelFinalizesQueuedTurnWithoutTransport() {
         AgentConversationService cancelSvc = serviceWithPresence(mock(ConversationRuntimePresence.class));
-        cancelSvc.setConversationTurnEventService(mock(ConversationTurnEventService.class));
+        cancelSvc.setBrowserEventPublisher(mock(ConversationBrowserEventPublisher.class));
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
         AgentConversationTurnDO queued = processingInboundTurn(77L);
@@ -1008,8 +1156,8 @@ class AgentConversationServiceTest {
 
     @Test
     void acknowledgeCanceledTurnPersistsPartialOutputAndPublishesCanceledEvent() {
-        ConversationTurnEventService eventService = mock(ConversationTurnEventService.class);
-        svc.setConversationTurnEventService(eventService);
+        ConversationBrowserEventPublisher eventService = mock(ConversationBrowserEventPublisher.class);
+        svc.setBrowserEventPublisher(eventService);
         svc.setCancelAckTimeoutSeconds(3600);
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
@@ -1037,8 +1185,8 @@ class AgentConversationServiceTest {
 
     @Test
     void acknowledgeCanceledTurnPersistsFallbackWhenPartialOutputIsBlank() {
-        ConversationTurnEventService eventService = mock(ConversationTurnEventService.class);
-        svc.setConversationTurnEventService(eventService);
+        ConversationBrowserEventPublisher eventService = mock(ConversationBrowserEventPublisher.class);
+        svc.setBrowserEventPublisher(eventService);
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
         AgentConversationTurnDO inTurn = processingInboundTurn(77L);
@@ -1060,8 +1208,8 @@ class AgentConversationServiceTest {
 
     @Test
     void acknowledgeSuccessfulTurnPublishesCompletedStatusEvent() {
-        ConversationTurnEventService eventService = mock(ConversationTurnEventService.class);
-        svc.setConversationTurnEventService(eventService);
+        ConversationBrowserEventPublisher eventService = mock(ConversationBrowserEventPublisher.class);
+        svc.setBrowserEventPublisher(eventService);
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
         AgentConversationTurnDO inTurn = processingInboundTurn(77L);
@@ -1079,8 +1227,8 @@ class AgentConversationServiceTest {
 
     @Test
     void acknowledgeFailedTurnPublishesFailedStatusEvent() {
-        ConversationTurnEventService eventService = mock(ConversationTurnEventService.class);
-        svc.setConversationTurnEventService(eventService);
+        ConversationBrowserEventPublisher eventService = mock(ConversationBrowserEventPublisher.class);
+        svc.setBrowserEventPublisher(eventService);
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
         AgentConversationTurnDO inTurn = processingInboundTurn(77L);
@@ -1098,10 +1246,10 @@ class AgentConversationServiceTest {
 
     @Test
     void acknowledgeTurnSurvivesTerminalStatusEventPublishFailure() {
-        ConversationTurnEventService eventService = mock(ConversationTurnEventService.class);
+        ConversationBrowserEventPublisher eventService = mock(ConversationBrowserEventPublisher.class);
         doThrow(new RuntimeException("push down")).when(eventService)
                 .publishStatusEvent(anyLong(), anyLong(), anyLong(), anyString());
-        svc.setConversationTurnEventService(eventService);
+        svc.setBrowserEventPublisher(eventService);
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
         AgentConversationTurnDO inTurn = processingInboundTurn(77L);
@@ -1121,12 +1269,12 @@ class AgentConversationServiceTest {
 
     @Test
     void cancelAckTimeoutFinalizesStillProcessingTurnWithFallbackContent() {
-        ConversationTurnEventService eventService = mock(ConversationTurnEventService.class);
+        ConversationBrowserEventPublisher eventService = mock(ConversationBrowserEventPublisher.class);
         ConversationRuntimePresence presence = mock(ConversationRuntimePresence.class);
         when(presence.isExecutorOnline(9L)).thenReturn(true);
         when(presence.supportsProtocolFeature(9L, "CONVERSATION_TURN_CANCEL")).thenReturn(true);
         AgentConversationService presenceSvc = serviceWithPresence(presence);
-        presenceSvc.setConversationTurnEventService(eventService);
+        presenceSvc.setBrowserEventPublisher(eventService);
         presenceSvc.setCancelAckTimeoutSeconds(3600);
         AgentConversationDO conv = existingConversationWithSession();
         when(convDao.findById(1L, 77L)).thenReturn(conv);
@@ -1146,6 +1294,154 @@ class AgentConversationServiceTest {
                 && "CANCELED".equals(t.getStatus())
                 && "响应已终止".equals(t.getContent())));
         verify(eventService).publishStatusEvent(1L, 77L, 55L, "canceled");
+    }
+
+    /**
+     * S12：执行器具备结构化提问能力时解除交互禁令 —— 它的提问会经 elicitation/create
+     * 变成前端卡片，用户可以真的回答。
+     */
+    @Test
+    void systemPromptDropsInteractionBanWhenRuntimeNegotiatesAcpInteraction() {
+        ConversationRuntimePresence presence = mock(ConversationRuntimePresence.class);
+        when(presence.supportsProtocolFeature(9L, "CONVERSATION_ACP_INTERACTION_V1")).thenReturn(true);
+
+        assertFalse(dispatchedSystemPrompt(serviceWithPresence(presence)).contains("API模式"),
+                "声明 ACP 交互能力后不该再禁止 AskUserQuestion");
+    }
+
+    /**
+     * S13：向后兼容回归。老执行器没有卡片通路，禁令必须保留，否则 Agent 的提问
+     * 会掉进黑洞 —— 用户看不到问题，Agent 等不到回答。
+     */
+    @Test
+    void systemPromptKeepsInteractionBanWhenRuntimeLacksAcpInteraction() {
+        ConversationRuntimePresence presence = mock(ConversationRuntimePresence.class);
+        when(presence.supportsProtocolFeature(9L, "CONVERSATION_ACP_INTERACTION_V1")).thenReturn(false);
+
+        assertTrue(dispatchedSystemPrompt(serviceWithPresence(presence)).contains("API模式"),
+                "未声明 ACP 交互能力时必须保留交互禁令");
+    }
+
+    /** 没有 presence 组件的部署同样保守保留禁令。 */
+    @Test
+    void systemPromptKeepsInteractionBanWithoutRuntimePresence() {
+        assertTrue(dispatchedSystemPrompt(svc).contains("API模式"));
+    }
+
+    /** 澄清渠道在禁令之外还要追加澄清模式说明，两段拼接顺序不能被本次改动打乱。 */
+    @Test
+    void systemPromptAppendsClarificationSuffixForClarificationChannel() {
+        String prompt = dispatchedSystemPrompt(svc, "WORKITEM_CLARIFICATION");
+
+        assertTrue(prompt.contains("API模式"));
+        assertTrue(prompt.contains("工单需求澄清会话"));
+        assertTrue(prompt.indexOf("API模式") < prompt.indexOf("工单需求澄清会话"));
+    }
+
+    /** S9：ACP 要求 cancel 时挂起请求必须有终态，所以卡片要先于取消帧被 cancel。 */
+    @Test
+    void requestTurnCancelCancelsPendingCardsBeforeSendingCancelFrame() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        AgentConversationService presenceSvc = cancelableService();
+        presenceSvc.setConversationElicitationService(elicitationService);
+        AgentConversationDO conv = existingConversationWithSession();
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(processingInboundTurn(77L));
+
+        presenceSvc.requestTurnCancel(1L, 77L, 55L);
+
+        InOrder order = inOrder(elicitationService, transport);
+        order.verify(elicitationService).settlePendingForTurn(1L, 77L, 55L);
+        order.verify(transport).sendCancel(conv, 55L);
+    }
+
+    /** 卡片的 cancel 帧也要等提交：取消轮次的事务回滚了，卡片得留在 PENDING。 */
+    @Test
+    void requestTurnCancelDefersCardFramesUntilCommit() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        AgentConversationService presenceSvc = cancelableService();
+        presenceSvc.setConversationElicitationService(elicitationService);
+        java.util.List<AgentConversationElicitationDO> settled = canceledCards();
+        when(elicitationService.settlePendingForTurn(1L, 77L, 55L)).thenReturn(settled);
+        when(convDao.findById(1L, 77L)).thenReturn(existingConversationWithSession());
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(processingInboundTurn(77L));
+
+        presenceSvc.requestTurnCancel(1L, 77L, 55L);
+        verify(elicitationService, never()).notifyCanceled(any());
+
+        commitTransactionSynchronizations();
+
+        verify(elicitationService).notifyCanceled(settled);
+    }
+
+    /** 排队中的轮次从未下发到执行器，不可能有挂起卡片，别白跑一次查询。 */
+    @Test
+    void requestTurnCancelSkipsCardLinkageForQueuedTurn() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        svc.setConversationElicitationService(elicitationService);
+        when(convDao.findById(1L, 77L)).thenReturn(existingConversationWithSession());
+        AgentConversationTurnDO queued = processingInboundTurn(77L);
+        queued.setStatus("QUEUED");
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(queued);
+        when(turnDao.updateStatusIfCurrent(1L, 55L, "QUEUED", "CANCELED", null)).thenReturn(1);
+
+        svc.requestTurnCancel(1L, 77L, 55L);
+
+        verify(elicitationService, never()).settlePendingForTurn(anyLong(), anyLong(), anyLong());
+    }
+
+    /** 卡片联动失败不能阻断取消：用户点了停止就必须停下来。 */
+    @Test
+    void requestTurnCancelProceedsWhenCardLinkageFails() {
+        ConversationElicitationService elicitationService = mock(ConversationElicitationService.class);
+        AgentConversationService presenceSvc = cancelableService();
+        presenceSvc.setConversationElicitationService(elicitationService);
+        AgentConversationDO conv = existingConversationWithSession();
+        when(convDao.findById(1L, 77L)).thenReturn(conv);
+        when(turnDao.findByConversationTurn(1L, 77L, 55L)).thenReturn(processingInboundTurn(77L));
+        doThrow(new IllegalStateException("db down")).when(elicitationService)
+                .settlePendingForTurn(anyLong(), anyLong(), anyLong());
+
+        presenceSvc.requestTurnCancel(1L, 77L, 55L);
+
+        verify(transport).sendCancel(conv, 55L);
+    }
+
+    private AgentConversationService cancelableService() {
+        ConversationRuntimePresence presence = mock(ConversationRuntimePresence.class);
+        when(presence.isExecutorOnline(9L)).thenReturn(true);
+        when(presence.supportsProtocolFeature(9L, "CONVERSATION_TURN_CANCEL")).thenReturn(true);
+        AgentConversationService target = serviceWithPresence(presence);
+        target.setCancelAckTimeoutSeconds(3600);
+        return target;
+    }
+
+    /** 走一遍首轮下发，把实际拼出的 systemPrompt 捞出来断言。 */
+    private String dispatchedSystemPrompt(AgentConversationService target) {
+        return dispatchedSystemPrompt(target, "DINGTALK");
+    }
+
+    private String dispatchedSystemPrompt(AgentConversationService target, String channel) {
+        when(turnDao.findByExternalMsgId(eq(1L), anyString())).thenReturn(null);
+        when(convDao.findByKey(1L, channel, "conv-prompt", 3L)).thenReturn(null);
+        when(executorSelector.select(eq(3L), isNull())).thenReturn(9L);
+        when(convDao.insert(any())).thenAnswer(inv -> {
+            AgentConversationDO c = inv.getArgument(0);
+            c.setId(77L);
+            return 1;
+        });
+        when(turnDao.insert(any())).thenAnswer(inv -> {
+            AgentConversationTurnDO t = inv.getArgument(0);
+            t.setId(88L);
+            return 1;
+        });
+
+        target.submitTurn(1L, 3L, channel, "conv-prompt", "hi", "msg-prompt");
+        commitTransactionSynchronizations();
+
+        ArgumentCaptor<String> sysCap = ArgumentCaptor.forClass(String.class);
+        verify(transport).send(any(), eq(88L), eq("hi"), sysCap.capture(), any());
+        return sysCap.getValue();
     }
 
     private AgentConversationService serviceWithPresence(ConversationRuntimePresence presence) {

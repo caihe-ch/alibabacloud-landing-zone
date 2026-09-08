@@ -1,5 +1,6 @@
 package com.aliyun.autowonder.user;
 
+import com.aliyun.autowonder.access.SystemAdminService;
 import com.aliyun.autowonder.auth.jwt.JwtProperties;
 import com.aliyun.autowonder.auth.jwt.JwtService;
 import com.aliyun.autowonder.auth.jwt.TokenPayload;
@@ -13,6 +14,8 @@ import com.aliyun.autowonder.user.dto.LoginResponse;
 import com.aliyun.autowonder.user.dto.LogoutRequest;
 import com.aliyun.autowonder.user.dto.RegisterRequest;
 import com.aliyun.autowonder.user.dto.UserVO;
+import com.aliyun.autowonder.workspace.WorkspaceMemberDO;
+import com.aliyun.autowonder.workspace.WorkspaceMemberDao;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
@@ -23,13 +26,19 @@ public class UserService {
     private final JwtService jwtService;
     private final SessionService sessionService;
     private final JwtProperties jwtProperties;
+    private final WorkspaceMemberDao workspaceMemberDao;
+    private final SystemAdminService systemAdminService;
 
     public UserService(UserDao userDao, JwtService jwtService,
-                       SessionService sessionService, JwtProperties jwtProperties) {
+                       SessionService sessionService, JwtProperties jwtProperties,
+                       WorkspaceMemberDao workspaceMemberDao,
+                       SystemAdminService systemAdminService) {
         this.userDao = userDao;
         this.jwtService = jwtService;
         this.sessionService = sessionService;
         this.jwtProperties = jwtProperties;
+        this.workspaceMemberDao = workspaceMemberDao;
+        this.systemAdminService = systemAdminService;
     }
 
     public UserVO register(RegisterRequest req) {
@@ -46,6 +55,9 @@ public class UserService {
         user.setPasswordHash(PasswordEncoderUtil.encode(req.getPassword()));
         user.setStatus(0);
         userDao.insert(user);
+        // D3: the platform's first active user is its admin. Idempotent — a no-op once any
+        // admin exists — so registering later users never changes who administers.
+        systemAdminService.ensureSystemAdmin();
 
         UserVO vo = new UserVO();
         vo.setId(user.getId());
@@ -78,7 +90,7 @@ public class UserService {
         }
     }
 
-    public String refreshAccessToken(String refreshToken) {
+    public String refreshAccessToken(String refreshToken, Long workspaceId) {
         if (refreshToken == null || refreshToken.isBlank()) {
             throw new BizException(ErrorCode.PARAM_INVALID, "refreshToken 不能为空");
         }
@@ -87,7 +99,24 @@ public class UserService {
             throw new BizException(ErrorCode.UNAUTHORIZED, "刷新令牌无效或已过期");
         }
         String jti = UUID.randomUUID().toString();
-        return jwtService.signAccess(new TokenPayload(userId, null, jti));
+        return jwtService.signAccess(
+                new TokenPayload(userId, resolveWorkspaceClaim(userId, workspaceId), jti));
+    }
+
+    // AuthFilter reads the workspace claim back into the request context, so signing it as null
+    // detaches the session from its workspace and every workspace-scoped call fails 11001.
+    // The claim is re-validated instead of trusted: the caller declares, the server decides.
+    private Long resolveWorkspaceClaim(Long userId, Long workspaceId) {
+        if (workspaceId == null) {
+            return null;
+        }
+        WorkspaceMemberDO member = workspaceMemberDao.findByWorkspaceAndUser(workspaceId, userId);
+        if (member == null
+                || !Integer.valueOf(0).equals(member.getStatus())
+                || !Integer.valueOf(0).equals(member.getIsDeleted())) {
+            return null;
+        }
+        return workspaceId;
     }
 
     public void changePassword(Long userId, ChangePasswordRequest req) {

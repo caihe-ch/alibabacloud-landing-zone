@@ -10,5 +10,7 @@ public class WorkspaceMembershipDO {
     private Long id;
     private String name;
     private String description;
+    /** org.owner_id (D8): there is no OWNER access level, so ownership is read off the workspace. */
+    private Long ownerId;
     private String accessLevel;
 }

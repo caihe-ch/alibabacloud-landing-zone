@@ -81,6 +81,14 @@ public interface DispatchDao {
                                @Param("beforeEpochMillis") long beforeEpochMillis,
                                @Param("limit") int limit);
 
+    /**
+     * In-flight dispatches of one workspace, oldest first, for the logical-delete linkage (D5).
+     * Caller supplies the status set so pauseable and non-pauseable rows are each one query.
+     */
+    List<DispatchDO> listInFlightByTenant(@Param("tenantId") Long tenantId,
+                                          @Param("statuses") Collection<String> statuses,
+                                          @Param("limit") int limit);
+
     /** Tenant-scoped, filtered, paged dispatch list, newest first. */
     List<DispatchDO> listByTenant(@Param("tenantId") Long tenantId,
                                   @Param("status") String status,

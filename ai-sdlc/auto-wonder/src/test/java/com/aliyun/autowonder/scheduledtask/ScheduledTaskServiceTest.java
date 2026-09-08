@@ -26,12 +26,14 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -42,6 +44,7 @@ class ScheduledTaskServiceTest {
     private static final Instant NOW = Instant.parse("2026-08-10T00:00:00Z");
 
     private ScheduledTaskDao taskDao;
+    private ScheduledTaskRunDao runDao;
     private SquadDao squadDao;
     private SquadMemberDao memberDao;
     private AgentDao agentDao;
@@ -51,11 +54,12 @@ class ScheduledTaskServiceTest {
     @BeforeEach
     void setUp() {
         taskDao = mock(ScheduledTaskDao.class);
+        runDao = mock(ScheduledTaskRunDao.class);
         squadDao = mock(SquadDao.class);
         memberDao = mock(SquadMemberDao.class);
         agentDao = mock(AgentDao.class);
         auditLogService = mock(AuditLogService.class);
-        service = new ScheduledTaskService(taskDao, squadDao, memberDao, agentDao,
+        service = new ScheduledTaskService(taskDao, runDao, squadDao, memberDao, agentDao,
                 auditLogService, new ScheduledTaskSchedule(),
                 Clock.fixed(NOW, ZoneOffset.UTC));
         givenValidSquadAndAgent(TENANT_ID);
@@ -304,6 +308,136 @@ class ScheduledTaskServiceTest {
 
         assertEquals("30005", exception.getCode());
         verify(taskDao, never()).updateStatus(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void deleteRetiresCursorHidesRowAndAuditsPreviousStatus() {
+        ScheduledTaskDO stored = storedTask("ACTIVE", 2);
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(stored);
+        when(runDao.findActiveByTask(TENANT_ID, 900L)).thenReturn(List.of());
+        when(taskDao.softDelete(TENANT_ID, 900L, 2, USER_ID)).thenReturn(1);
+
+        service.delete(900L, 2, TENANT_ID, USER_ID);
+
+        verify(taskDao).softDelete(TENANT_ID, 900L, 2, USER_ID);
+        assertEquals(1, stored.getIsDeleted());
+        assertEquals("ARCHIVED", stored.getStatus());
+        assertNull(stored.getNextFireAt());
+        assertEquals(3, stored.getVersion());
+        assertEquals(USER_ID, stored.getModifierId());
+        ArgumentCaptor<AuditLogRecord> captor = ArgumentCaptor.forClass(AuditLogRecord.class);
+        verify(auditLogService).recordRequired(captor.capture());
+        AuditLogRecord record = captor.getValue();
+        assertEquals("SCHEDULED_TASK", record.getModule());
+        assertEquals("DELETE", record.getAction());
+        assertEquals(900L, record.getTargetId());
+        assertEquals("ACTIVE", record.getDetail().get("previousStatus"));
+        assertEquals("ARCHIVED", record.getDetail().get("status"));
+    }
+
+    @Test
+    void deleteIsAllowedFromEveryNonDeletedStatus() {
+        when(runDao.findActiveByTask(TENANT_ID, 900L)).thenReturn(List.of());
+        when(taskDao.softDelete(TENANT_ID, 900L, 1, USER_ID)).thenReturn(1);
+
+        for (String status : List.of("ACTIVE", "PAUSED", "EXHAUSTED", "ARCHIVED")) {
+            when(taskDao.findById(TENANT_ID, 900L)).thenReturn(storedTask(status, 1));
+
+            service.delete(900L, 1, TENANT_ID, USER_ID);
+        }
+
+        verify(taskDao, times(4)).softDelete(TENANT_ID, 900L, 1, USER_ID);
+    }
+
+    @Test
+    void deleteRejectsWhileRunsAreStillActive() {
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(storedTask("PAUSED", 1));
+        ScheduledTaskRunDO running = new ScheduledTaskRunDO();
+        running.setId(10482L);
+        running.setStatus("WAITING_EXECUTOR");
+        when(runDao.findActiveByTask(TENANT_ID, 900L)).thenReturn(List.of(running));
+
+        BizException exception = assertThrows(BizException.class,
+                () -> service.delete(900L, 1, TENANT_ID, USER_ID));
+
+        assertEquals("30005", exception.getCode());
+        assertTrue(exception.getMessage().contains("未结束的运行实例"));
+        verify(taskDao, never()).softDelete(any(), any(), any(), any());
+        verify(auditLogService, never()).recordRequired(any());
+    }
+
+    @Test
+    void deleteTreatsNullActiveRunListAsNoActiveRun() {
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(storedTask("PAUSED", 1));
+        when(runDao.findActiveByTask(TENANT_ID, 900L)).thenReturn(null);
+        when(taskDao.softDelete(TENANT_ID, 900L, 1, USER_ID)).thenReturn(1);
+
+        service.delete(900L, 1, TENANT_ID, USER_ID);
+
+        verify(taskDao).softDelete(TENANT_ID, 900L, 1, USER_ID);
+        verify(auditLogService).recordRequired(any(AuditLogRecord.class));
+    }
+
+    @Test
+    void deleteReportsVersionConflictWhenCasLostTheRace() {
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(storedTask("ARCHIVED", 5));
+        when(runDao.findActiveByTask(TENANT_ID, 900L)).thenReturn(List.of());
+        when(taskDao.softDelete(TENANT_ID, 900L, 5, USER_ID)).thenReturn(0);
+
+        BizException exception = assertThrows(BizException.class,
+                () -> service.delete(900L, 5, TENANT_ID, USER_ID));
+
+        assertEquals("30002", exception.getCode());
+        verify(taskDao).softDelete(TENANT_ID, 900L, 5, USER_ID);
+        verify(auditLogService, never()).recordRequired(any());
+    }
+
+    @Test
+    void deleteRejectsStaleOrMissingExpectedVersion() {
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(storedTask("ACTIVE", 2));
+
+        BizException stale = assertThrows(BizException.class,
+                () -> service.delete(900L, 1, TENANT_ID, USER_ID));
+        BizException missing = assertThrows(BizException.class,
+                () -> service.delete(900L, null, TENANT_ID, USER_ID));
+
+        assertEquals("30002", stale.getCode());
+        assertEquals("30002", missing.getCode());
+        verify(taskDao, never()).softDelete(any(), any(), any(), any());
+        verify(runDao, never()).findActiveByTask(any(), any());
+    }
+
+    @Test
+    void deleteRejectsUnknownOrAlreadyDeletedTask() {
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(null);
+
+        BizException unknown = assertThrows(BizException.class,
+                () -> service.delete(900L, 1, TENANT_ID, USER_ID));
+
+        ScheduledTaskDO alreadyDeleted = storedTask("ARCHIVED", 1);
+        alreadyDeleted.setIsDeleted(1);
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(alreadyDeleted);
+
+        BizException deleted = assertThrows(BizException.class,
+                () -> service.delete(900L, 1, TENANT_ID, USER_ID));
+
+        assertEquals("30001", unknown.getCode());
+        assertEquals("30001", deleted.getCode());
+        verify(runDao, never()).findActiveByTask(any(), any());
+        verify(taskDao, never()).softDelete(any(), any(), any(), any());
+    }
+
+    @Test
+    void deleteRejectsNonPositiveAuditActor() {
+        when(taskDao.findById(TENANT_ID, 900L)).thenReturn(storedTask("ACTIVE", 2));
+
+        BizException exception = assertThrows(BizException.class,
+                () -> service.delete(900L, 2, TENANT_ID, 0L));
+
+        assertEquals("30004", exception.getCode());
+        verify(runDao, never()).findActiveByTask(any(), any());
+        verify(taskDao, never()).softDelete(any(), any(), any(), any());
+        verify(auditLogService, never()).recordRequired(any());
     }
 
     @Test

@@ -47,18 +47,6 @@ export async function getClarificationConversation(
   return resp.data;
 }
 
-export async function getClarificationEvents(
-  workitemId: number | string,
-  conversationId: number,
-  afterId: number = 0,
-): Promise<ClarificationTurnEvent[]> {
-  const resp = await apiClient.get<ClarificationTurnEvent[]>(
-    `${base(workitemId)}/${conversationId}/events`,
-    { params: { afterId } },
-  );
-  return resp.data;
-}
-
 export async function submitClarificationTurn(
   workitemId: number | string,
   conversationId: number,
@@ -79,4 +67,31 @@ export async function cancelClarificationTurn(
   await apiClient.post(
     `${base(workitemId)}/${conversationId}/turns/${turnId}/cancel`,
   );
+}
+
+/** content 以字符串承载：requestedSchema 是任意 JSON Schema，答案结构由 Agent 决定，
+ *  原样透传回执行器最安全，服务端与前端都不重排。 */
+export async function replyClarificationElicitation(
+  workitemId: number | string,
+  conversationId: number,
+  requestId: string,
+  action: 'accept' | 'decline',
+  content?: Record<string, unknown>,
+): Promise<void> {
+  await apiClient.post(
+    `${base(workitemId)}/${conversationId}/elicitations/${encodeURIComponent(requestId)}/reply`,
+    { action, content: content ? JSON.stringify(content) : null },
+  );
+}
+
+/** 现有 GET /events 只支持 afterId 且上限 200，取不全一轮，故单开按轮次端点。 */
+export async function getClarificationTurnEvents(
+  workitemId: number | string,
+  conversationId: number,
+  turnId: number,
+): Promise<ClarificationTurnEvent[]> {
+  const resp = await apiClient.get<ClarificationTurnEvent[]>(
+    `${base(workitemId)}/${conversationId}/turns/${turnId}/events`,
+  );
+  return resp.data;
 }

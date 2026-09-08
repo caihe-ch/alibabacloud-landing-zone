@@ -20,6 +20,19 @@ public interface UserDao {
 
     Long findFirstActiveUserId();
 
+    long countSystemAdmins();
+
+    /** Idempotent: the {@code is_admin = 0} guard makes a repeat call a no-op. */
+    int markSystemAdmin(@Param("id") Long id);
+
+    /** Idempotent: the {@code is_admin = 1} guard makes a repeat call a no-op. */
+    int revokeSystemAdmin(@Param("id") Long id);
+
+    List<UserDO> listSystemAdmins();
+
+    List<UserDO> searchSystemAdminCandidates(@Param("keyword") String keyword,
+                                             @Param("limit") int limit);
+
     List<UserDO> searchWorkspaceCandidates(@Param("tenantId") Long tenantId,
                                       @Param("keyword") String keyword,
                                       @Param("limit") int limit);

@@ -6,6 +6,7 @@ COPY pom.xml ./
 COPY frontend ./frontend
 COPY src ./src
 COPY docs ./docs
+COPY scripts ./scripts
 COPY APP-META ./APP-META
 RUN --mount=type=cache,target=/root/.m2 \
     --mount=type=cache,target=/workspace/target/npm-cache \

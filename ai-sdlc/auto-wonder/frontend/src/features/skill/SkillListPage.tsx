@@ -1,18 +1,20 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { Key } from 'react';
 import {
   Table, Card, Collapse, Tag, Button, Space, Segmented, Modal, Form, Input, Select, Popconfirm, message,
-  Radio, Alert, Typography, Descriptions, Divider, InputNumber, Checkbox, Tooltip,
+  Radio, Alert, Typography, Descriptions, Divider, InputNumber, Checkbox, Tooltip, Tree, Spin,
 } from 'antd';
-import { PlusOutlined, EditOutlined, DeleteOutlined, FolderOpenOutlined, FileTextOutlined, MinusCircleOutlined } from '@ant-design/icons';
+import { PlusOutlined, EditOutlined, DeleteOutlined, FolderOpenOutlined, FileTextOutlined, MinusCircleOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   listSkills, createSkill, updateSkill, deleteSkill, createSkillFromPackage, updateSkillPackage,
-  testSkillConnection,
+  testSkillConnection, getSkillPackageFiles, getSkillPackageFile, downloadSkillPackage,
 } from './api';
-import type { Skill, SkillConnectionTestResult } from './api';
+import type { Skill, SkillConnectionTestResult, SkillPackageFile, SkillPackageFileContent } from './api';
 import type { ColumnsType } from 'antd/es/table';
-import { buildSkillZip, readSkillDirectory } from './skillPackage';
+import { buildSkillZip, readSkillDirectory, buildPackageTree, formatBytes } from './skillPackage';
 import type { SkillDirectoryReadResult } from './skillPackage';
+import { MarkdownView } from '@/shared/ui/MarkdownView';
 import { useAccessCommand } from '@/shared/auth/useAccessCommand';
 import { listExecutors } from '@/features/executor/api';
 import type { ExecutorVO } from '@/features/executor/api';
@@ -57,6 +59,19 @@ function accessLabel(record: Skill) {
   return '命令行接入';
 }
 
+/** 与后端 packageRef 的前置校验保持一致：只有存在 packageOssRef 的 OSS_ZIP 才有包可看。 */
+function isPackageSkill(skill: Skill | null): skill is Skill {
+  return !!skill && skill.sourceType === 'OSS_ZIP' && !!skill.packageOssRef;
+}
+
+function isMarkdown(path: string): boolean {
+  return /\.(md|markdown)$/i.test(path);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : '操作失败';
+}
+
 export function SkillListPage() {
   const queryClient = useQueryClient();
   const runWithAccess = useAccessCommand();
@@ -80,6 +95,16 @@ export function SkillListPage() {
   const [form] = Form.useForm();
   const selectedType = Form.useWatch('type', form);
 
+  const [packageFiles, setPackageFiles] = useState<SkillPackageFile[]>([]);
+  const [packageFilesLoading, setPackageFilesLoading] = useState(false);
+  const [packageFilesError, setPackageFilesError] = useState<string | null>(null);
+  const [selectedPackagePath, setSelectedPackagePath] = useState<string | null>(null);
+  const [packageFileContent, setPackageFileContent] = useState<SkillPackageFileContent | null>(null);
+  const [packageFileLoading, setPackageFileLoading] = useState(false);
+  const [downloadingPackage, setDownloadingPackage] = useState(false);
+  // 单文件内容请求的自增序号：用于作废在途响应，避免跨技能同名文件（如 SKILL.md）乱序返回时渲染错内容
+  const packageFileRequestSeq = useRef(0);
+
   const { data = [], isLoading } = useQuery({
     queryKey: ['skills', page, size, typeFilter],
     queryFn: () => listSkills({ page, size, type: typeFilter || undefined }),
@@ -87,6 +112,131 @@ export function SkillListPage() {
   const { data: executors = [] } = useQuery<ExecutorVO[]>({ queryKey: ['executors'], queryFn: () => listExecutors() });
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['skills'] });
+
+  const closeDetail = () => {
+    setDetailSkill(null);
+    setPackageFiles([]);
+    setPackageFilesError(null);
+    setSelectedPackagePath(null);
+    setPackageFileContent(null);
+  };
+
+  // 打开详情时才拉目录树。cancelled 标志防止快速切换技能时旧响应覆盖新技能的包内容。
+  useEffect(() => {
+    // 同时作废上一个技能仍在途的单文件内容请求，否则它返回后会写进新技能的预览面板
+    packageFileRequestSeq.current += 1;
+    setPackageFiles([]);
+    setPackageFilesError(null);
+    setSelectedPackagePath(null);
+    setPackageFileContent(null);
+    setPackageFileLoading(false);
+    if (!isPackageSkill(detailSkill)) {
+      setPackageFilesLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPackageFilesLoading(true);
+    getSkillPackageFiles(detailSkill.id)
+      .then((result) => {
+        if (!cancelled) setPackageFiles(result.files ?? []);
+      })
+      .catch((error) => {
+        if (!cancelled) setPackageFilesError(errorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setPackageFilesLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [detailSkill]);
+
+  const packageEntryMap = useMemo(
+    () => new Map(packageFiles.map((file) => [file.path, file])),
+    [packageFiles],
+  );
+  const packageTree = useMemo(() => buildPackageTree(packageFiles), [packageFiles]);
+  const selectedPackageEntry = selectedPackagePath ? packageEntryMap.get(selectedPackagePath) ?? null : null;
+
+  const handlePackageSelect = async (keys: Key[]) => {
+    const path = keys.length > 0 ? String(keys[0]) : null;
+    // 取号即作废此前所有在途请求：先发出但后返回的响应不得覆盖当前选中项
+    const seq = ++packageFileRequestSeq.current;
+    const stale = () => seq !== packageFileRequestSeq.current;
+    setSelectedPackagePath(path);
+    setPackageFileContent(null);
+    setPackageFileLoading(false);
+    if (!path || !detailSkill) return;
+    const entry = packageEntryMap.get(path);
+    // 目录只展开层级；图片与二进制只展示元信息，不请求内容
+    if (!entry || entry.dir || entry.kind !== 'TEXT') return;
+    setPackageFileLoading(true);
+    try {
+      const content = await getSkillPackageFile(detailSkill.id, path);
+      if (!stale()) setPackageFileContent(content);
+    } catch (error) {
+      if (!stale()) message.error(errorMessage(error));
+    } finally {
+      if (!stale()) setPackageFileLoading(false);
+    }
+  };
+
+  const handleDownloadPackage = async () => {
+    if (!detailSkill) return;
+    setDownloadingPackage(true);
+    try {
+      await downloadSkillPackage(detailSkill.id, detailSkill.packageFileName);
+    } catch (error) {
+      message.error(errorMessage(error));
+    } finally {
+      setDownloadingPackage(false);
+    }
+  };
+
+  const renderPackagePreview = () => {
+    if (!selectedPackagePath || !selectedPackageEntry) {
+      return <Typography.Text type="secondary">选择左侧文件查看内容</Typography.Text>;
+    }
+    if (selectedPackageEntry.dir) {
+      const prefix = `${selectedPackagePath}/`;
+      const childCount = packageFiles.filter((file) => file.path.startsWith(prefix)
+        && !file.path.substring(prefix.length).includes('/')).length;
+      return (
+        <Space direction="vertical" size={4}>
+          <Typography.Text strong>{selectedPackagePath}</Typography.Text>
+          <Typography.Text type="secondary">目录 · {childCount} 项</Typography.Text>
+        </Space>
+      );
+    }
+    if (selectedPackageEntry.kind !== 'TEXT') {
+      return (
+        <Space direction="vertical" size={4}>
+          <Typography.Text strong>{selectedPackageEntry.name}</Typography.Text>
+          <Typography.Text type="secondary">
+            该文件不支持在线预览（{selectedPackageEntry.kind === 'IMAGE' ? '图片' : '二进制'} · {formatBytes(selectedPackageEntry.size)}）
+          </Typography.Text>
+        </Space>
+      );
+    }
+    if (packageFileLoading) {
+      return <Spin />;
+    }
+    if (!packageFileContent) {
+      return <Typography.Text type="secondary">内容加载失败</Typography.Text>;
+    }
+    return isMarkdown(packageFileContent.path) ? (
+      <MarkdownView content={packageFileContent.content} />
+    ) : (
+      // pre 的 UA 默认 white-space:pre 会关闭折行，超长行会撑破弹窗，这里强制折行
+      <pre style={{
+        margin: 0,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        fontSize: 12,
+      }}>
+        {packageFileContent.content}
+      </pre>
+    );
+  };
 
   const createMut = useMutation({
     mutationFn: createSkill,
@@ -420,8 +570,8 @@ export function SkillListPage() {
       <Modal
         title="能力详情"
         open={!!detailSkill}
-        onCancel={() => setDetailSkill(null)}
-        footer={<Button onClick={() => setDetailSkill(null)}>关闭</Button>}
+        onCancel={closeDetail}
+        footer={<Button onClick={closeDetail}>关闭</Button>}
         width={720}
       >
         {detailSkill && (
@@ -471,6 +621,71 @@ export function SkillListPage() {
                 <Typography.Text type="secondary">
                   OSS Ref: {detailSkill.packageOssRef}
                 </Typography.Text>
+              </>
+            )}
+            {isPackageSkill(detailSkill) && (
+              <>
+                <Divider style={{ margin: 0 }} />
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Typography.Text strong>包内容</Typography.Text>
+                    <Button
+                      size="small"
+                      icon={<DownloadOutlined />}
+                      loading={downloadingPackage}
+                      onClick={handleDownloadPackage}
+                    >
+                      下载技能包
+                    </Button>
+                  </div>
+                  {packageFilesError && (
+                    <Alert type="error" showIcon style={{ marginTop: 8 }} message={packageFilesError} />
+                  )}
+                  <Spin spinning={packageFilesLoading}>
+                    <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+                      <div
+                        data-testid="skill-package-tree"
+                        style={{
+                          width: 260,
+                          flexShrink: 0,
+                          maxHeight: 300,
+                          overflow: 'auto',
+                          border: '1px solid #f0f0f0',
+                          borderRadius: 8,
+                          padding: 8,
+                        }}
+                      >
+                        {packageTree.length > 0 ? (
+                          <Tree
+                            treeData={packageTree}
+                            selectedKeys={selectedPackagePath ? [selectedPackagePath] : []}
+                            onSelect={handlePackageSelect}
+                            showLine
+                            blockNode
+                            defaultExpandAll
+                          />
+                        ) : packageFilesLoading || packageFilesError ? null : (
+                          // 清单拉取失败时上方已有错误 Alert，再显示空态会被误读为包本身没内容
+                          <Typography.Text type="secondary">技能包为空</Typography.Text>
+                        )}
+                      </div>
+                      <div
+                        data-testid="skill-package-preview"
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          maxHeight: 300,
+                          overflow: 'auto',
+                          border: '1px solid #f0f0f0',
+                          borderRadius: 8,
+                          padding: 12,
+                        }}
+                      >
+                        {renderPackagePreview()}
+                      </div>
+                    </div>
+                  </Spin>
+                </div>
               </>
             )}
           </Space>

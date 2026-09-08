@@ -15,7 +15,7 @@ import {
 } from './hooks';
 import { listRepos } from '@/features/repo/api';
 import { listSkills } from '@/features/skill/api';
-import { listMemories } from '@/features/memory/api';
+import { listMemories, type Memory } from '@/features/memory/api';
 import { listSdlcTemplates } from '@/features/sdlc/api';
 import { AGENT_ROLE_CODE_OPTIONS, AGENT_ROLE_NAME_OPTIONS, getRoleCodeByName, getRoleNameByCode } from './constants';
 import type { ColumnsType } from 'antd/es/table';
@@ -39,7 +39,7 @@ interface SkillRow {
 
 interface MemoryRow {
   memoryId: number;
-  contentMd: string;
+  title: string;
   source: string;
 }
 
@@ -54,6 +54,10 @@ function uniqueBy<T>(items: T[], keyOf: (item: T) => string | number): T[] {
 
 function errorMessage(e: unknown, fallback: string) {
   return e instanceof Error && e.message ? e.message : fallback;
+}
+
+function memoryTitle(memory: Memory | undefined, memoryId: number) {
+  return memory?.title?.trim() || `#${memoryId}`;
 }
 
 function evolutionModeFromIdentity(identityJson?: string | null): EvolutionMode {
@@ -123,6 +127,8 @@ export function AgentEditPage() {
   // Reference data — backend returns raw arrays; API types say PageResult but runtime is T[]
   const { data: reposRaw } = useQuery({ queryKey: ['repos', 1, 100], queryFn: () => listRepos({ page: 1, size: 100 }) });
   const { data: skillsRaw } = useQuery({ queryKey: ['skills', 1, 100], queryFn: () => listSkills({ page: 1, size: 100 }) });
+  // 不按 status 过滤：已绑定记忆可能是历史 PENDING/REJECTED 引用，需要全量列表才能解析出标题；
+  // “仅已审核可选”的限制加在导入下拉的候选项上。
   const { data: memoriesRaw } = useQuery({ queryKey: ['memories', 1, 100], queryFn: () => listMemories({ page: 1, size: 100 }) });
   const { data: sdlcsRaw } = useQuery({ queryKey: ['sdlcs', 1, 100], queryFn: () => listSdlcTemplates({ page: 1, size: 100 }) });
   // Safe extract: handle both PageResult and raw array
@@ -170,7 +176,7 @@ export function AgentEditPage() {
       const memory = memoriesList.find((item) => item.id === memoryRef.memoryId);
       return {
         memoryId: memoryRef.memoryId,
-        contentMd: memory?.contentMd || `#${memoryRef.memoryId}`,
+        title: memoryTitle(memory, memoryRef.memoryId),
         source: memoryRef.source,
       };
     }), item => item.memoryId));
@@ -312,7 +318,7 @@ export function AgentEditPage() {
           addMemoryRef.mutateAsync({ agentId, memoryId, source: 'ORG' })));
         const added = selectedMemoryIds.map(memoryId => {
           const mem = memoriesList.find(m => m.id === memoryId);
-          return { memoryId, contentMd: mem?.contentMd || '', source: 'ORG' };
+          return { memoryId, title: memoryTitle(mem, memoryId), source: 'ORG' };
         });
         setMemories(prev => uniqueBy([...prev, ...added], item => item.memoryId));
         setMemoryModalOpen(false);
@@ -360,7 +366,7 @@ export function AgentEditPage() {
   ];
 
   const memoryColumns: ColumnsType<MemoryRow> = [
-    { title: '内容', dataIndex: 'contentMd', ellipsis: true },
+    { title: '标题', dataIndex: 'title', ellipsis: true },
     { title: '来源', dataIndex: 'source', width: 80, render: (v: string) => <Tag>{v}</Tag> },
     {
       title: '操作', width: 80,
@@ -534,8 +540,9 @@ export function AgentEditPage() {
         okButtonProps={{ disabled: selectedMemoryIds.length === 0 }}>
         <Select mode="multiple" placeholder="选择记忆（可多选）" style={{ width: '100%' }} value={selectedMemoryIds}
           onChange={setSelectedMemoryIds} showSearch optionFilterProp="label"
-          options={memoriesList.filter(m => !memories.some(me => me.memoryId === m.id))
-            .map(m => ({ value: m.id, label: (m.contentMd || m.title || '').slice(0, 60) })) || []}
+          options={memoriesList
+            .filter(m => m.status === 'ADOPTED' && !memories.some(me => me.memoryId === m.id))
+            .map(m => ({ value: m.id, label: memoryTitle(m, m.id) }))}
         />
       </Modal>
     </div>

@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useRealtime } from '@/shared/realtime/useRealtime';
 import * as api from './api';
-import type { ConversationRealtimeEvent, ProviderEventPayload } from './types';
+import { buildTimeline, type TimelineNode } from './timeline';
+import type {
+  AcpSlashCommand,
+  ClarificationTurnEvent,
+  ConversationRealtimeEvent,
+  ProviderEventPayload,
+} from './types';
 
 export function useClarificationConversations(workitemId: number | string, agentId: number | null) {
   return useQuery({
@@ -193,6 +199,25 @@ export function useClarificationEvents(
     [visibleEvents],
   );
 
+  const timeline = useMemo(() => buildTimeline(visibleEvents), [visibleEvents]);
+
+  /** 斜杠命令是会话级能力，取全量事件里的末次快照 —— 按轮次过滤会让候选
+   *  在轮次切换后凭空消失。 */
+  const availableCommands = useMemo(() => {
+    let latest: AcpSlashCommand[] = [];
+    for (const ev of streamedEvents) {
+      if (ev.eventType === 'acp_commands') {
+        latest = ev.payload?.data?.availableCommands ?? [];
+      }
+    }
+    return latest;
+  }, [streamedEvents]);
+
+  const streamedTurnId = useMemo(() => {
+    if (processingTurnId != null) return processingTurnId;
+    return visibleEvents.length > 0 ? visibleEvents[visibleEvents.length - 1].turnId : null;
+  }, [processingTurnId, visibleEvents]);
+
   /** 清空会话级累积事件（与切换会话的重置等价）：流式回复落库后调用，
    *  避免残留事件在下一轮被误渲染，同时让新一轮从干净状态累积。 */
   const resetStreamedEvents = useCallback(() => {
@@ -203,6 +228,9 @@ export function useClarificationEvents(
 
   return {
     streamedEvents: visibleEvents,
+    timeline,
+    availableCommands,
+    streamedTurnId,
     lastEventSeq: lastEventSeqRef.current,
     streamedText,
     streamedTurnCompleted,
@@ -212,15 +240,157 @@ export function useClarificationEvents(
   };
 }
 
-export function useClarificationEventsReplay(
-  _workitemId: number | string,
+const TERMINAL_TURN_STATUS = new Set(['COMPLETED', 'SUCCESS', 'CANCELED', 'FAILED']);
+
+export function isOutboundTurnDirection(direction: string): boolean {
+  return direction !== 'IN' && direction !== 'INBOUND';
+}
+
+/**
+ * 找出某个 OUT 轮次配对的 IN 轮次 id。
+ *
+ * 事件全部按 IN 轮次落库（服务端用 findProcessingInbound 校验后才落 turnId），
+ * 而 OUT 轮次是在它的 IN 轮次被 ACK 时才插入的，因此配对关系就是「紧邻的前一个
+ * IN 轮次」。拿 OUT 轮次 id 去查按轮次事件端点只会永远返回空。
+ */
+export function findPairedInboundTurnId(
+  turns: ReadonlyArray<{ id: number; direction: string; status?: string }>,
+  outboundIndex: number,
+): number | null {
+  for (let i = outboundIndex - 1; i >= 0; i -= 1) {
+    const candidate = turns[i];
+    if (isOutboundTurnDirection(candidate.direction)) continue;
+    // 卡片挂起时用户再输入会立刻插入一个 QUEUED 的 IN 轮次。它排在这个 OUT
+    // 之前，但还没被处理过，不可能产出它 —— 配上去详情就又是空的。
+    // CANCELED 同理：要么在 QUEUED 时就被取消（从未执行），要么已经带着自己的
+    // 「已取消」OUT 气泡，都不该吃掉真正在跑的那一轮产出的 OUT。
+    const status = (candidate.status ?? '').toUpperCase();
+    if (status === 'QUEUED' || status === 'CANCELED') continue;
+    return candidate.id;
+  }
+  return null;
+}
+
+/**
+ * 判断流式轮次的回复是否已落库。
+ *
+ * 此前用纯文本相等（`turn.content === streamedText`）判断：引入非文本事件后
+ * 落库正文与流式文本不再逐字相同，会误判成「还没落库」而多出一个重复气泡，
+ * 反向也可能把别的轮次的回复错认成本轮的而丢掉气泡。改为按 turnId 顺序 +
+ * 轮次终态判定。
+ */
+export function hasPersistedReplyForTurn(
+  turns: ReadonlyArray<{ id: number; direction: string; status: string }>,
+  streamedTurnId: number | null | undefined,
+): boolean {
+  if (streamedTurnId == null) return false;
+  return turns.some((turn) =>
+    isOutboundTurnDirection(turn.direction)
+    && turn.id > streamedTurnId
+    && TERMINAL_TURN_STATUS.has((turn.status ?? '').toUpperCase()));
+}
+
+/**
+ * 把按轮次端点返回的原始事件行重组成逻辑事件：服务端只保存分片，浏览器拿到的
+ * 是 (turnId, dispatchAttempt, eventSeq) 三元组下的若干 payloadFragment。
+ *
+ * stale 重投会把整套逻辑事件按新的 dispatchAttempt 再落一遍，所以同一
+ * (turnId, eventSeq) 只保留 dispatchAttempt 最大的那一组，否则历史详情内容翻倍。
+ */
+export function assembleTurnEvents(
+  rows: readonly ClarificationTurnEvent[],
+): StreamedEvent[] {
+  const latestAttempt = new Map<string, number>();
+  for (const row of rows) {
+    const logicalKey = `${row.turnId}:${row.eventSeq}`;
+    const known = latestAttempt.get(logicalKey);
+    if (known === undefined || row.dispatchAttempt > known) {
+      latestAttempt.set(logicalKey, row.dispatchAttempt);
+    }
+  }
+
+  const groups = new Map<string, ClarificationTurnEvent[]>();
+  for (const row of rows) {
+    const logicalKey = `${row.turnId}:${row.eventSeq}`;
+    if (row.dispatchAttempt !== latestAttempt.get(logicalKey)) continue;
+    const bucket = groups.get(logicalKey);
+    if (bucket) bucket.push(row);
+    else groups.set(logicalKey, [row]);
+  }
+
+  const events: StreamedEvent[] = [];
+  for (const chunks of groups.values()) {
+    const head = chunks[0];
+    const expected = head.chunkCount ?? 1;
+    // 分片不全就整条丢弃：拼出半截 JSON 只会让整个详情面板炸掉。
+    if (chunks.length < expected) continue;
+    const text = [...chunks]
+      .sort((a, b) => a.chunkIndex - b.chunkIndex)
+      .map((chunk) => chunk.payloadFragment)
+      .join('');
+    events.push({
+      eventSeq: head.eventSeq,
+      turnId: head.turnId,
+      eventType: head.eventType,
+      payload: parsePayload(text),
+      receivedAt: 0,
+    });
+  }
+  // eventSeq 每轮从 1 重新递增，排序键必须带 turnId。
+  return events.sort((a, b) => a.turnId - b.turnId || a.eventSeq - b.eventSeq);
+}
+
+function parsePayload(text: string): ProviderEventPayload | null {
+  try {
+    return JSON.parse(text) as ProviderEventPayload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 历史轮次的执行事件按需加载：执行器无合并节流，1 个 token 级 chunk 就是 1 行
+ * 记录，一轮数百至数千行，默认全量回放会让页面初始化拉上万行。
+ */
+export function useTurnEvents(
+  workitemId: number | string,
   conversationId: number | null,
-  _turnId: number | null,
+  turnId: number | null,
+  enabled: boolean,
 ) {
-  return useQuery({
-    queryKey: ['workitem', _workitemId, 'clarification-events', conversationId, _turnId],
-    queryFn: () => api.getClarificationEvents(_workitemId, conversationId!),
-    enabled: !!_workitemId && !!conversationId,
-    staleTime: 30_000,
+  const query = useQuery({
+    queryKey: ['workitem', workitemId, 'clarification-turn-events', conversationId, turnId],
+    queryFn: () => api.getClarificationTurnEvents(workitemId, conversationId!, turnId!),
+    enabled: enabled && !!workitemId && !!conversationId && !!turnId,
+    staleTime: 60_000,
+  });
+
+  const timeline = useMemo<TimelineNode[]>(
+    () => buildTimeline(assembleTurnEvents(query.data ?? [])),
+    [query.data],
+  );
+
+  return { ...query, timeline };
+}
+
+export interface ElicitationReplyVariables {
+  requestId: string;
+  action: 'accept' | 'decline';
+  content?: Record<string, unknown>;
+}
+
+export function useReplyElicitation(workitemId: number | string, conversationId: number | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: ElicitationReplyVariables) =>
+      api.replyClarificationElicitation(
+        workitemId, conversationId!, vars.requestId, vars.action, vars.content,
+      ),
+    onSuccess: () => {
+      // 回答会唤醒挂起的 Agent 继续本轮，轮次状态随即变化，必须重新拉会话。
+      queryClient.invalidateQueries({
+        queryKey: ['workitem', workitemId, 'clarification-conversation', conversationId],
+      });
+    },
   });
 }

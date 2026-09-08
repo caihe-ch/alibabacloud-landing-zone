@@ -1198,7 +1198,8 @@ public class WorkitemService {
             }
         }
 
-        enrichAgentUsage(tenantId, dispatches, agentProgress);
+        com.aliyun.autowonder.aiusage.dto.WorkitemUsageSummaryVO totalUsage =
+                enrichAgentUsage(tenantId, dispatches, agentProgress);
 
         WorkflowPlanVO workflowPlan = latestWorkflowPlan(runtimeEvents);
         if (!applyWorkflowPlan(workflowPlan, agentProgress)) {
@@ -1215,6 +1216,7 @@ public class WorkitemService {
         result.setWorkflowPlan(workflowPlan);
         result.setProcessGraph(buildProcessGraph(w, tenantId, dispatches));
         result.setTotalDurationMs(sumAgentDurations(agentProgress));
+        result.setTotalUsage(totalUsage);
         return result;
     }
 
@@ -1714,24 +1716,24 @@ public class WorkitemService {
         return agents.get(agents.size() - 1).getSteps();
     }
 
-    private void enrichAgentUsage(long tenantId, List<DispatchDO> dispatches,
-                                     List<AgentDeliveryProgressVO> agentProgress) {
-        if (dispatchAiUsageDao == null || dispatches.isEmpty() || agentProgress.isEmpty()) {
-            return;
+    private com.aliyun.autowonder.aiusage.dto.WorkitemUsageSummaryVO enrichAgentUsage(
+            long tenantId, List<DispatchDO> dispatches, List<AgentDeliveryProgressVO> agentProgress) {
+        if (dispatchAiUsageDao == null || dispatches.isEmpty()) {
+            return null;
         }
         List<Long> dispatchIds = dispatches.stream()
                 .map(DispatchDO::getId).filter(Objects::nonNull).collect(Collectors.toList());
         if (dispatchIds.isEmpty()) {
-            return;
+            return null;
         }
         List<com.aliyun.autowonder.aiusage.DispatchAiUsageDO> usageRows;
         try {
             usageRows = dispatchAiUsageDao.listByDispatchIds(tenantId, dispatchIds);
         } catch (RuntimeException ex) {
-            return;
+            return null;
         }
         if (usageRows == null || usageRows.isEmpty()) {
-            return;
+            return null;
         }
         Map<Long, List<com.aliyun.autowonder.aiusage.DispatchAiUsageDO>> byAgent = usageRows.stream()
                 .filter(r -> r.getAgentId() != null)
@@ -1757,6 +1759,11 @@ public class WorkitemService {
                 }
             }
         }
+        List<DispatchDO> knownDispatches = dispatches.stream()
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        return com.aliyun.autowonder.aiusage.WorkitemUsageAggregator.summarize(
+                usageRows, knownDispatches, this::resolveAgentName);
     }
 
     private com.aliyun.autowonder.aiusage.dto.StepUsageSummaryVO aggregateUsage(

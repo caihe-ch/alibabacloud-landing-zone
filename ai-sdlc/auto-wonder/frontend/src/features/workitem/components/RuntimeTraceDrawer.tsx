@@ -41,12 +41,10 @@ function duration(ms?: number | null): string {
   return `${Math.floor(seconds / 60)}分${seconds % 60 ? `${seconds % 60}秒` : ''}`;
 }
 
-function usage(value?: { available?: boolean; availability?: string | null; totalTokens: number; credits?: number | null; inputTokens?: number; outputTokens?: number } | null, prefix = ' · '): string {
+function usage(value?: { available?: boolean; availability?: string | null; credits?: number | null } | null, prefix = ' · '): string {
   if (!value || value.available !== true) return '';
-  const tokens = value.totalTokens > 0 ? `${value.totalTokens.toLocaleString('en-US')} tokens` : '';
-  const credit = value.credits != null && value.credits > 0 ? `💰${value.credits.toFixed(2)}` : '';
-  const result = [tokens, credit].filter(Boolean).join(' · ');
-  return result ? `${prefix}${result}` : '';
+  const credit = value.credits != null && value.credits > 0 ? `💰${value.credits.toFixed(2)} credits` : '';
+  return credit ? `${prefix}${credit}` : '';
 }
 
 function statusColor(status?: string | null): string {

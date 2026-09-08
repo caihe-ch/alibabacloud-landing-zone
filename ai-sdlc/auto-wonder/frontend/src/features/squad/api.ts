@@ -68,6 +68,15 @@ export async function getSquad(id: number): Promise<Squad> {
   return resp.data;
 }
 
+// GET /api/squads returns memberAgentIds as null; only the detail endpoint populates it.
+export async function listSquadsWithMembers(pageSize = 100): Promise<Squad[]> {
+  const page = await listSquads({ pageNum: 1, pageSize });
+  if (page.list.length === 0) {
+    return [];
+  }
+  return Promise.all(page.list.map(squad => getSquad(squad.id)));
+}
+
 export async function createSquad(params: { name: string; description?: string }): Promise<Squad> {
   const resp = await apiClient.post<Squad>('/api/squads', params);
   return resp.data;

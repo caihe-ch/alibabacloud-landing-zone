@@ -24,6 +24,12 @@ export interface WorkspaceInfo {
   id: number;
   name: string;
   description: string;
+  background?: string | null;
+  /** org.version, echoed so the edit modal can submit it as the optimistic-lock expectation. */
+  version?: number | null;
+  accessLevel?: WorkspaceAccessLevel | null;
+  isOwner?: boolean | null;
+  canManage?: boolean | null;
 }
 
 export type WorkspaceAccessLevel = 'READ_ONLY' | 'READ_WRITE' | 'ADMIN';
@@ -35,6 +41,22 @@ export interface WorkspaceListItem {
   membershipStatus: 'MEMBER' | 'NOT_MEMBER' | 'PENDING';
   accessLevel: WorkspaceAccessLevel | null;
   pendingRequestId?: number | null;
+  isOwner?: boolean | null;
+  canManage?: boolean | null;
+}
+
+/** One row of the workspace-only recycle bin (F4). */
+export interface RecycleBinItem {
+  id: number;
+  name: string;
+  description: string | null;
+  ownerId: number | null;
+  ownerName: string | null;
+  deletedAt: string | null;
+  deletedBy: number | null;
+  deletedByName: string | null;
+  /** False when an in-use workspace already holds this name, so restore needs a rename. */
+  restorable: boolean | null;
 }
 
 export interface LoginResponse {
@@ -69,4 +91,8 @@ export const ErrorCodes = {
   NOT_FOUND: '10404',
   CONFLICT: '10409',
   RATE_LIMITED: '10429',
+  ORG_VERSION_CONFLICT: '11004',
+  ORG_DELETED_OR_DISABLED: '11005',
+  ORG_NOT_FOUND_OR_NO_PERMISSION: '11006',
+  ORG_RESTORE_NAME_CONFLICT: '11007',
 } as const;

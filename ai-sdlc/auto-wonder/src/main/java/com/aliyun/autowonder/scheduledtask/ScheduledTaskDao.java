@@ -51,4 +51,22 @@ public interface ScheduledTaskDao {
                      @Param("targetStatus") String targetStatus,
                      @Param("version") Integer version,
                      @Param("modifierId") Long modifierId);
+
+    /**
+     * Logical delete guarded by workspace and optimistic version. The same statement retires the
+     * schedule cursor, so a deleted task cannot be fired again even by a read path that forgets the
+     * is_deleted filter. Returns 1 on success, 0 when the version moved or the row is already gone.
+     */
+    int softDelete(@Param("workspaceId") Long workspaceId,
+                   @Param("id") Long id,
+                   @Param("expectedVersion") Integer expectedVersion,
+                   @Param("modifierId") Long modifierId);
+
+    /**
+     * Bulk pause for workspace logical delete (D5). One statement instead of a per-task
+     * read-modify-write loop, so a delete cannot be slowed down or half-applied by how many
+     * tasks the workspace happens to own. Returns the number of tasks that were ACTIVE.
+     */
+    int pauseActiveByWorkspace(@Param("workspaceId") Long workspaceId,
+                               @Param("modifierId") Long modifierId);
 }

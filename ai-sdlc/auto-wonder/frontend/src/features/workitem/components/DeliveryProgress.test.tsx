@@ -1,9 +1,20 @@
-import { describe, it, expect, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { server } from '@/test/mocks/server';
+import * as workitemApi from '../api';
 import { DeliveryProgress, formatDuration, convergeStepsForTerminalStatus } from './DeliveryProgress';
 import type { Artifact, DeliveryProgress as DeliveryProgressModel, DeliveryStep } from '@/shared/types/workitem';
+
+beforeEach(() => {
+  server.use(http.get('/api/dispatches/:dispatchId/runtime-trace/activities', ({ params }) => HttpResponse.json({
+    success: true,
+    code: '0',
+    message: '',
+    traceId: null,
+    data: { dispatchId: Number(params.dispatchId), activities: [] },
+  })));
+});
 
 describe('formatDuration', () => {
   it('returns empty string for null', () => {
@@ -131,6 +142,287 @@ describe('DeliveryProgress', () => {
     expect(within(stepCard).getByText(/第1次: AW代码评审工程师 · SUCCEEDED · 4分/)).toBeInTheDocument();
     expect(within(stepCard).getByText('读取工单上下文')).toBeInTheDocument();
     expect(within(stepCard).getByText('发布评审评论')).toBeInTheDocument();
+  });
+
+  it('loads and renders safe activity messages for a default-expanded failed attempt', async () => {
+    let requests = 0;
+    server.use(http.get('/api/dispatches/301/runtime-trace/activities', () => {
+      requests += 1;
+      return HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: {
+          dispatchId: 301,
+          activities: [
+            {
+              eventId: '301:1',
+              seq: 1,
+              eventTime: '2026-09-02T10:00:00Z',
+              eventType: 'agent.message',
+              level: 'INFO',
+              content: '正在分析工单评论。',
+            },
+            {
+              eventId: '301:2',
+              seq: null,
+              eventTime: '2026-09-02T10:00:02Z',
+              eventType: 'dispatch.executor_failover',
+              level: 'ERROR',
+              content: 'Runtime 10067 执行失败，正在切换其他在线 Runtime',
+            },
+          ],
+        },
+      });
+    }));
+    const steps: DeliveryStep[] = [{
+      stepId: 11,
+      name: '执行代码评审',
+      status: 'failed',
+      executorName: '评审 Agent',
+      error: 'Runtime 执行失败',
+      subSteps: null,
+      durationMs: 10_000,
+      attempts: [{
+        dispatchId: 301,
+        executorName: '评审 Agent',
+        status: 'FAILED',
+        error: 'Runtime 执行失败',
+        startedAt: null,
+        durationMs: 10_000,
+      }],
+    }];
+
+    render(<DeliveryProgress steps={steps} />);
+
+    const stepCard = screen.getByTestId('delivery-step-11');
+    const feed = await within(stepCard).findByTestId('dispatch-activities-301');
+    expect(within(feed).getByText('正在分析工单评论。')).toBeInTheDocument();
+    expect(within(feed).getByText('Runtime 10067 执行失败，正在切换其他在线 Runtime')).toHaveStyle({ color: 'rgb(207, 19, 34)' });
+    expect(requests).toBe(1);
+  });
+
+  it('does not start a second activity poll while an active attempt request is still pending', async () => {
+    vi.useFakeTimers();
+    try {
+      let requests = 0;
+      let resolveFirstResponse: ((response: Response) => void) | undefined;
+      let notifyFirstRequest: (() => void) | undefined;
+      const firstRequest = new Promise<void>((resolve) => { notifyFirstRequest = resolve; });
+      const firstResponse = new Promise<Response>((resolve) => { resolveFirstResponse = resolve; });
+      server.use(http.get('/api/dispatches/303/runtime-trace/activities', () => {
+        requests += 1;
+        notifyFirstRequest?.();
+        return firstResponse;
+      }));
+      const steps: DeliveryStep[] = [{
+        stepId: 13,
+        name: '正在执行的代码评审',
+        status: 'active',
+        executorName: '评审 Agent',
+        error: null,
+        subSteps: null,
+        durationMs: 10_000,
+        attempts: [{
+          dispatchId: 303,
+          executorName: '评审 Agent',
+          status: 'RUNNING',
+          error: null,
+          startedAt: null,
+          durationMs: 10_000,
+        }],
+      }];
+
+      const { unmount } = render(<DeliveryProgress steps={steps} />);
+      await firstRequest;
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+
+      expect(requests).toBe(1);
+      unmount();
+      resolveFirstResponse?.(HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: { dispatchId: 303, activities: [] },
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defers completed-attempt activity requests until execution records expand', async () => {
+    let requests = 0;
+    server.use(http.get('/api/dispatches/302/runtime-trace/activities', () => {
+      requests += 1;
+      return HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: { dispatchId: 302, activities: [] },
+      });
+    }));
+    const steps: DeliveryStep[] = [{
+      stepId: 12,
+      name: '已完成的代码评审',
+      status: 'done',
+      executorName: '评审 Agent',
+      error: null,
+      subSteps: null,
+      durationMs: 10_000,
+      attempts: [{
+        dispatchId: 302,
+        executorName: '评审 Agent',
+        status: 'SUCCEEDED',
+        error: null,
+        startedAt: null,
+        durationMs: 10_000,
+      }],
+    }];
+
+    render(<DeliveryProgress steps={steps} />);
+
+    expect(requests).toBe(0);
+    fireEvent.click(within(screen.getByTestId('delivery-step-12')).getByText('执行记录'));
+    await waitFor(() => expect(requests).toBe(1));
+  });
+
+  it('opens a stable step when it becomes active without reopening a user-collapsed active step', () => {
+    const pendingStep: DeliveryStep = {
+      stepId: 14,
+      name: '等待执行的代码评审',
+      status: 'pending',
+      executorName: '评审 Agent',
+      error: null,
+      subSteps: null,
+      durationMs: null,
+      attempts: [{
+        dispatchId: 304,
+        executorName: '评审 Agent',
+        status: 'RUNNING',
+        error: null,
+        startedAt: null,
+        durationMs: null,
+      }],
+    };
+    const activeStep: DeliveryStep = { ...pendingStep, status: 'active' };
+    const { rerender } = render(<DeliveryProgress steps={[pendingStep]} />);
+    const stepCard = screen.getByTestId('delivery-step-14');
+
+    expect(within(stepCard).queryByTestId('dispatch-activities-304')).not.toBeInTheDocument();
+
+    rerender(<DeliveryProgress steps={[activeStep]} />);
+
+    expect(within(stepCard).getByTestId('dispatch-activities-304')).toBeInTheDocument();
+    fireEvent.click(within(stepCard).getByText('执行记录'));
+    expect(within(stepCard).queryByTestId('dispatch-activities-304')).not.toBeInTheDocument();
+
+    rerender(<DeliveryProgress steps={[{ ...activeStep, durationMs: 1_000 }]} />);
+
+    expect(within(stepCard).queryByTestId('dispatch-activities-304')).not.toBeInTheDocument();
+  });
+
+  it('opens records when a pending step becomes paused and preserves a user collapse across paused updates', async () => {
+    let requests = 0;
+    server.use(http.get('/api/dispatches/306/runtime-trace/activities', () => {
+      requests += 1;
+      return HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: { dispatchId: 306, activities: [] },
+      });
+    }));
+    const pendingStep: DeliveryStep = {
+      stepId: 16,
+      name: '等待暂停的代码评审',
+      status: 'pending',
+      executorName: '评审 Agent',
+      error: null,
+      subSteps: null,
+      durationMs: null,
+      attempts: [{
+        dispatchId: 306,
+        executorName: '评审 Agent',
+        status: 'PAUSED',
+        error: null,
+        startedAt: null,
+        durationMs: null,
+      }],
+    };
+    const pausedStep: DeliveryStep = { ...pendingStep, status: 'paused' };
+
+    const { rerender } = render(<DeliveryProgress steps={[pendingStep]} />);
+    const stepCard = screen.getByTestId('delivery-step-16');
+    expect(within(stepCard).queryByTestId('dispatch-activities-306')).not.toBeInTheDocument();
+
+    rerender(<DeliveryProgress steps={[pausedStep]} />);
+
+    expect(await within(stepCard).findByTestId('dispatch-activities-306')).toBeInTheDocument();
+    await waitFor(() => expect(requests).toBe(1));
+
+    fireEvent.click(within(stepCard).getByText('执行记录'));
+    expect(within(stepCard).queryByTestId('dispatch-activities-306')).not.toBeInTheDocument();
+
+    rerender(<DeliveryProgress steps={[{ ...pausedStep, durationMs: 1_000 }]} />);
+
+    expect(within(stepCard).queryByTestId('dispatch-activities-306')).not.toBeInTheDocument();
+    expect(requests).toBe(1);
+  });
+
+  it('opens records when a completed step becomes failed and preserves a user collapse across failed updates', async () => {
+    let requests = 0;
+    server.use(http.get('/api/dispatches/307/runtime-trace/activities', () => {
+      requests += 1;
+      return HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: { dispatchId: 307, activities: [] },
+      });
+    }));
+    const doneStep: DeliveryStep = {
+      stepId: 17,
+      name: '完成后失败的代码评审',
+      status: 'done',
+      executorName: '评审 Agent',
+      error: null,
+      subSteps: null,
+      durationMs: null,
+      attempts: [{
+        dispatchId: 307,
+        executorName: '评审 Agent',
+        status: 'FAILED',
+        error: '执行失败',
+        startedAt: null,
+        durationMs: null,
+      }],
+    };
+    const failedStep: DeliveryStep = { ...doneStep, status: 'failed', error: '执行失败' };
+
+    const { rerender } = render(<DeliveryProgress steps={[doneStep]} />);
+    const stepCard = screen.getByTestId('delivery-step-17');
+    expect(within(stepCard).queryByTestId('dispatch-activities-307')).not.toBeInTheDocument();
+
+    rerender(<DeliveryProgress steps={[failedStep]} />);
+
+    expect(await within(stepCard).findByTestId('dispatch-activities-307')).toBeInTheDocument();
+    await waitFor(() => expect(requests).toBe(1));
+
+    fireEvent.click(within(stepCard).getByText('执行记录'));
+    expect(within(stepCard).queryByTestId('dispatch-activities-307')).not.toBeInTheDocument();
+
+    rerender(<DeliveryProgress steps={[{ ...failedStep, durationMs: 1_000 }]} />);
+
+    expect(within(stepCard).queryByTestId('dispatch-activities-307')).not.toBeInTheDocument();
+    expect(requests).toBe(1);
   });
 
   it('keeps every completed step expandable inside a finished agent group', () => {
@@ -386,6 +678,69 @@ describe('DeliveryProgress', () => {
     expect(within(screen.getByTestId('delivery-step-10')).queryByRole('button', { name: /暂停/ })).not.toBeInTheDocument();
     fireEvent.click(within(screen.getByTestId('delivery-step-20')).getByRole('button', { name: /暂停/ }));
     expect(onPause).toHaveBeenCalledWith(30);
+  });
+
+  it('mounts a moved attempt activity feed only on the active action-owning step', async () => {
+    let requests = 0;
+    const onPause = vi.fn();
+    const getRuntimeActivities = vi.spyOn(workitemApi, 'getRuntimeActivities');
+    server.use(http.get('/api/dispatches/30/runtime-trace/activities', () => {
+      requests += 1;
+      return HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: { dispatchId: 30, activities: [] },
+      });
+    }));
+    const steps: DeliveryStep[] = [
+      {
+        stepId: 10,
+        name: '需求分析',
+        status: 'done',
+        executorName: 'worker',
+        error: null,
+        subSteps: null,
+        durationMs: 30_000,
+        attempts: [{
+          dispatchId: 30,
+          executorName: 'worker',
+          status: 'RUNNING',
+          error: '迁移前的执行错误',
+          startedAt: null,
+          durationMs: 30_000,
+          canPause: true,
+        }],
+      },
+      {
+        stepId: 20,
+        name: '编码实现',
+        status: 'active',
+        executorName: 'worker',
+        error: null,
+        subSteps: null,
+        durationMs: 10_000,
+        attempts: null,
+      },
+    ];
+
+    render(<DeliveryProgress steps={steps} onPause={onPause} />);
+
+    const sourceStep = screen.getByTestId('delivery-step-10');
+    const targetStep = screen.getByTestId('delivery-step-20');
+    expect(await within(targetStep).findByTestId('dispatch-activities-30')).toBeInTheDocument();
+    await waitFor(() => expect(requests).toBe(1));
+    expect(getRuntimeActivities).toHaveBeenCalledTimes(1);
+    expect(within(targetStep).getByRole('button', { name: /暂停/ })).toBeInTheDocument();
+
+    fireEvent.click(within(sourceStep).getByText('执行记录'));
+
+    expect(within(sourceStep).getByText(/第1次: worker · RUNNING.*迁移前的执行错误/)).toBeInTheDocument();
+    expect(getRuntimeActivities).toHaveBeenCalledTimes(1);
+    expect(requests).toBe(1);
+    expect(within(sourceStep).queryByTestId('dispatch-activities-30')).not.toBeInTheDocument();
+    getRuntimeActivities.mockRestore();
   });
 
   it('does not move comment interaction pause actions to the current sdlc step', () => {
@@ -820,7 +1175,7 @@ describe('DeliveryProgress', () => {
         success: true, code: '0', message: '', traceId: null,
         data: {
           dispatchId: 302, runtimeId: 'rt-1', provider: 'codex', changed: true, lastSeq: 15,
-          tokenUsage: { available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100 },
+          tokenUsage: { available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100, credits: 12.34 },
           events: [
             { eventId: '302:0', seq: 0, eventType: 'runtime.started', eventTime: '2026-07-30T10:00:00Z', detail: { runtimeId: 'rt-1' } },
             { eventId: '302:1', seq: 1, eventType: 'runtime.recovery_completed', eventTime: '2026-07-30T10:00:01Z', detail: { mode: 'checkpoint' } },
@@ -830,7 +1185,7 @@ describe('DeliveryProgress', () => {
           sessions: [{
             sessionId: 's1', parentSessionId: null, status: 'INTERRUPTED',
             startedAt: '2026-07-30T10:00:00Z', endedAt: '2026-07-30T10:01:06Z', durationMs: 10000,
-            tokenUsage: { available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100 },
+            tokenUsage: { available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100, credits: 12.34 },
             eventIds: [],
             boundaries: [
               { eventId: '302:1', kind: 'RESUMED', eventTime: '2026-07-30T10:00:00Z', label: 'RESUMED' },
@@ -892,7 +1247,8 @@ describe('DeliveryProgress', () => {
     expect(within(drawer).getByText(/Dispatch #302/)).toBeInTheDocument();
     expect(within(drawer).getByText(/恢复自 #301/)).toBeInTheDocument();
     expect(within(drawer).getByText(/Session s1/)).toBeInTheDocument();
-    expect(within(drawer).getAllByText(/2,100 tokens/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/12\.34 credits/).length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText(/tokens/)).not.toBeInTheDocument();
     expect(within(drawer).getByText(/Turn t2/)).toBeInTheDocument();
     expect(within(drawer).getByText(/Runtime & SDLC/)).toBeInTheDocument();
     expect(within(drawer).getByText('runtime.recovery_completed')).toBeInTheDocument();
@@ -1372,7 +1728,7 @@ describe('DeliveryProgress terminal convergence rendering', () => {
 });
 
 describe('DeliveryProgress usage display', () => {
-  it('keeps agent and step rows compact: token badges without credits or artifacts count', () => {
+  it('keeps agent and step rows compact: credits badges without token counts', () => {
     const progress: DeliveryProgressModel = {
       steps: [],
       agents: [{
@@ -1403,11 +1759,43 @@ describe('DeliveryProgress usage display', () => {
 
     render(<DeliveryProgress progress={progress} artifacts={artifacts} />);
 
-    expect(screen.getAllByText('1M').length).toBe(2);
-    expect(screen.queryByText(/82\.61/)).not.toBeInTheDocument();
+    expect(screen.getAllByText('82.61 credits').length).toBe(2);
+    expect(screen.queryByText('1M')).not.toBeInTheDocument();
+    expect(screen.queryByText(/tokens/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/💰/)).not.toBeInTheDocument();
     expect(screen.queryByText('2 artifacts')).not.toBeInTheDocument();
     expect(screen.queryByText('无产物')).not.toBeInTheDocument();
     expect(screen.getAllByText(/2 artifacts/).length).toBeGreaterThan(0);
+  });
+
+  it('hides the usage badge when the backend still reports tokens without credits', () => {
+    const progress: DeliveryProgressModel = {
+      steps: [],
+      agents: [{
+        agentId: 42,
+        agentName: 'AW全栈开发',
+        status: 'finished',
+        durationMs: 60_000,
+        usage: { model: 'auto', inputTokens: 800_000, outputTokens: 200_000 },
+        steps: [{
+          stepId: 201,
+          name: '编码实现',
+          status: 'done',
+          executorName: 'AW全栈开发',
+          error: null,
+          subSteps: null,
+          durationMs: 60_000,
+          usage: { inputTokens: 800_000, outputTokens: 200_000 },
+          attempts: null,
+        }],
+      }],
+    };
+
+    render(<DeliveryProgress progress={progress} />);
+
+    expect(screen.getAllByText('AW全栈开发').length).toBeGreaterThan(0);
+    expect(screen.queryByText(/credits/)).not.toBeInTheDocument();
+    expect(screen.queryByText('1M')).not.toBeInTheDocument();
+    expect(screen.queryByText(/tokens/i)).not.toBeInTheDocument();
   });
 });

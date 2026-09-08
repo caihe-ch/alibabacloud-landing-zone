@@ -275,6 +275,18 @@
         LIMIT #{limit}
     </select>
 
+    <!-- In-flight dispatches of one workspace, for the logical-delete linkage (D5). Caller supplies
+         the status set so pauseable and non-pauseable rows can be fetched in one pass each. -->
+    <select id="listInFlightByTenant" resultMap="dispatchMap">
+        SELECT <include refid="cols"/> FROM dispatch
+        WHERE tenant_id = #{tenantId}
+          AND is_deleted = 0
+          AND status IN
+          <foreach collection="statuses" item="s" open="(" separator="," close=")">#{s}</foreach>
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
+
     <sql id="tenantFilter" databaseId="autowonder-source-aware">
         tenant_id = #{tenantId} AND is_deleted = 0
         <if test="status != null and status != ''">AND status = #{status}</if>

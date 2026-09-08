@@ -88,4 +88,23 @@ describe('ReplyingIndicator', () => {
     // 多次轮换覆盖了多个文案
     expect(seen.size).toBeGreaterThan(2);
   });
+
+  it('draws the spinner track with the control-weight border, not the hairline divider', () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const { getByTestId } = render(<ReplyingIndicator agentName="AW需求澄清" />);
+
+    // pick 恒为 0：一次轮换把样式从 dots 推到 spinner，因此这条是确定性的。
+    act(() => {
+      vi.advanceTimersByTime(REPLYING_INDICATOR_ROTATE_INTERVAL_MS);
+    });
+
+    const ring = getByTestId('clarification-replying-indicator').querySelector('span[aria-hidden]');
+    expect(ring).not.toBeNull();
+    // 2px 圆环用 6% 的分割线灰（hairline）几乎看不见，必须是 10% 的控件描边。
+    expect((ring as HTMLElement).style.borderLeftColor).toBe('rgba(0,0,0,0.10)');
+    expect((ring as HTMLElement).style.borderLeftWidth).toBe('2px');
+    // 旋转头保持 textMuted，动效才读得出来
+    expect((ring as HTMLElement).style.borderTopColor).toBe('#9ca3af');
+  });
 });

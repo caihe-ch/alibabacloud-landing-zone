@@ -14,4 +14,14 @@ public interface ConversationTransport {
      * CONVERSATION_TURN_ACK(status=CANCELED, replyMarkdown=已产出的部分内容) 收尾。
      */
     void sendCancel(AgentConversationDO conv, Long turnId);
+
+    /**
+     * 把用户对挂起 ACP 问答卡片的回答路由回执行器。真正的路由键是 requestId，
+     * conversationId 与 turnId 供执行器侧日志定位。
+     *
+     * @param action     accept / decline / cancel
+     * @param answerJson accept 时的答案 JSON 对象；decline 与 cancel 传 null
+     */
+    void sendElicitationReply(AgentConversationDO conv, long turnId, String requestId,
+            String action, String answerJson);
 }

@@ -33,23 +33,25 @@ public class ScheduledTaskService {
             "ACTIVE", "PAUSED", "EXHAUSTED", "ARCHIVED");
 
     private final ScheduledTaskDao taskDao;
+    private final ScheduledTaskRunDao runDao;
     private final AuditLogService auditLogService;
     private final ScheduledTaskSchedule schedule;
     private final ScheduledTaskValidator validator;
     private final Clock clock;
 
     @Autowired
-    public ScheduledTaskService(ScheduledTaskDao taskDao, SquadDao squadDao,
+    public ScheduledTaskService(ScheduledTaskDao taskDao, ScheduledTaskRunDao runDao, SquadDao squadDao,
                                 SquadMemberDao memberDao, AgentDao agentDao,
                                 AuditLogService auditLogService, ScheduledTaskSchedule schedule) {
-        this(taskDao, squadDao, memberDao, agentDao, auditLogService, schedule, Clock.systemUTC());
+        this(taskDao, runDao, squadDao, memberDao, agentDao, auditLogService, schedule, Clock.systemUTC());
     }
 
-    public ScheduledTaskService(ScheduledTaskDao taskDao, SquadDao squadDao,
+    public ScheduledTaskService(ScheduledTaskDao taskDao, ScheduledTaskRunDao runDao, SquadDao squadDao,
                                 SquadMemberDao memberDao, AgentDao agentDao,
                                 AuditLogService auditLogService, ScheduledTaskSchedule schedule,
                                 Clock clock) {
         this.taskDao = taskDao;
+        this.runDao = runDao;
         this.auditLogService = auditLogService;
         this.schedule = schedule;
         this.validator = new ScheduledTaskValidator(squadDao, memberDao, agentDao);
@@ -182,6 +184,29 @@ public class ScheduledTaskService {
         }
         return transition(task, version, workspaceId, userId,
                 source, ScheduledTaskStatus.ARCHIVED, "ARCHIVE");
+    }
+
+    @Transactional
+    public void delete(long id, Integer version, long workspaceId, long userId) {
+        requireMutationContext(id, workspaceId, userId);
+        ScheduledTaskDO task = requireTask(workspaceId, id);
+        requireExpectedVersion(task, version);
+        // Run recovery scans scheduled_task_run without joining the parent task, so a leftover
+        // QUEUED run would still be dispatched after the task row disappears.
+        List<ScheduledTaskRunDO> active = runDao.findActiveByTask(workspaceId, id);
+        if (active != null && !active.isEmpty()) {
+            throw invalidState("存在未结束的运行实例，请先取消后再删除");
+        }
+        String previousStatus = task.getStatus();
+        if (taskDao.softDelete(workspaceId, id, version, userId) != 1) {
+            throw versionConflict();
+        }
+        task.setStatus(ScheduledTaskStatus.ARCHIVED.name());
+        task.setNextFireAt(null);
+        task.setIsDeleted(1);
+        task.setModifierId(userId);
+        task.setVersion(version + 1);
+        audit(task, userId, "DELETE", previousStatus);
     }
 
     private ScheduledTaskVO transition(long id, Integer version, long workspaceId, long userId,

@@ -104,6 +104,7 @@ export function useAddComment() {
       queryClient.invalidateQueries({ queryKey: ['workitem', variables.workitemId, 'comments'] });
       queryClient.invalidateQueries({ queryKey: ['workitem', variables.workitemId, 'unified-timeline'] });
       queryClient.invalidateQueries({ queryKey: ['workitem', variables.workitemId, 'participants'] });
+      queryClient.invalidateQueries({ queryKey: ['workitem', variables.workitemId, 'delivery-progress'] });
     },
   });
 }

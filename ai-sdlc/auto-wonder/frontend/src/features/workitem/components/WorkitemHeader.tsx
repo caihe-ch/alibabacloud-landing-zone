@@ -2,6 +2,8 @@ import { useNavigate } from 'react-router-dom';
 import { Typography, Tag, Space } from 'antd';
 import { ArrowLeftOutlined } from '@ant-design/icons';
 import { ScheduledExecutionBadge } from './ScheduledExecutionBadge';
+import { WorkitemCreditsBadge } from './WorkitemCreditsBadge';
+import type { WorkitemUsageSummary } from '@/shared/types/workitem';
 
 const { Title } = Typography;
 
@@ -19,9 +21,10 @@ interface WorkitemHeaderProps {
   scheduledStartAt?: string | null;
   scheduledStartTriggeredAt?: string | null;
   gmtCreate?: string | null;
+  usage?: WorkitemUsageSummary | null;
 }
 
-export function WorkitemHeader({ title, statusName, workType, origin, scheduledStartAt, scheduledStartTriggeredAt, gmtCreate }: WorkitemHeaderProps) {
+export function WorkitemHeader({ title, statusName, workType, origin, scheduledStartAt, scheduledStartTriggeredAt, gmtCreate, usage }: WorkitemHeaderProps) {
   const navigate = useNavigate();
 
   return (
@@ -45,6 +48,7 @@ export function WorkitemHeader({ title, statusName, workType, origin, scheduledS
         >
           {TYPE_MAP[workType] || workType}
         </Tag>
+        <WorkitemCreditsBadge usage={usage} />
         <ScheduledExecutionBadge
           scheduledStartAt={scheduledStartAt}
           scheduledStartTriggeredAt={scheduledStartTriggeredAt}

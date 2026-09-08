@@ -11,6 +11,7 @@ import com.aliyun.autowonder.context.AutoWonderContext;
 import com.aliyun.autowonder.log.BizLog;
 import com.aliyun.autowonder.workspace.WorkspaceMemberDO;
 import com.aliyun.autowonder.workspace.WorkspaceMemberDao;
+import com.aliyun.autowonder.workspace.WorkspaceDao;
 import com.aliyun.autowonder.user.UserDO;
 import com.aliyun.autowonder.user.UserDao;
 import org.springframework.web.filter.OncePerRequestFilter;
@@ -33,10 +34,19 @@ public class AuthFilter extends OncePerRequestFilter {
     private static final String PLATFORM_BRANDING_LOGO_PATH = "/api/platform/branding/logo";
     private static final Pattern WORKSPACE_SWITCH_PATH =
             Pattern.compile("^/api/workspaces/[0-9]+/switch$");
+    private static final Pattern WORKSPACE_LIFECYCLE_PATH =
+            Pattern.compile("^/api/workspaces/[0-9]+$");
+    private static final Pattern WORKSPACE_RESTORE_PATH =
+            Pattern.compile("^/api/workspaces/[0-9]+/restore$");
+    private static final String WORKSPACE_RECYCLE_BIN_PATH = "/api/workspaces/recycle-bin";
     private static final Pattern CLI_WORKITEM_UPLOAD_PATH =
             Pattern.compile("^/api/cli/workitems/[0-9]+/requirement-documents$");
     private static final Pattern CLI_SCHEDULED_TASK_UPLOAD_PATH =
             Pattern.compile("^/api/cli/scheduled-tasks/[0-9]+/documents$");
+    private static final Pattern CLI_WORKITEM_DOWNLOAD_INDEX_PATH =
+            Pattern.compile("^/api/cli/workitems/[0-9]+/requirement-documents/index$");
+    private static final Pattern CLI_WORKITEM_DOWNLOAD_CONTENT_PATH =
+            Pattern.compile("^/api/cli/workitems/[0-9]+/requirement-documents/[0-9]+/content$");
     // path 模式 MCP 入口：/api/mcp/<个人令牌>[/(rpc)[/]]，放行后由 McpController 做令牌鉴权
     private static final Pattern PERSONAL_MCP_PATH_TOKEN_PATH =
             Pattern.compile("^/api/mcp/awmcp_[A-Za-z0-9_-]{43}(?:/(?:rpc/?)?)?$");
@@ -48,13 +58,16 @@ public class AuthFilter extends OncePerRequestFilter {
     private final JwtService jwtService;
     private final SessionService sessionService;
     private final WorkspaceMemberDao workspaceMemberDao;
+    private final WorkspaceDao workspaceDao;
     private final UserDao userDao;
 
     public AuthFilter(JwtService jwtService, SessionService sessionService,
-                      WorkspaceMemberDao workspaceMemberDao, UserDao userDao) {
+                      WorkspaceMemberDao workspaceMemberDao, WorkspaceDao workspaceDao,
+                      UserDao userDao) {
         this.jwtService = jwtService;
         this.sessionService = sessionService;
         this.workspaceMemberDao = workspaceMemberDao;
+        this.workspaceDao = workspaceDao;
         this.userDao = userDao;
     }
 
@@ -104,6 +117,14 @@ public class AuthFilter extends OncePerRequestFilter {
             ctx.setTraceId(UUID.randomUUID().toString());
             if (payload.getCurrentWorkspaceId() != null
                     && !isLoginOnlyRequest(request)) {
+                // Read from the database on every request instead of trusting the token: a workspace
+                // deleted after the token was issued must stop working immediately, and there is no
+                // revocation path that reaches already-issued access tokens.
+                if (workspaceDao.countUsable(payload.getCurrentWorkspaceId()) == 0) {
+                    writeFailure(response, HttpServletResponse.SC_FORBIDDEN,
+                            ErrorCode.ORG_DELETED_OR_DISABLED);
+                    return;
+                }
                 WorkspaceMemberDO member = workspaceMemberDao.findByWorkspaceAndUser(
                         payload.getCurrentWorkspaceId(), payload.getUserId());
                 if (member == null
@@ -144,6 +165,11 @@ public class AuthFilter extends OncePerRequestFilter {
                     || CLI_SCHEDULED_TASK_UPLOAD_PATH.matcher(path).matches())) {
             return true;
         }
+        if ("GET".equalsIgnoreCase(request.getMethod())
+                && (CLI_WORKITEM_DOWNLOAD_INDEX_PATH.matcher(path).matches()
+                    || CLI_WORKITEM_DOWNLOAD_CONTENT_PATH.matcher(path).matches())) {
+            return true;
+        }
         if (PERSONAL_MCP_PATH_TOKEN_PATH.matcher(path).matches()) {
             return true;
         }
@@ -162,6 +188,16 @@ public class AuthFilter extends OncePerRequestFilter {
             return true;
         }
         if (path.startsWith(PERSONAL_USER_API_PREFIX)) {
+            return true;
+        }
+        if ("GET".equalsIgnoreCase(method) && WORKSPACE_RECYCLE_BIN_PATH.equals(path)) {
+            return true;
+        }
+        if (("PUT".equalsIgnoreCase(method) || "DELETE".equalsIgnoreCase(method))
+                && WORKSPACE_LIFECYCLE_PATH.matcher(path).matches()) {
+            return true;
+        }
+        if ("POST".equalsIgnoreCase(method) && WORKSPACE_RESTORE_PATH.matcher(path).matches()) {
             return true;
         }
         return ("POST".equalsIgnoreCase(method) && "/api/workspaces".equals(path))

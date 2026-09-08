@@ -4,6 +4,8 @@ import com.aliyun.autowonder.common.error.BizException;
 import com.aliyun.autowonder.common.error.ErrorCode;
 import com.aliyun.autowonder.common.result.PageResult;
 import com.aliyun.autowonder.agent.AgentDO;
+import com.aliyun.autowonder.aiusage.DispatchAiUsageDO;
+import com.aliyun.autowonder.aiusage.DispatchAiUsageDao;
 import com.aliyun.autowonder.dispatch.AgentSdlcResolver;
 import com.aliyun.autowonder.dispatch.DispatchDO;
 import com.aliyun.autowonder.dispatch.DispatchDao;
@@ -45,7 +47,9 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.slf4j.MDC;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.test.util.ReflectionTestUtils;
 
+import java.math.BigDecimal;
 import java.util.Date;
 import java.util.List;
 import java.util.ArrayList;
@@ -2516,5 +2520,102 @@ class WorkitemServiceTest {
         assertThrows(BizException.class, () -> service.updateTags(500L,
                 List.of("x".repeat(33)), 100L, 7L));
         verify(workitemDao, never()).updateTags(anyLong(), anyLong(), any(), anyInt(), anyLong());
+    }
+
+    @Test
+    void delivery_progress_accumulates_credits_across_agent_runs() {
+        stubWorkitemWithSingleStep();
+        when(dispatchDao.listByWorkitem(7L, 100L)).thenReturn(List.of(
+                creditsDispatch(30L, 40L, 1_000L),
+                creditsDispatch(31L, 41L, 2_000L),
+                creditsDispatch(32L, 40L, 3_000L)));
+        stubAgent(40L, "DEV");
+        stubAgent(41L, "CR");
+        stubUsageDao(List.of(
+                usageRow(30L, 40L, "20"), usageRow(31L, 41L, "20"), usageRow(32L, 40L, "30")));
+
+        DeliveryProgressVO progress = service.getDeliveryProgress(100L, 7L);
+
+        assertNotNull(progress.getTotalUsage());
+        assertEquals(0, new BigDecimal("70").compareTo(progress.getTotalUsage().getCredits()));
+        assertEquals(List.of("DEV run-1", "CR run-1", "DEV run-2"),
+                progress.getTotalUsage().getRuns().stream()
+                        .map(com.aliyun.autowonder.aiusage.dto.WorkitemUsageRunVO::getLabel).toList());
+        AgentDeliveryProgressVO dev = progress.getAgents().stream()
+                .filter(agent -> Long.valueOf(40L).equals(agent.getAgentId())).findFirst().orElseThrow();
+        assertEquals(0, new BigDecimal("50").compareTo(dev.getUsage().getCredits()));
+    }
+
+    @Test
+    void delivery_progress_omits_credits_summary_when_nothing_recorded() {
+        stubWorkitemWithSingleStep();
+        when(dispatchDao.listByWorkitem(7L, 100L)).thenReturn(List.of(creditsDispatch(30L, 40L, 1_000L)));
+        stubAgent(40L, "DEV");
+        stubUsageDao(List.of());
+
+        assertNull(service.getDeliveryProgress(100L, 7L).getTotalUsage());
+    }
+
+    @Test
+    void delivery_progress_credits_summary_degrades_to_null_when_usage_query_fails() {
+        stubWorkitemWithSingleStep();
+        when(dispatchDao.listByWorkitem(7L, 100L)).thenReturn(List.of(creditsDispatch(30L, 40L, 1_000L)));
+        stubAgent(40L, "DEV");
+        DispatchAiUsageDao usageDao = mock(DispatchAiUsageDao.class);
+        when(usageDao.listByDispatchIds(eq(7L), anyList())).thenThrow(new RuntimeException("db down"));
+        ReflectionTestUtils.setField(service, "dispatchAiUsageDao", usageDao);
+
+        DeliveryProgressVO progress = service.getDeliveryProgress(100L, 7L);
+
+        assertNull(progress.getTotalUsage());
+        assertTrue(progress.getAgents().stream().allMatch(agent -> agent.getUsage() == null));
+    }
+
+    private void stubWorkitemWithSingleStep() {
+        WorkitemDO w = new WorkitemDO();
+        w.setId(100L);
+        w.setTenantId(7L);
+        w.setSdlcId(10L);
+        w.setCurrentStepId(20L);
+        when(workitemDao.findById(100L)).thenReturn(w);
+
+        SdlcStepDO step = new SdlcStepDO();
+        step.setId(20L);
+        step.setName("编码实现");
+        step.setStepOrder(1);
+        when(sdlcStepDao.listBySdlc(10L)).thenReturn(new ArrayList<>(List.of(step)));
+    }
+
+    private void stubAgent(long agentId, String name) {
+        AgentDO agent = new AgentDO();
+        agent.setId(agentId);
+        agent.setName(name);
+        when(agentDao.findById(agentId)).thenReturn(agent);
+    }
+
+    private void stubUsageDao(List<DispatchAiUsageDO> rows) {
+        DispatchAiUsageDao usageDao = mock(DispatchAiUsageDao.class);
+        when(usageDao.listByDispatchIds(eq(7L), anyList())).thenReturn(rows);
+        ReflectionTestUtils.setField(service, "dispatchAiUsageDao", usageDao);
+    }
+
+    private DispatchDO creditsDispatch(long id, long agentId, long gmtCreate) {
+        DispatchDO dispatch = new DispatchDO();
+        dispatch.setId(id);
+        dispatch.setAgentId(agentId);
+        dispatch.setSdlcStepId(20L);
+        dispatch.setStatus(DispatchStatus.SUCCEEDED);
+        dispatch.setGmtCreate(new Date(gmtCreate));
+        return dispatch;
+    }
+
+    private DispatchAiUsageDO usageRow(long dispatchId, long agentId, String credits) {
+        DispatchAiUsageDO row = new DispatchAiUsageDO();
+        row.setWorkitemId(100L);
+        row.setDispatchId(dispatchId);
+        row.setAgentId(agentId);
+        row.setStepId("20");
+        row.setCredits(new BigDecimal(credits));
+        return row;
     }
 }

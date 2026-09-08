@@ -42,6 +42,10 @@ export async function transitionScheduledTask(id: number, action: 'enable' | 'pa
   return resp.data;
 }
 
+export async function deleteScheduledTask(id: number, version: number): Promise<void> {
+  await apiClient.delete(`/api/scheduled-tasks/${id}`, { params: { version } });
+}
+
 export async function runScheduledTaskNow(id: number, version: number, requestId: string): Promise<ScheduledTaskRun> {
   const resp = await apiClient.post<ScheduledTaskRun>(`/api/scheduled-tasks/${id}/run-now`, { version, requestId });
   return resp.data;

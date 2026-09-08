@@ -1,5 +1,6 @@
 package com.aliyun.autowonder.websocket;
 
+import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
 import com.aliyun.autowonder.conversation.AgentConversationDO;
 import com.aliyun.autowonder.conversation.ConversationCapabilityService;
@@ -77,6 +78,42 @@ public class WsConversationTransport implements ConversationTransport {
         frame.put("conversationId", conv.getId());
         frame.put("turnId", turnId);
         deliverToExecutor(conv.getExecutorId(), frame.toJSONString());
+    }
+
+    @Override
+    public void sendElicitationReply(AgentConversationDO conv, long turnId, String requestId,
+            String action, String answerJson) {
+        if (conv.getExecutorId() == null) {
+            throw new IllegalArgumentException("conversation must have a bound executor");
+        }
+        JSONObject frame = buildElicitationReplyFrame(conv.getExecutorId(), conv.getId(), turnId,
+                requestId, action, answerJson);
+        deliverToExecutor(conv.getExecutorId(), frame.toJSONString());
+    }
+
+    /**
+     * 与执行器 daemon/wsclient.ConversationElicitationReplyFrame 逐字段对齐的帧构造。
+     * 抽成静态方法是为了让契约测试不必搭 WS 环境就能断言字段名。
+     *
+     * <p>{@code executorId} 不属于执行器读取的业务字段，但 Redis 广播兜底靠
+     * {@link NodeMailboxListener} 按它找本机会话，缺失会导致跨节点投递被静默丢弃。
+     *
+     * <p>{@code answerJson} 为 null 或空白时不放 {@code content} 键 —— decline 与
+     * cancel 本就没有答案，塞一个空对象会让执行器误以为用户答了空表单。
+     */
+    static JSONObject buildElicitationReplyFrame(long executorId, long conversationId, long turnId,
+            String requestId, String action, String answerJson) {
+        JSONObject frame = new JSONObject(true);
+        frame.put("type", "CONVERSATION_ELICITATION_REPLY");
+        frame.put("executorId", executorId);
+        frame.put("conversationId", conversationId);
+        frame.put("turnId", turnId);
+        frame.put("requestId", requestId);
+        frame.put("action", action);
+        if (answerJson != null && !answerJson.isBlank()) {
+            frame.put("content", JSON.parseObject(answerJson));
+        }
+        return frame;
     }
 
     private void deliverToExecutor(Long executorId, String payload) {

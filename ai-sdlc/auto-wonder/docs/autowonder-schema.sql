@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS `user` (
   `avatar_url`    VARCHAR(512)    DEFAULT NULL COMMENT '头像（OSS 引用）',
   `phone`         VARCHAR(32)     DEFAULT NULL COMMENT '联系方式',
   `status`        TINYINT         NOT NULL DEFAULT 0 COMMENT '0 正常 / 1 禁用',
+  `is_admin`      TINYINT         NOT NULL DEFAULT 0 COMMENT '0 普通用户 / 1 平台管理员',
   `deactivated_at`          DATETIME(3) DEFAULT NULL COMMENT '注销申请时间',
   `cooling_off_expires_at`  DATETIME(3) DEFAULT NULL COMMENT '冷静期截止时间（7天后）',
   `deactivation_revoked_at` DATETIME(3) DEFAULT NULL COMMENT '撤销注销时间',
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS `user_im_identity` (
 CREATE TABLE IF NOT EXISTS `org` (
   `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '工作空间 ID；历史复用表以 tenant_id 关联',
   `name`         VARCHAR(128)    NOT NULL COMMENT '工作空间名称',
+  `active_name_key` VARCHAR(128) DEFAULT NULL COMMENT '在用名称键；软删除后置 NULL 以释放名称占位',
   `slug`         VARCHAR(64)     DEFAULT NULL COMMENT '唯一短标识（邀请链接用）',
   `description`  VARCHAR(512)    DEFAULT NULL COMMENT '描述',
   `background`   TEXT            DEFAULT NULL COMMENT '工作空间背景',
@@ -115,10 +117,13 @@ CREATE TABLE IF NOT EXISTS `org` (
   `creator_id`   BIGINT UNSIGNED DEFAULT NULL,
   `modifier_id`  BIGINT UNSIGNED DEFAULT NULL,
   `is_deleted`   TINYINT         NOT NULL DEFAULT 0,
+  `deleted_at`   DATETIME(3)     DEFAULT NULL COMMENT '逻辑删除时间',
+  `deleted_by`   BIGINT UNSIGNED DEFAULT NULL COMMENT '执行逻辑删除的 user_id',
   `version`      INT             NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_name` (`name`),
-  UNIQUE KEY `uk_slug` (`slug`)
+  UNIQUE KEY `uk_active_name` (`active_name_key`),
+  UNIQUE KEY `uk_slug` (`slug`),
+  KEY `idx_org_recycle_bin` (`is_deleted`, `deleted_at`, `id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=10000 DEFAULT CHARSET=utf8mb4 COMMENT='工作空间（历史物理表 org）';
 
 -- 工作空间成员（历史物理表名 org_member）
@@ -1267,7 +1272,8 @@ CREATE TABLE IF NOT EXISTS `workitem_comment_delivery` (
   KEY `idx_delivery_source` (`tenant_id`, `source_type`, `workitem_id`, `id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=10000 DEFAULT CHARSET=utf8mb4 COMMENT='工单评论定向 Worker 投递状态';
 
--- 钉钉数字人对话能力（V018__dingtalk_agent_conversation）：机器人绑定 + 工单无关会话 + turn。
+-- 钉钉数字人对话能力：机器人绑定 + 工单无关会话 + turn。
+-- （社区 docs/migration 自 V036 起编号，本组表已包含在本基线内，无对应迁移文件。）
 CREATE TABLE IF NOT EXISTS `dingtalk_robot_binding` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `tenant_id` BIGINT NOT NULL,
@@ -1355,7 +1361,31 @@ CREATE TABLE IF NOT EXISTS `agent_conversation_turn_event` (
   KEY `idx_cleanup` (`gmt_create`)
 ) ENGINE=InnoDB AUTO_INCREMENT=10000 DEFAULT CHARSET=utf8mb4 COMMENT='Provider event chunks for conversation turns';
 
--- 工作空间权限申请（V044__workspace_access_request）：任意登录用户申请加入工作空间，ADMIN 审批。
+-- ACP elicitation（Agent 向用户提问）的挂起请求（V049__conversation_elicitation）。
+--
+-- 为什么单独建表而不是复用 agent_conversation_turn_event：
+-- 卡片需要可变状态（PENDING → ANSWERED/DECLINED/EXPIRED/CANCELED）与
+-- 按 requestId 的唯一约束，而事件表是 append-only 的分片日志。
+CREATE TABLE IF NOT EXISTS `agent_conversation_elicitation` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `tenant_id` BIGINT NOT NULL,
+  `conversation_id` BIGINT NOT NULL,
+  `turn_id` BIGINT NOT NULL,
+  `request_id` VARCHAR(64) NOT NULL COMMENT '执行器生成的挂起请求标识',
+  `mode` VARCHAR(16) NOT NULL DEFAULT 'form',
+  `message` VARCHAR(1024) NULL,
+  `schema_json` MEDIUMTEXT NULL COMMENT 'ACP requestedSchema 原样存储',
+  `status` VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/ANSWERED/DECLINED/EXPIRED/CANCELED',
+  `answer_json` MEDIUMTEXT NULL,
+  `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `gmt_modified` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_conv_request` (`tenant_id`, `conversation_id`, `request_id`),
+  KEY `idx_turn` (`tenant_id`, `turn_id`),
+  KEY `idx_pending_expiry` (`status`, `gmt_create`)
+) ENGINE=InnoDB AUTO_INCREMENT=10000 DEFAULT CHARSET=utf8mb4 COMMENT='ACP 问答卡片挂起请求';
+
+-- 工作空间权限申请（V048__workspace_access_request）：任意登录用户申请加入工作空间，ADMIN 审批。
 -- pending_marker 为生成列（PENDING 时为 1，否则为 NULL），配合唯一键在库层保证
 -- 每个 (tenant_id, requester_id) 最多一条 PENDING 申请，同时允许被拒后重新申请。
 CREATE TABLE IF NOT EXISTS `workspace_access_request` (

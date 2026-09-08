@@ -187,6 +187,20 @@ export interface UsageSummary {
   credits?: number | null;
 }
 
+export interface WorkitemUsageRun {
+  agentId?: number | null;
+  agentName?: string | null;
+  runIndex?: number | null;
+  /** 后端给出的展示标签，形如 `DEV run-1`。 */
+  label?: string | null;
+  credits?: number | null;
+}
+
+export interface WorkitemUsageSummary {
+  credits?: number | null;
+  runs?: WorkitemUsageRun[] | null;
+}
+
 export interface AgentDeliveryProgress {
   agentId: number;
   agentName: string;
@@ -203,6 +217,8 @@ export interface DeliveryProgress {
   workflowPlan?: WorkflowPlan | null;
   processGraph?: ProcessGraph | null;
   totalDurationMs?: number | null;
+  /** 工单内全部执行轮次累加的 credits；无消耗时后端返回 null。 */
+  totalUsage?: WorkitemUsageSummary | null;
 }
 
 export interface ProcessGraphNode {
@@ -347,6 +363,20 @@ export interface RuntimeTraceEvent {
   eventType: string;
   eventTime?: string | null;
   detail: Record<string, unknown>;
+}
+
+export interface RuntimeActivity {
+  eventId?: string | null;
+  seq?: number | null;
+  eventTime?: string | null;
+  eventType: string;
+  level: 'INFO' | 'ERROR';
+  content: string;
+}
+
+export interface RuntimeActivityTimeline {
+  dispatchId: number;
+  activities: RuntimeActivity[];
 }
 
 export interface RuntimeTrace {
