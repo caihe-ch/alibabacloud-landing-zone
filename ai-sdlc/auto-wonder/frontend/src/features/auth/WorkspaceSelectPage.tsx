@@ -1,6 +1,13 @@
 import { useState, type CSSProperties } from 'react';
 import { Button, Card, Form, Input, Typography, message, Spin, Tabs } from 'antd';
-import { ArrowRightOutlined, BgColorsOutlined, PlusOutlined } from '@ant-design/icons';
+import {
+  ArrowRightOutlined,
+  BgColorsOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  PlusOutlined,
+  RestOutlined,
+} from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/shared/api/client';
@@ -9,12 +16,15 @@ import type { WorkspaceInfo, SwitchWorkspaceResponse } from '@/shared/types/comm
 import { ApiError } from '@/shared/types/common';
 import { myWorkspacesQueryKey } from './api';
 import { AllWorkspacesTab } from './AllWorkspacesTab';
+import { WorkspaceEditModal } from './WorkspaceEditModal';
+import { WorkspaceDeleteModal } from './WorkspaceDeleteModal';
 import { refreshTenantScopedQueries } from '@/features/workitem/queryCache';
 import {
   BRANDING_QUERY_KEY,
   DEFAULT_BRANDING,
   getPublicBranding,
 } from '@/features/platform/brandingApi';
+import './workspaceLifecycle.css';
 
 const { Title, Text } = Typography;
 const { TextArea } = Input;
@@ -27,10 +37,13 @@ const WORKSPACE_CARD_SHADOW = '0 0 0 2px rgba(255, 106, 0, 0.08), 0 14px 28px rg
 export function WorkspaceSelectPage() {
   const [creating, setCreating] = useState(false);
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [editTarget, setEditTarget] = useState<WorkspaceInfo | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<WorkspaceInfo | null>(null);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const setAccessToken = useAuthStore((s) => s.setAccessToken);
   const setCurrentWorkspace = useAuthStore((s) => s.setCurrentWorkspace);
+  const clearCurrentWorkspace = useAuthStore((s) => s.clearCurrentWorkspace);
   const currentWorkspace = useAuthStore((s) => s.currentWorkspace);
   const user = useAuthStore((s) => s.user);
   const [form] = Form.useForm();
@@ -76,6 +89,15 @@ export function WorkspaceSelectPage() {
     }
   };
 
+  // F6: the access token stays bound to a workspace that AuthFilter now rejects on every
+  // workspace-scoped call, so the binding is dropped at the moment of deletion rather than
+  // after the first failed request.
+  const handleDeleted = (deleted: WorkspaceInfo) => {
+    if (currentWorkspace?.id === deleted.id) {
+      clearCurrentWorkspace();
+    }
+  };
+
   return (
     <div style={pageShellStyle}>
       <div style={contentStyle}>
@@ -113,12 +135,10 @@ export function WorkspaceSelectPage() {
                       {workspaces.map((workspace) => {
                         const active = currentWorkspace?.id === workspace.id;
                         return (
-                          <button
+                          <div
                             key={workspace.id}
-                            type="button"
-                            data-testid={`workspace-card-${workspace.id}`}
+                            data-testid={`workspace-card-shell-${workspace.id}`}
                             style={getOrgCardStyle(active)}
-                            aria-label={`进入工作空间 ${workspace.name}`}
                             onMouseEnter={(event) => {
                               event.currentTarget.style.borderColor = BRAND_ORANGE;
                               event.currentTarget.style.boxShadow = WORKSPACE_CARD_SHADOW;
@@ -139,16 +159,52 @@ export function WorkspaceSelectPage() {
                               event.currentTarget.style.borderColor = String(nextStyle.borderColor);
                               event.currentTarget.style.boxShadow = String(nextStyle.boxShadow);
                             }}
-                            onClick={() => handleSwitch(workspace)}
                           >
                             {active && <span style={currentBadgeStyle}>当前</span>}
-                            <span style={orgMarkStyle}>{getOrgInitial(workspace.name)}</span>
-                            <span style={orgNameStyle}>{workspace.name}</span>
-                            <span style={orgDescStyle}>{workspace.description || '暂无描述'}</span>
-                            <span style={orgActionStyle}>
-                              进入工作空间 <ArrowRightOutlined />
-                            </span>
-                          </button>
+                            <button
+                              type="button"
+                              data-testid={`workspace-card-${workspace.id}`}
+                              style={cardEnterStyle}
+                              aria-label={`进入工作空间 ${workspace.name}`}
+                              onClick={() => handleSwitch(workspace)}
+                            >
+                              <span style={orgMarkStyle}>{getOrgInitial(workspace.name)}</span>
+                              <span style={orgNameStyle}>{workspace.name}</span>
+                              <span style={orgDescStyle}>{workspace.description || '暂无描述'}</span>
+                              <span style={orgActionStyle}>
+                                进入工作空间 <ArrowRightOutlined />
+                              </span>
+                            </button>
+                            {/* F1.2: siblings of the enter button rather than children of it. A
+                                control nested inside a <button> is invalid HTML and its click
+                                would reach the card's enter handler. canManage comes from the
+                                server (owner or ADMIN) so the UI cannot disagree with it. */}
+                            {workspace.canManage === true && (
+                              <div
+                                style={cardManageAreaStyle}
+                                data-testid={`workspace-manage-area-${workspace.id}`}
+                              >
+                                <button
+                                  type="button"
+                                  className="aw-card-manage-button"
+                                  data-testid={`edit-workspace-${workspace.id}`}
+                                  aria-label={`编辑工作空间 ${workspace.name}`}
+                                  onClick={() => setEditTarget(workspace)}
+                                >
+                                  <EditOutlined />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="aw-card-manage-button aw-card-manage-button--danger"
+                                  data-testid={`delete-workspace-${workspace.id}`}
+                                  aria-label={`删除工作空间 ${workspace.name}`}
+                                  onClick={() => setDeleteTarget(workspace)}
+                                >
+                                  <DeleteOutlined />
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         );
                       })}
 
@@ -222,6 +278,27 @@ export function WorkspaceSelectPage() {
             },
           ]}
         />
+
+        {/* F4.1: bottom-right of the list page, a real button (icon + text) rather than a
+            decorative element, and it only ever carries workspaces. */}
+        <div style={recycleBinBarStyle}>
+          <button
+            type="button"
+            className="aw-recycle-bin-entry"
+            data-testid="workspace-recycle-bin-entry"
+            aria-label="打开工作空间回收站"
+            onClick={() => navigate('/workspaces/recycle-bin')}
+          >
+            <RestOutlined /> 工作空间回收站
+          </button>
+        </div>
+
+        <WorkspaceEditModal workspace={editTarget} onClose={() => setEditTarget(null)} />
+        <WorkspaceDeleteModal
+          workspace={deleteTarget}
+          onDeleted={handleDeleted}
+          onClose={() => setDeleteTarget(null)}
+        />
       </div>
     </div>
   );
@@ -286,6 +363,40 @@ const orgCardStyle: CSSProperties = {
   textAlign: 'left',
   appearance: 'none',
   transition: 'border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease',
+};
+
+// The enter control now lives inside the card shell, so it sheds every piece of native button
+// chrome and lets the shell own the border, background and hover transform.
+const cardEnterStyle: CSSProperties = {
+  display: 'block',
+  width: '100%',
+  padding: 0,
+  // `0` rather than the idiomatic `'none'`: jsdom drops the `border: none` shorthand, so the
+  // computed border falls back to the UA default and this reset becomes unobservable in tests.
+  // Both render identically in a browser.
+  border: 0,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  textAlign: 'left',
+  cursor: 'pointer',
+  appearance: 'none',
+};
+
+// In normal flow below the enter control rather than absolutely positioned over it: an overlay
+// would both hide part of the card and swallow the management clicks (acceptance #18).
+const cardManageAreaStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'flex-end',
+  gap: 8,
+  marginTop: 12,
+};
+
+const recycleBinBarStyle: CSSProperties = {
+  display: 'flex',
+  justifyContent: 'flex-end',
+  marginTop: 18,
 };
 
 const createCardStyle: CSSProperties = {

@@ -47,4 +47,9 @@
         WHERE tenant_id = #{tenantId} AND is_deleted = 0 AND id IN
         <foreach collection="ids" item="eid" open="(" separator="," close=")">#{eid}</foreach>
     </select>
+    <select id="listByClientKind" resultType="com.aliyun.autowonder.executor.ExecutorDO">
+        SELECT * FROM executor
+        WHERE client_kind = #{clientKind} AND is_deleted = 0
+        ORDER BY last_heartbeat DESC, id ASC
+    </select>
 </mapper>

@@ -1,20 +1,33 @@
-import { useState } from 'react';
-import { Card, Table, Tag, Badge, Button, Space, Modal, Form, Input, Select, message, Popconfirm, Alert, Typography, Dropdown, Tooltip, Segmented } from 'antd';
-import { PlusOutlined, DeleteOutlined, CopyOutlined, CheckCircleFilled, CodeOutlined, EyeOutlined, EyeInvisibleOutlined, CodeSandboxOutlined, DownOutlined, BugOutlined } from '@ant-design/icons';
+import { useEffect, useMemo, useState } from 'react';
+import { Card, Table, Tag, Badge, Button, Space, Modal, Form, Input, Select, message, Popconfirm, Alert, Typography, Dropdown, Tooltip, Segmented, Collapse } from 'antd';
+import { PlusOutlined, DeleteOutlined, CopyOutlined, CheckCircleFilled, CodeOutlined, RobotOutlined, EyeOutlined, EyeInvisibleOutlined, CodeSandboxOutlined, DownOutlined, BugOutlined } from '@ant-design/icons';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { listExecutors, createExecutor, deleteExecutor, getExecutorToken } from './api';
+import { listExecutors, createExecutor, deleteExecutor, getExecutorToken, getExecutorModelCatalog } from './api';
 import { listAgents } from '@/features/agent/api';
+import type { Agent } from '@/features/agent/api';
+import { listSquadsWithMembers } from '@/features/squad/api';
+import { buildAgentSquadNameMap, formatAgentSquadLabel } from './agentSquadLabel';
+import { buildExecutorAgentGroups, type ExecutorAgentGroup } from './executorAgentGroups';
 import { BRANDING_QUERY_KEY, DEFAULT_BRANDING, getPublicBranding } from '@/features/platform/brandingApi';
 import type { ExecutorVO, IssuedExecutorVO } from './api';
 import type { ColumnsType } from 'antd/es/table';
-import { QODER_MODELS, qoderOptionsForModel, type QoderLaunchOptions } from './qoderOptions';
+import {
+  chooseQoderModel,
+  qoderOptionsForModel,
+  qoderProviderForClientKind,
+  resolveQoderModelOptions,
+  type QoderLaunchOptions,
+} from './qoderOptions';
 import { useAccessCommand } from '@/shared/auth/useAccessCommand';
 import { copyTextToClipboard } from '@/shared/lib/clipboard';
-import { buildDebugCommand, buildStartupCommand, detectStartupOs, type DebugShell, type StartupOs } from './startupCommand';
+import { buildStartupCommand, buildStartupDebugCommand, detectStartupOs, type DebugShell, type StartupOs } from './startupCommand';
 
-export const CLIENT_KINDS: { value: string; label: string; color: string; Icon: typeof CodeOutlined }[] = [
+const CLIENT_KINDS: { value: string; label: string; color: string; Icon: typeof CodeOutlined }[] = [
   { value: 'QODER_CN_CLI', label: 'Qoder CLI CN', color: '#1677ff', Icon: CodeOutlined },
   { value: 'QODER_CLI', label: 'Qoder CLI', color: '#1677ff', Icon: CodeOutlined },
+  { value: 'CLAUDE_CODE', label: 'Claude Code', color: '#d4380d', Icon: RobotOutlined },
+  { value: 'CODEX_CLI', label: 'Codex CLI', color: '#13a8a8', Icon: CodeSandboxOutlined },
+  { value: 'CURSOR_CLI', label: 'Cursor CLI', color: '#141414', Icon: CodeSandboxOutlined },
 ];
 
 const clientKindMap = Object.fromEntries(CLIENT_KINDS.map((k) => [k.value, k]));
@@ -23,6 +36,8 @@ export function isQoderClientKind(kind?: string): boolean {
   return kind === 'QODER_CLI' || kind === 'QODER_CN_CLI';
 }
 
+// 新建执行器仅开放 Qoder 系执行器，其余类型在列表中仍正常展示
+export const CREATABLE_CLIENT_KINDS = CLIENT_KINDS.filter((k) => isQoderClientKind(k.value));
 
 const QODER_PREFS_KEY_PREFIX = 'autowonder.executor.qoderStartupOptions';
 
@@ -37,10 +52,18 @@ export function readQoderStartupPreference(executorId: number): QoderStartupPref
   try {
     const raw = localStorage.getItem(`${QODER_PREFS_KEY_PREFIX}.${executorId}`);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as QoderStartupPreference;
-    const validModel = QODER_MODELS.some((m) => m.value === parsed.model);
-    if (!validModel || !parsed.memoryMode) return null;
-    return parsed;
+    const parsed = JSON.parse(raw) as Partial<QoderStartupPreference>;
+    if (
+      !parsed.memoryMode
+      || !parsed.model
+      || !parsed.reasoningEffort
+      || !parsed.contextWindow
+      || typeof parsed.memoryMode !== 'string'
+      || typeof parsed.model !== 'string'
+      || typeof parsed.reasoningEffort !== 'string'
+      || typeof parsed.contextWindow !== 'string'
+    ) return null;
+    return parsed as QoderStartupPreference;
   } catch {
     return null;
   }
@@ -52,6 +75,21 @@ export function writeQoderStartupPreference(executorId: number, pref: QoderStart
   } catch {
     // localStorage quota or unavailable — silently ignore
   }
+}
+
+// 写入的偏好与创建成功弹窗必须共用同一套兜底值，否则两处展示的 Context Window 会不一致
+export function resolveQoderLaunch(
+  model?: string,
+  reasoningEffort?: string,
+  contextWindow?: string,
+): QoderLaunchOptions {
+  const resolvedModel = model ?? 'auto';
+  const options = qoderOptionsForModel(resolvedModel);
+  return {
+    model: resolvedModel,
+    reasoningEffort: reasoningEffort ?? options.defaultReasoningEffort,
+    contextWindow: contextWindow ?? options.defaultContextWindow,
+  };
 }
 
 const statusBadge: Record<string, { status: 'success' | 'processing' | 'default'; text: string }> = {
@@ -91,7 +129,7 @@ function CopyCommandActions({ onCopy }: { onCopy: (shell?: DebugShell) => void }
 function ClientKindSelect({ value, onChange }: { value?: string; onChange?: (v: string) => void }) {
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
-      {CLIENT_KINDS.map(({ value: v, label, color, Icon }) => {
+      {CREATABLE_CLIENT_KINDS.map(({ value: v, label, color, Icon }) => {
         const selected = value === v;
         return (
           <div
@@ -125,10 +163,25 @@ function ClientKindSelect({ value, onChange }: { value?: string; onChange?: (v: 
   );
 }
 
+function ExecutorGroupHeader({ group }: { group: ExecutorAgentGroup }) {
+  return (
+    <Space size={8} wrap>
+      <RobotOutlined style={{ color: '#1677ff' }} />
+      <Typography.Text strong>{group.label}</Typography.Text>
+      <Tag>{`${group.executors.length} 个执行器`}</Tag>
+      <Badge status="success" text={`在线 ${group.statusSummary.online}`} />
+      <Badge status="processing" text={`忙碌 ${group.statusSummary.busy}`} />
+      <Badge status="default" text={`离线 ${group.statusSummary.offline}`} />
+    </Space>
+  );
+}
+
 export function ExecutorListPage() {
   const queryClient = useQueryClient();
   const runAccessCommand = useAccessCommand();
   const [selectedAgentId, setSelectedAgentId] = useState<number | undefined>();
+  // 只记录用户主动展开的分组，Agent 分组默认折叠，异步加载或刷新后新出现的分组同样保持折叠。
+  const [expandedAgentKeys, setExpandedAgentKeys] = useState<string[]>([]);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [tokenResult, setTokenResult] = useState<(IssuedExecutorVO & {
     clientKind: string;
@@ -144,17 +197,117 @@ export function ExecutorListPage() {
   const [loadingTokenId, setLoadingTokenId] = useState<number | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [startupOs, setStartupOs] = useState<StartupOs>(detectStartupOs());
+  const clientKind = Form.useWatch('clientKind', form);
+  const qoderModel = Form.useWatch('model', form) ?? 'auto';
+  const startupQoderModel = Form.useWatch('model', startupForm) ?? 'qmodel_latest';
+  const startupMemoryMode = Form.useWatch('memoryMode', startupForm) ?? 'platform';
+  const startupReasoningEffort = Form.useWatch('reasoningEffort', startupForm);
+  const startupContextWindow = Form.useWatch('contextWindow', startupForm);
+  const createQoderProvider = createModalOpen ? qoderProviderForClientKind(clientKind) : undefined;
+  const startupQoderProvider = qoderProviderForClientKind(startupTarget?.clientKind);
+
+  const qoderCatalogQuery = useQuery({
+    queryKey: ['executor-model-catalog', 'qoder'],
+    queryFn: () => getExecutorModelCatalog('qoder'),
+    enabled: createQoderProvider === 'qoder' || startupQoderProvider === 'qoder',
+    retry: false,
+  });
+  const qoderCnCatalogQuery = useQuery({
+    queryKey: ['executor-model-catalog', 'qodercn'],
+    queryFn: () => getExecutorModelCatalog('qodercn'),
+    enabled: createQoderProvider === 'qodercn' || startupQoderProvider === 'qodercn',
+    retry: false,
+  });
+  const qoderCatalogModels = qoderCatalogQuery.isError ? undefined : qoderCatalogQuery.data?.models;
+  const qoderCnCatalogModels = qoderCnCatalogQuery.isError ? undefined : qoderCnCatalogQuery.data?.models;
+  const createQoderModelOptions = useMemo(() => resolveQoderModelOptions(
+    createQoderProvider === 'qoder'
+      ? qoderCatalogModels
+      : createQoderProvider === 'qodercn'
+        ? qoderCnCatalogModels
+        : undefined,
+  ), [createQoderProvider, qoderCatalogModels, qoderCnCatalogModels]);
+  const startupQoderModelOptions = useMemo(() => resolveQoderModelOptions(
+    startupQoderProvider === 'qoder'
+      ? qoderCatalogModels
+      : startupQoderProvider === 'qodercn'
+        ? qoderCnCatalogModels
+        : undefined,
+  ), [startupQoderProvider, qoderCatalogModels, qoderCnCatalogModels]);
+  const startupQoderCatalogSettling = startupQoderProvider === 'qoder'
+    ? qoderCatalogQuery.isPending || qoderCatalogQuery.isFetching
+    : startupQoderProvider === 'qodercn'
+      ? qoderCnCatalogQuery.isPending || qoderCnCatalogQuery.isFetching
+      : false;
+
+  useEffect(() => {
+    if (!createQoderProvider) return;
+    const model = chooseQoderModel(createQoderModelOptions, form.getFieldValue('model'));
+    if (!model || model === form.getFieldValue('model')) return;
+    const options = qoderOptionsForModel(model);
+    form.setFieldsValue({
+      model,
+      reasoningEffort: options.defaultReasoningEffort,
+      contextWindow: options.defaultContextWindow,
+    });
+  }, [createQoderModelOptions, createQoderProvider, form]);
+
+  useEffect(() => {
+    if (!startupTarget || !startupQoderProvider || startupQoderCatalogSettling) return;
+    const model = chooseQoderModel(startupQoderModelOptions, startupForm.getFieldValue('model'));
+    if (!model || model === startupForm.getFieldValue('model')) return;
+    const options = qoderOptionsForModel(model);
+    startupForm.setFieldsValue({
+      model,
+      reasoningEffort: options.defaultReasoningEffort,
+      contextWindow: options.defaultContextWindow,
+    });
+  }, [startupForm, startupQoderCatalogSettling, startupQoderModelOptions, startupQoderProvider, startupTarget]);
 
   const { data: agents = [] } = useQuery({
     queryKey: ['agents', 1, 100],
     queryFn: () => listAgents({ page: 1, size: 100 }),
   });
 
+  const squadsQuery = useQuery({
+    queryKey: ['squads', 'executor-agent-options'],
+    queryFn: () => listSquadsWithMembers(),
+  });
+  const squadNameMap = useMemo(
+    () => buildAgentSquadNameMap(squadsQuery.data ?? []),
+    [squadsQuery.data],
+  );
+  const agentOptionLabel = (agent: Agent) => squadsQuery.data
+    ? formatAgentSquadLabel(agent.name, squadNameMap.get(agent.id))
+    : agent.name;
+
   const { data: executors = [], isLoading } = useQuery({
     queryKey: ['executors', selectedAgentId],
     queryFn: () => listExecutors(selectedAgentId),
     refetchInterval: 10000,
   });
+
+  const agentNameById = useMemo(
+    () => new Map(agents.map((agent) => [agent.id, agent.name])),
+    [agents],
+  );
+
+  const executorGroups = useMemo(() => buildExecutorAgentGroups(
+    executors,
+    (agentId, agentName) => {
+      const name = agentName ?? agentNameById.get(agentId);
+      if (!name) return null;
+      return squadsQuery.data
+        ? formatAgentSquadLabel(name, squadNameMap.get(agentId))
+        : name;
+    },
+  ), [agentNameById, executors, squadNameMap, squadsQuery.data]);
+
+  const handleAgentCollapseChange = (keys: string | string[]) => {
+    // 非手风琴模式下 antd 恒传数组，用 flat 归一化两种签名，避免留下不可达分支。
+    setExpandedAgentKeys([keys].flat());
+  };
+
   const brandingQuery = useQuery({
     queryKey: BRANDING_QUERY_KEY,
     queryFn: getPublicBranding,
@@ -175,6 +328,12 @@ export function ExecutorListPage() {
     }) =>
       createExecutor(agentId, { name, clientKind }),
     onSuccess: (data, variables) => {
+      if (isQoderClientKind(variables.clientKind)) {
+        writeQoderStartupPreference(data.id, {
+          memoryMode: variables.memoryMode,
+          ...resolveQoderLaunch(variables.model, variables.reasoningEffort, variables.contextWindow),
+        });
+      }
       setTokenResult({
         ...data,
         clientKind: variables.clientKind,
@@ -204,22 +363,12 @@ export function ExecutorListPage() {
     });
   };
 
-  const clientKind = Form.useWatch('clientKind', form);
-  const qoderModel = Form.useWatch('model', form) ?? 'auto';
-  const startupQoderModel = Form.useWatch('model', startupForm) ?? 'qmodel_latest';
   const startupQoderOptions = qoderOptionsForModel(startupQoderModel);
   const qoderModelOptions = qoderOptionsForModel(qoderModel);
   const tokenQoderOptions: QoderLaunchOptions | undefined = tokenResult && isQoderClientKind(tokenResult.clientKind)
-    ? {
-        model: tokenResult.model ?? 'auto',
-        reasoningEffort: tokenResult.reasoningEffort ?? qoderOptionsForModel(tokenResult.model ?? 'auto').defaultReasoningEffort,
-        contextWindow: tokenResult.contextWindow ?? qoderOptionsForModel(tokenResult.model ?? 'auto').defaultContextWindow,
-      }
+    ? resolveQoderLaunch(tokenResult.model, tokenResult.reasoningEffort, tokenResult.contextWindow)
     : undefined;
 
-  const startupMemoryMode = Form.useWatch('memoryMode', startupForm) ?? 'platform';
-  const startupReasoningEffort = Form.useWatch('reasoningEffort', startupForm);
-  const startupContextWindow = Form.useWatch('contextWindow', startupForm);
   const startupIsQoder = startupTarget ? isQoderClientKind(startupTarget.clientKind) : false;
   const startupQoderLaunch: QoderLaunchOptions | undefined = startupIsQoder
     ? {
@@ -319,15 +468,15 @@ export function ExecutorListPage() {
     }
     let cmd: string;
     try {
-      // debug suffix is a shell redirection, so it must wrap the plain command,
-      // never the Windows powershell -Command form
-      const base = buildStartupCommand(
-        spec.token, spec.executorId, spec.clientKind, spec.memoryMode,
-        mcpBaseUrl, runtimeVersion, spec.qoder, shell ? 'posix' : os,
-      );
       cmd = shell
-        ? buildDebugCommand(base, spec.clientKind, spec.executorId, shell, new Date())
-        : base;
+        ? buildStartupDebugCommand(
+            spec.token, spec.executorId, spec.clientKind, spec.memoryMode,
+            mcpBaseUrl, runtimeVersion, spec.qoder, shell, new Date(),
+          )
+        : buildStartupCommand(
+            spec.token, spec.executorId, spec.clientKind, spec.memoryMode,
+            mcpBaseUrl, runtimeVersion, spec.qoder, os,
+          );
     } catch (error) {
       message.error(error instanceof Error ? error.message : '启动命令生成失败');
       return;
@@ -537,14 +686,34 @@ export function ExecutorListPage() {
           </Space>
         }
       >
-        <Table
-          rowKey="id"
-          columns={columns}
-          dataSource={executors}
-          loading={isLoading}
-          pagination={false}
-          scroll={{ x: 1390 }}
-        />
+        {executorGroups.length > 0 ? (
+          <Collapse
+            activeKey={expandedAgentKeys}
+            onChange={handleAgentCollapseChange}
+            items={executorGroups.map((group) => ({
+              key: group.key,
+              label: <ExecutorGroupHeader group={group} />,
+              children: (
+                <Table
+                  rowKey="id"
+                  columns={columns}
+                  dataSource={group.executors}
+                  pagination={false}
+                  scroll={{ x: 1390 }}
+                />
+              ),
+            }))}
+          />
+        ) : (
+          <Table
+            rowKey="id"
+            columns={columns}
+            dataSource={executors}
+            loading={isLoading}
+            pagination={false}
+            scroll={{ x: 1390 }}
+          />
+        )}
       </Card>
 
       {/* Create Modal */}
@@ -558,7 +727,7 @@ export function ExecutorListPage() {
         }}>
           <Form.Item label="归属 Agent" name="agentId" rules={[{ required: true, message: '请选择归属 Agent' }]}>
             <Select placeholder="选择 Agent" showSearch optionFilterProp="label"
-              options={agents.map(a => ({ value: a.id, label: a.name }))}
+              options={agents.map(a => ({ value: a.id, label: agentOptionLabel(a) }))}
             />
           </Form.Item>
           <Form.Item label="客户端类型" name="clientKind" rules={[{ required: true, message: '请选择类型' }]}>
@@ -574,7 +743,7 @@ export function ExecutorListPage() {
           {isQoderClientKind(clientKind) && (
             <>
               <Form.Item label="Qoder 模型" name="model" rules={[{ required: true, message: '请选择 Qoder 模型' }]}>
-                <Select options={QODER_MODELS} onChange={(model) => {
+                <Select options={createQoderModelOptions} onChange={(model) => {
                   const options = qoderOptionsForModel(model);
                   form.setFieldsValue({
                     reasoningEffort: options.defaultReasoningEffort,
@@ -613,7 +782,7 @@ export function ExecutorListPage() {
           {startupIsQoder && (
             <>
               <Form.Item label="Qoder 模型" name="model" rules={[{ required: true }]}>
-                <Select options={QODER_MODELS} onChange={(model) => {
+                <Select options={startupQoderModelOptions} onChange={(model) => {
                   const options = qoderOptionsForModel(model);
                   startupForm.setFieldsValue({
                     reasoningEffort: options.defaultReasoningEffort,

@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { apiClient } from '@/shared/api/client';
-import { cancelClarificationTurn, submitClarificationTurn } from './api';
+import {
+  cancelClarificationTurn,
+  getClarificationTurnEvents,
+  replyClarificationElicitation,
+  submitClarificationTurn,
+} from './api';
 
 vi.mock('@/shared/api/client', () => ({
   apiClient: {
+    get: vi.fn(),
     post: vi.fn(),
   },
 }));
@@ -50,6 +56,44 @@ describe('clarification api', () => {
 
     expect(apiClient.post).toHaveBeenCalledWith(
       '/api/workitems/10011/clarification-conversations/10010/turns/77/cancel',
+    );
+  });
+});
+
+describe('clarification acp api', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('replies to a card on the per-request reply endpoint with a serialised answer', async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ data: null } as never);
+
+    await replyClarificationElicitation(10011, 10010, 'a1b2c3', 'accept', { q0: '方案A' });
+
+    expect(apiClient.post).toHaveBeenCalledWith(
+      '/api/workitems/10011/clarification-conversations/10010/elicitations/a1b2c3/reply',
+      { action: 'accept', content: '{"q0":"方案A"}' },
+    );
+  });
+
+  it('sends a null content for decline and escapes the requestId', async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ data: null } as never);
+
+    await replyClarificationElicitation(10011, 10010, 'a/b', 'decline');
+
+    expect(apiClient.post).toHaveBeenCalledWith(
+      '/api/workitems/10011/clarification-conversations/10010/elicitations/a%2Fb/reply',
+      { action: 'decline', content: null },
+    );
+  });
+
+  it('fetches all events of a single turn', async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ data: [] } as never);
+
+    await expect(getClarificationTurnEvents(10011, 10010, 77)).resolves.toEqual([]);
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/api/workitems/10011/clarification-conversations/10010/turns/77/events',
     );
   });
 });

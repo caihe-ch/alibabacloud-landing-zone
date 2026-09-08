@@ -17,10 +17,12 @@ class WorkitemClarificationConversationServiceTest {
     private final AgentDao agentDao = mock(AgentDao.class);
     private final ExecutorSelector executorSelector = mock(ExecutorSelector.class);
     private final ConversationRuntimePresence runtimePresence = mock(ConversationRuntimePresence.class);
+    private final ConversationElicitationService elicitationService =
+            mock(ConversationElicitationService.class);
 
     private final WorkitemClarificationConversationService service =
             new WorkitemClarificationConversationService(convDao, turnDao, conversationService,
-                    agentDao, executorSelector, runtimePresence);
+                    agentDao, executorSelector, runtimePresence, elicitationService);
 
     private AgentConversationDO clarificationConversation(Long workitemId) {
         AgentConversationDO conv = new AgentConversationDO();
@@ -99,5 +101,95 @@ class WorkitemClarificationConversationServiceTest {
 
         assertEquals("QUEUED", vo.getProcessingStatus());
         assertEquals(55L, vo.getProcessingTurnId());
+    }
+
+    /** S14：前端据此决定是否启用卡片交互入口，必须随 feature 变化。 */
+    @Test
+    void getConversationReportsAcpInteractionSupportedWhenRuntimeNegotiatesFeature() {
+        when(convDao.findById(1L, 77L)).thenReturn(clarificationConversation(10011L));
+        when(turnDao.listTurnsByConversation(1L, 77L)).thenReturn(java.util.List.of());
+        when(runtimePresence.isExecutorOnline(9L)).thenReturn(true);
+        when(runtimePresence.supportsProtocolFeature(9L, "CONVERSATION_ACP_INTERACTION_V1"))
+                .thenReturn(true);
+
+        assertTrue(service.getConversation(1L, 10011L, 77L).isAcpInteractionSupported());
+    }
+
+    @Test
+    void getConversationHidesAcpInteractionWhenRuntimeLacksFeature() {
+        when(convDao.findById(1L, 77L)).thenReturn(clarificationConversation(10011L));
+        when(turnDao.listTurnsByConversation(1L, 77L)).thenReturn(java.util.List.of());
+        when(runtimePresence.isExecutorOnline(9L)).thenReturn(true);
+        when(runtimePresence.supportsProtocolFeature(9L, "CONVERSATION_ACP_INTERACTION_V1"))
+                .thenReturn(false);
+
+        assertFalse(service.getConversation(1L, 10011L, 77L).isAcpInteractionSupported());
+    }
+
+    /** 执行器离线时卡片提交必然失败，不该把交互入口亮出来。 */
+    @Test
+    void getConversationHidesAcpInteractionWhenExecutorOffline() {
+        when(convDao.findById(1L, 77L)).thenReturn(clarificationConversation(10011L));
+        when(turnDao.listTurnsByConversation(1L, 77L)).thenReturn(java.util.List.of());
+        when(runtimePresence.isExecutorOnline(9L)).thenReturn(false);
+        when(runtimePresence.supportsProtocolFeature(9L, "CONVERSATION_ACP_INTERACTION_V1"))
+                .thenReturn(true);
+
+        assertFalse(service.getConversation(1L, 10011L, 77L).isAcpInteractionSupported());
+    }
+
+    /** 浏览器刷新后要能从服务端状态恢复未解决卡片，而不是把用户卡在空白处。 */
+    @Test
+    void getConversationEchoesPendingElicitationsForRefreshRecovery() {
+        when(convDao.findById(1L, 77L)).thenReturn(clarificationConversation(10011L));
+        when(turnDao.listTurnsByConversation(1L, 77L)).thenReturn(java.util.List.of());
+        AgentConversationElicitationDO pending = new AgentConversationElicitationDO();
+        pending.setRequestId("req-1");
+        pending.setTurnId(55L);
+        pending.setMode("form");
+        pending.setMessage("pick one");
+        pending.setSchemaJson("{\"type\":\"object\"}");
+        pending.setStatus("PENDING");
+        when(elicitationService.listPending(1L, 77L)).thenReturn(java.util.List.of(pending));
+
+        ClarificationConversationVO vo = service.getConversation(1L, 10011L, 77L);
+
+        assertEquals(1, vo.getPendingElicitations().size());
+        assertEquals("req-1", vo.getPendingElicitations().get(0).getRequestId());
+        assertEquals(55L, vo.getPendingElicitations().get(0).getTurnId());
+        assertEquals("pick one", vo.getPendingElicitations().get(0).getMessage());
+        assertEquals("{\"type\":\"object\"}",
+                vo.getPendingElicitations().get(0).getRequestedSchema());
+    }
+
+    /** 列表接口不该为每个会话都去查挂起卡片，那是详情页才需要的数据。 */
+    @Test
+    void listConversationsDoesNotLoadPendingElicitations() {
+        when(convDao.listByBizRef(1L, "WORKITEM_CLARIFICATION", "WORKITEM", 10011L, 3L))
+                .thenReturn(java.util.List.of(clarificationConversation(10011L)));
+
+        service.listConversations(1L, 10011L, 3L);
+
+        verify(elicitationService, never()).listPending(anyLong(), anyLong());
+    }
+
+    @Test
+    void replyElicitationDelegatesToElicitationService() {
+        when(convDao.findById(1L, 77L)).thenReturn(clarificationConversation(10011L));
+
+        service.replyElicitation(1L, 10011L, 77L, "req-1", "accept", "{\"q0\":\"A\"}");
+
+        verify(elicitationService).reply(1L, 77L, "req-1", "accept", "{\"q0\":\"A\"}");
+    }
+
+    /** S16 的回答侧对偶：跨工单猜 conversationId 必须在触达卡片之前就被拒。 */
+    @Test
+    void replyElicitationRejectsConversationFromOtherWorkitem() {
+        when(convDao.findById(1L, 77L)).thenReturn(clarificationConversation(10011L));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.replyElicitation(1L, 99999L, 77L, "req-1", "accept", "{}"));
+        verify(elicitationService, never()).reply(anyLong(), anyLong(), anyString(), anyString(),
+                anyString());
     }
 }

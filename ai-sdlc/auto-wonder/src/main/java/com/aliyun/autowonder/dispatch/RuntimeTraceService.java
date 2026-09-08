@@ -1,9 +1,11 @@
 package com.aliyun.autowonder.dispatch;
 
 import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.aliyun.autowonder.common.error.BizException;
 import com.aliyun.autowonder.common.error.ErrorCode;
+import com.aliyun.autowonder.dispatch.dto.RuntimeActivityTimelineVO;
 import com.aliyun.autowonder.dispatch.dto.RuntimeTraceVO;
 import org.springframework.stereotype.Service;
 
@@ -141,20 +143,111 @@ public class RuntimeTraceService {
         return trace;
     }
 
+    public RuntimeActivityTimelineVO getActivities(long tenantId, long dispatchId) {
+        DispatchDO dispatch = dispatchDao.findById(dispatchId);
+        if (dispatch == null || dispatch.getTenantId() == null || dispatch.getTenantId() != tenantId) {
+            throw new BizException(ErrorCode.DISPATCH_NOT_FOUND);
+        }
+        List<DispatchRuntimeEventDO> sources = eventDao.listByDispatchInArrivalOrder(tenantId, dispatchId);
+        RuntimeActivityTimelineVO timeline = new RuntimeActivityTimelineVO();
+        timeline.setDispatchId(dispatchId);
+
+        RuntimeActivityTimelineVO.Activity pendingMessage = null;
+        String pendingSessionId = null;
+        String pendingTurnId = null;
+        String pendingSpanId = null;
+        for (DispatchRuntimeEventDO source : sources) {
+            String eventType = source.getEventType() == null ? "" : source.getEventType();
+            Map<String, Object> detail = detailOf(source);
+            if (hasError(source, eventType)) {
+                pendingMessage = null;
+                String content = errorContentOf(source, detail);
+                if (content != null) {
+                    timeline.getActivities().add(activityOf(source, "ERROR", content));
+                }
+                continue;
+            }
+            if ("agent.message".equals(eventType)) {
+                String sessionId = textual(detail, "sessionId");
+                String turnId = textual(detail, "turnId");
+                String spanId = textual(detail, "spanId");
+                boolean completeStream = sessionId != null && turnId != null && spanId != null;
+                boolean matchesPendingStream = pendingMessage != null
+                        && java.util.Objects.equals(pendingSessionId, sessionId)
+                        && java.util.Objects.equals(pendingTurnId, turnId)
+                        && java.util.Objects.equals(pendingSpanId, spanId);
+                String content = first(activityText(detail.get("content")), activityText(source.getMessage()));
+                if (content == null) {
+                    if (!completeStream || !matchesPendingStream) {
+                        pendingMessage = null;
+                    }
+                    continue;
+                }
+                if (completeStream && matchesPendingStream) {
+                    pendingMessage.setContent(pendingMessage.getContent() + content);
+                    continue;
+                }
+                pendingMessage = activityOf(source, "INFO", content);
+                timeline.getActivities().add(pendingMessage);
+                pendingSessionId = sessionId;
+                pendingTurnId = turnId;
+                pendingSpanId = spanId;
+                continue;
+            }
+
+            pendingMessage = null;
+        }
+        return timeline;
+    }
+
+    private static RuntimeActivityTimelineVO.Activity activityOf(DispatchRuntimeEventDO source, String level,
+                                                                  String content) {
+        RuntimeActivityTimelineVO.Activity activity = new RuntimeActivityTimelineVO.Activity();
+        activity.setEventId(source.getEventId());
+        activity.setSeq(source.getSeq());
+        activity.setEventTime(eventTimeOf(source));
+        activity.setEventType(source.getEventType());
+        activity.setLevel(level);
+        activity.setContent(content);
+        return activity;
+    }
+
+    private static boolean hasError(DispatchRuntimeEventDO source, String eventType) {
+        return activityText(source.getError()) != null || "step.failed".equals(eventType)
+                || "session.failed".equals(eventType) || "dispatch.failed".equals(eventType);
+    }
+
+    private static String errorContentOf(DispatchRuntimeEventDO source, Map<String, Object> detail) {
+        return first(activityText(source.getError()), activityText(detail.get("reason")),
+                activityText(detail.get("error")), activityText(source.getMessage()),
+                activityText(detail.get("message")));
+    }
+
     private static RuntimeTraceVO.Event toEvent(DispatchRuntimeEventDO source) {
         RuntimeTraceVO.Event event = new RuntimeTraceVO.Event();
         event.setEventId(source.getEventId());
         event.setSeq(source.getSeq());
         event.setEventType(source.getEventType());
         event.setEventTime(source.getEventTime() == null ? null : source.getEventTime().toInstant().toString());
+        event.setDetail(detailOf(source));
+        return event;
+    }
+
+    private static String eventTimeOf(DispatchRuntimeEventDO source) {
+        if (source.getEventTime() != null) {
+            return source.getEventTime().toInstant().toString();
+        }
+        return source.getGmtCreate() == null ? null : source.getGmtCreate().toInstant().toString();
+    }
+
+    private static Map<String, Object> detailOf(DispatchRuntimeEventDO source) {
         JSONObject parsed = null;
         try {
             parsed = source.getDetailJson() == null ? null : JSON.parseObject(source.getDetailJson());
         } catch (RuntimeException ignored) {
-            // A malformed optional detail must not hide the rest of a dispatch trace.
+            // A malformed optional detail must not hide the rest of a dispatch trace or activity timeline.
         }
-        event.setDetail(parsed == null ? new LinkedHashMap<>() : new LinkedHashMap<>(parsed));
-        return event;
+        return parsed == null ? new LinkedHashMap<>() : new LinkedHashMap<>(parsed);
     }
 
     private static void applySessionLifecycle(RuntimeTraceVO.Session session, String type,
@@ -363,6 +456,26 @@ public class RuntimeTraceService {
         } catch (NumberFormatException ignored) {
             return null;
         }
+    }
+
+    private static String textual(Map<String, Object> detail, String key) {
+        Object value = detail.get(key);
+        return value instanceof String && !((String) value).isBlank() ? (String) value : null;
+    }
+
+    private static String activityText(Object value) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            return null;
+        }
+        try {
+            Object parsed = JSON.parse(text);
+            if (parsed instanceof JSONObject || parsed instanceof JSONArray) {
+                return null;
+            }
+        } catch (RuntimeException ignored) {
+            // Plain text is not necessarily JSON and remains safe to show in an activity.
+        }
+        return text;
     }
 
     private static String text(Map<String, Object> detail, String key) {

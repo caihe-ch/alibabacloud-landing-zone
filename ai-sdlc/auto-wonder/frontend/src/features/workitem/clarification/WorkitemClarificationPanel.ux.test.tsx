@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { http, HttpResponse } from 'msw';
 import { server } from '@/test/mocks/server';
@@ -282,6 +282,61 @@ describe('WorkitemClarificationPanel 回复体验（R1/R2/R3/R4）', () => {
     expect(await screen.findByText('已终止')).toBeInTheDocument();
     expect(screen.queryByTestId('clarification-replying-indicator')).toBeNull();
     expect(screen.getByPlaceholderText('输入消息...')).toBeEnabled();
+  });
+});
+
+describe('WorkitemClarificationPanel 回复结束后的输入焦点（工单 53305）', () => {
+  afterEach(() => {
+    clearClarificationPrefill('100');
+    vi.restoreAllMocks();
+  });
+
+  it('Agent 响应结束后自动聚焦输入框，用户可以直接接着打字', async () => {
+    const { queryClient } = await renderPanelWithConversation({
+      processingStatus: 'PROCESSING',
+      processingTurnId: 7,
+      turns: [{ id: 1, direction: 'IN', content: '帮我澄清需求', status: 'SUCCESS' }],
+    });
+
+    await screen.findByTestId('clarification-replying-indicator');
+    expect(screen.getByPlaceholderText('输入消息...')).toBeDisabled();
+    expect(document.activeElement).not.toBe(screen.getByPlaceholderText('输入消息...'));
+
+    // 回复完成落库：等价于终态实时事件触发的会话失效重拉
+    mockConversation({
+      processingStatus: null,
+      processingTurnId: null,
+      turns: [
+        { id: 1, direction: 'IN', content: '帮我澄清需求', status: 'SUCCESS' },
+        { id: 2, direction: 'OUT', content: '澄清完成', status: 'COMPLETED' },
+      ],
+    });
+    act(() => {
+      queryClient.invalidateQueries({
+        queryKey: ['workitem', '100', 'clarification-conversation', 1],
+      });
+    });
+
+    await waitFor(() => expect(screen.getByPlaceholderText('输入消息...')).toBeEnabled());
+    await waitFor(() => expect(screen.queryByTestId('clarification-replying-indicator')).toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByPlaceholderText('输入消息...')));
+  });
+
+  // 焦点只在「本轮回复结束」时归还：面板首次拉取会话时输入框同样经历一次
+  // 禁用→可用，若把它当回复结束，打开历史会话就会抢走用户当前的焦点。
+  it('打开回复早已结束的历史会话时不抢焦点', async () => {
+    const { textarea } = await renderPanelWithConversation({
+      processingStatus: null,
+      turns: [
+        { id: 1, direction: 'IN', content: '帮我澄清需求', status: 'SUCCESS' },
+        { id: 2, direction: 'OUT', content: '澄清完成', status: 'COMPLETED' },
+      ],
+    });
+
+    await waitFor(() => expect(textarea).toBeEnabled());
+    expect(screen.queryByTestId('clarification-replying-indicator')).toBeNull();
+    expect(document.activeElement).not.toBe(textarea);
   });
 });
 

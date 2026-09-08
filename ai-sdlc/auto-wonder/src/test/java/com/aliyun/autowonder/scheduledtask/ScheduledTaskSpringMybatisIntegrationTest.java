@@ -82,6 +82,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -92,6 +93,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class ScheduledTaskSpringMybatisIntegrationTest {
     private static final String SOURCE_AWARE_DATABASE_ID = "autowonder-source-aware";
+    /**
+     * {@code scheduled_task.next_fire_at} and friends are documented as UTC cursors
+     * (docs/autowonder-schema.sql), and every fixture statement therefore writes a UTC
+     * DATETIME literal.  Connector/J's default {@code connectionTimeZone=LOCAL} instead
+     * binds and reads DATETIME through the developer machine's offset, so the same row
+     * would mean a different instant on a UTC laptop and on a +08 laptop.  MyBatis
+     * connections in this fixture therefore pin the connection zone to UTC: a persisted
+     * literal round-trips to exactly the instant it names, independently of the host.
+     */
+    private static final String UTC_DATETIME_BINDING = "&connectionTimeZone=UTC&preserveInstants=true";
     private static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4.4")
             .withDatabaseName("test").withUsername("test").withPassword("test");
     private static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7-alpine")
@@ -127,7 +138,8 @@ class ScheduledTaskSpringMybatisIntegrationTest {
             seed(connection);
         }
         dataSource = new DriverManagerDataSource("jdbc:mysql://" + MYSQL.getHost() + ":"
-                + MYSQL.getMappedPort(3306) + "/scheduled_spring?useSSL=false", "root", MYSQL.getPassword());
+                + MYSQL.getMappedPort(3306) + "/scheduled_spring?useSSL=false" + UTC_DATETIME_BINDING,
+                "root", MYSQL.getPassword());
         SqlSessionFactoryBean factoryBean = new SqlSessionFactoryBean();
         factoryBean.setDataSource(dataSource);
         factoryBean.setTransactionFactory(new SpringManagedTransactionFactory());
@@ -145,7 +157,7 @@ class ScheduledTaskSpringMybatisIntegrationTest {
         runDao = session.getMapper(ScheduledTaskRunDao.class);
         agentDao = session.getMapper(AgentDao.class);
         agentVersionDao = session.getMapper(AgentVersionDao.class);
-        ScheduledTaskService target = new ScheduledTaskService(taskDao,
+        ScheduledTaskService target = new ScheduledTaskService(taskDao, runDao,
                 session.getMapper(SquadDao.class), squadMemberDao, agentDao,
                 new AuditLogService(session.getMapper(AuditLogDao.class), null, agentDao),
                 new ScheduledTaskSchedule(), Clock.fixed(Instant.parse("2026-08-10T00:00:00Z"), ZoneOffset.UTC));
@@ -259,7 +271,7 @@ class ScheduledTaskSpringMybatisIntegrationTest {
         ScheduledTaskDO restored = taskDao.findById(1L, 100L);
         assertEquals(0, restored.getVersion());
         assertEquals("ACTIVE", restored.getStatus());
-        assertEquals(Instant.parse("2026-08-10T10:00:00Z"), restored.getNextFireAt().toInstant());
+        assertEquals(Instant.parse("2026-08-10T18:00:00Z"), restored.getNextFireAt().toInstant());
         assertEquals(null, restored.getLastFireAt());
         assertEquals(0, runDao.listByTask(1L, 100L, 20, 0).size());
 
@@ -336,6 +348,38 @@ class ScheduledTaskSpringMybatisIntegrationTest {
         assertEquals(1, runDao.listByTask(1L, 100L, 20, 0).size());
         assertEquals(ScheduledTaskTriggerService.scheduledKey(100L, before.getNextFireAt().toInstant()),
                 runDao.listByTask(1L, 100L, 20, 0).get(0).getTriggerKey());
+    }
+
+    @Test
+    void deletedTaskIsHiddenFromEveryReadPathAndNeverEntersTheScheduleAgain() throws Exception {
+        resetActiveDueTask();
+        ScheduledTaskDO before = taskDao.findById(1L, 100L);
+        int version = before.getVersion();
+        assertEquals(1, taskDao.findDue(java.util.Date.from(scannerNow(before)), 20).size());
+        try {
+            service.delete(100L, version, 1L, 7L);
+
+            // A mapper mock cannot prove the row actually disappears, because the
+            // schedule guard lives in the production softDelete XML plus the is_deleted
+            // filter every read path already carries.
+            assertNull(taskDao.findById(1L, 100L));
+            assertEquals(0, taskDao.findDue(java.util.Date.from(scannerNow(before)), 20).size());
+            assertTrue(taskDao.listByWorkspace(1L, null, null, null, null, 100, 0).stream()
+                    .noneMatch(task -> task.getId() == 100L));
+            assertThrows(BizException.class, () -> service.delete(100L, version + 1, 1L, 7L));
+            assertThrows(BizException.class, () -> service.enable(100L, version + 1, 1L, 7L));
+            try (Connection connection = fixture.open("scheduled_spring")) {
+                assertEquals(1, fixture.count(connection,
+                        "SELECT COUNT(*) FROM scheduled_task WHERE id=100 AND workspace_id=1"
+                                + " AND status='ARCHIVED' AND is_deleted=1 AND next_fire_at IS NULL"));
+            }
+        } finally {
+            // resetActiveDueTask() never clears is_deleted, so the fixture row has to be
+            // revived here or every later test in this class would see a deleted task.
+            try (Connection connection = fixture.open("scheduled_spring"); Statement statement = connection.createStatement()) {
+                statement.executeUpdate("UPDATE scheduled_task SET is_deleted=0 WHERE id=100 AND workspace_id=1");
+            }
+        }
     }
 
     @Test
@@ -506,9 +550,9 @@ class ScheduledTaskSpringMybatisIntegrationTest {
                         + " next_fire_at='2026-08-10 10:00:00.000', last_fire_at=NULL, version=0"
                         + " WHERE workspace_id=1 AND id=100");
             }
-            // JDBC DATETIME conversion is JVM-zone dependent in this build.  Derive the
-            // scanner instant from the persisted cursor so this remains a four-occurrence
-            // production scan on every supported developer/CI timezone.
+            // The cursor is a UTC DATETIME, so this is 10:00 UTC on every host.  The scanner
+            // instant is still derived from the persisted cursor: four minute-spaced
+            // occurrences then follow from the claimed cursor itself.
             Instant firstDue = taskDao.findById(1L, 100L).getNextFireAt().toInstant();
             ScheduledTaskScheduler scheduler = schedulerAt(firstDue.plusSeconds(180));
             scheduler.scan();
@@ -1169,7 +1213,8 @@ class ScheduledTaskSpringMybatisIntegrationTest {
 
     private static TriggerNode independentTriggerNode() throws Exception {
         DataSource nodeDataSource = new DriverManagerDataSource("jdbc:mysql://" + MYSQL.getHost() + ":"
-                + MYSQL.getMappedPort(3306) + "/scheduled_spring?useSSL=false", "root", MYSQL.getPassword());
+                + MYSQL.getMappedPort(3306) + "/scheduled_spring?useSSL=false" + UTC_DATETIME_BINDING,
+                "root", MYSQL.getPassword());
         SqlSessionFactoryBean factoryBean = new SqlSessionFactoryBean();
         factoryBean.setDataSource(nodeDataSource);
         // Explicitly bind each independent mapper factory to its own Spring
@@ -1212,25 +1257,40 @@ class ScheduledTaskSpringMybatisIntegrationTest {
             statement.executeUpdate("DELETE FROM agent_version WHERE id=41");
             statement.executeUpdate("DELETE FROM artifact WHERE tenant_id=1 AND source_type='SCHEDULED_TASK' AND workitem_id=100");
             statement.executeUpdate("DELETE FROM scheduled_task WHERE id >= 200");
-            statement.executeUpdate("UPDATE scheduled_task SET status='ACTIVE', cron_expression='0 0 2 * * *', next_fire_at='2026-08-10 18:00:00.000', last_fire_at=NULL, version=0 WHERE id=100 AND workspace_id=1");
+            // gmt_create must precede the seeded cursor: the scanner deliberately drops
+            // every occurrence earlier than the task creation instant
+            // (ScheduledTaskScheduler.dueOccurrences), so leaving the column at the
+            // container's own start time would silently make this due task unclaimable.
+            statement.executeUpdate("UPDATE scheduled_task SET status='ACTIVE', cron_expression='0 0 2 * * *',"
+                    + " next_fire_at='2026-08-10 18:00:00.000', gmt_create='2026-08-01 00:00:00.000',"
+                    + " last_fire_at=NULL, version=0 WHERE id=100 AND workspace_id=1");
         }
     }
 
     /**
-     * The test schema uses DATETIME while this fixture intentionally runs its
-     * JDBC driver in a different default zone.  Query binding therefore needs
-     * an eight-hour-later scanner Clock.  A 04:00 cron keeps the next logical
-     * occurrence after that Clock, so this remains a one-occurrence scanner
-     * test rather than accidentally exercising FIRE_LATEST misfire behavior.
+     * Keeps these scans on a one-occurrence window: with the cursor at 18:00 UTC and the
+     * task zone at Asia/Shanghai, the next 04:00 occurrence lands at 20:00 UTC, i.e. after
+     * {@link #scannerNow(ScheduledTaskDO)}.  The precondition is asserted rather than merely
+     * described, because a second due occurrence would silently switch the assertion from a
+     * single scheduled fire to FIRE_LATEST misfire handling.
      */
     private static void prepareSingleOccurrenceScannerWindow() throws Exception {
         try (Connection connection = fixture.open("scheduled_spring"); Statement statement = connection.createStatement()) {
             statement.executeUpdate("UPDATE scheduled_task SET cron_expression='0 0 4 * * *' WHERE workspace_id=1 AND id=100");
         }
+        ScheduledTaskDO window = taskDao.findById(1L, 100L);
+        Instant nextOccurrence = new ScheduledTaskSchedule()
+                .next(window.getCronExpression(), window.getTimezone(), window.getNextFireAt().toInstant());
+        assertTrue(nextOccurrence.isAfter(scannerNow(window)),
+                "scanner window must stay single-occurrence, next occurrence was " + nextOccurrence);
     }
 
+    /**
+     * The smallest instant at which the persisted cursor is due.  The cursor is a UTC
+     * DATETIME read over a UTC-pinned connection, so no host-zone compensation is needed.
+     */
     private static Instant scannerNow(ScheduledTaskDO task) {
-        return task.getNextFireAt().toInstant().plusSeconds(8 * 60 * 60L + 1);
+        return task.getNextFireAt().toInstant().plusSeconds(1);
     }
 
     /** Every assertion gets its own logical scheduler cluster; stale locks must never cross tests. */
@@ -1275,10 +1335,10 @@ class ScheduledTaskSpringMybatisIntegrationTest {
         ScheduledTaskDO task = taskDao.findById(1L, 100L);
         assertEquals("PAUSED", task.getStatus());
         assertEquals(0, task.getVersion());
-        // MySQL DATETIME is read in the JVM's configured +08 zone in this build;
-        // this is the same persisted cursor inserted by resetPausedTask, not the
-        // recomputed 2026-08 scheduler cursor.
-        assertEquals(Instant.parse("2025-12-31T16:00:00Z"), task.getNextFireAt().toInstant());
+        // The cursor is the same UTC DATETIME literal written by resetPausedTask, not the
+        // recomputed 2026-08 scheduler cursor; the UTC-pinned connection makes it read back
+        // as the instant it names on every host zone.
+        assertEquals(Instant.parse("2026-01-01T00:00:00Z"), task.getNextFireAt().toInstant());
     }
 
     private static void seed(Connection connection) throws Exception {

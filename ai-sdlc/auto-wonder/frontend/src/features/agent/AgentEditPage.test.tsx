@@ -35,6 +35,40 @@ const versionData = {
   reviewComment: null, reviewedAt: null, version: 1, gmtCreate: '2026-07-01',
 };
 
+const ok = (data: unknown) =>
+  HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data });
+
+const okPage = (list: unknown[]) =>
+  HttpResponse.json({
+    success: true, code: '0', message: '', traceId: null,
+    data: { list, total: list.length, pageNum: 1, pageSize: 100 },
+  });
+
+function mockMemoryApis({ memories = [], memoryRefs = [] }: {
+  memories?: unknown[];
+  memoryRefs?: Array<{ memoryId: number; source: string }>;
+} = {}) {
+  server.use(
+    http.get('/api/agents/1', () => ok(agentData)),
+    http.get('/api/agents/1/versions/1', () => ok({ ...versionData, memoryRefs })),
+    http.get('/api/repos', () => okPage([])),
+    http.get('/api/skills', () => okPage([])),
+    http.get('/api/memories', () => okPage(memories)),
+    http.get('/api/sdlcs', () => okPage([])),
+  );
+}
+
+async function findMemoryCard() {
+  return (await screen.findByText('记忆导入')).closest('.ant-card') as HTMLElement;
+}
+
+async function openMemoryImportDialog() {
+  await userEvent.click(screen.getByRole('button', { name: /导入记忆/ }));
+  const dialog = await screen.findByRole('dialog', { name: /导入记忆/ });
+  await userEvent.click(within(dialog).getAllByRole('combobox')[0]);
+  return dialog;
+}
+
 describe('AgentEditPage', () => {
   beforeEach(() => {
     useAuthStore.getState().clear();
@@ -103,7 +137,7 @@ describe('AgentEditPage', () => {
       })),
       http.get('/api/repos', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [{ id: 11, name: 'web-repo' }], total: 1, pageNum: 1, pageSize: 100 } })),
       http.get('/api/skills', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [{ id: 22, name: 'Code Review', code: 'CR' }], total: 1, pageNum: 1, pageSize: 100 } })),
-      http.get('/api/memories', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [{ id: 33, contentMd: 'React rules' }], total: 1, pageNum: 1, pageSize: 100 } })),
+      http.get('/api/memories', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [{ id: 33, title: 'React 规范', contentMd: '第一行正文\n第二行正文', status: 'ADOPTED' }], total: 1, pageNum: 1, pageSize: 100 } })),
       http.get('/api/sdlcs', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [], total: 0, pageNum: 1, pageSize: 100 } })),
     );
 
@@ -112,9 +146,11 @@ describe('AgentEditPage', () => {
     expect(screen.getAllByText('web-repo')).toHaveLength(1);
     expect(screen.getByText('WRITE')).toBeInTheDocument();
     expect(screen.getByText('Code Review')).toBeInTheDocument();
-    expect(screen.getByText('React rules')).toBeInTheDocument();
+    expect(screen.getByText('React 规范')).toBeInTheDocument();
     expect(screen.getAllByText('Code Review')).toHaveLength(1);
-    expect(screen.getAllByText('React rules')).toHaveLength(1);
+    expect(screen.getAllByText('React 规范')).toHaveLength(1);
+    expect(screen.queryByText(/第一行正文/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/第二行正文/)).not.toBeInTheDocument();
   });
 
   it('uses multi-select controls for repositories, capabilities, and memories', async () => {
@@ -226,40 +262,87 @@ describe('AgentEditPage', () => {
     expect(await screen.findByText('当前版本不是草稿,无法编辑')).toBeInTheDocument();
   });
 
-  it('renders with null contentMd memories and imports them with fallback label', async () => {
+  it('lists only adopted memories by title in the import dialog', async () => {
     const imported: Array<{ memoryId: number; source: string }> = [];
-    const memoriesData = [
-      { id: 41, scope: 'ORG', ownerRef: null, type: 'FACT', title: '仅标题记忆', contentMd: null, status: 'PENDING', source: 'MCP', sourceRef: null, version: 0, gmtCreate: '2026-08-01' },
-      { id: 42, scope: 'ORG', ownerRef: null, type: 'FACT', title: '正常记忆', contentMd: 'React rules 正常内容', status: 'ADOPTED', source: null, sourceRef: null, version: 0, gmtCreate: '2026-08-01' },
-    ];
+    mockMemoryApis({
+      memories: [
+        { id: 41, title: '待审核记忆', contentMd: '待审核正文', status: 'PENDING' },
+        { id: 42, title: '已采纳记忆', contentMd: '已采纳正文首行', status: 'ADOPTED' },
+        { id: 43, title: '已驳回记忆', contentMd: '已驳回正文', status: 'REJECTED' },
+      ],
+    });
     server.use(
-      http.get('/api/agents/1', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: agentData })),
-      http.get('/api/agents/1/versions/1', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: versionData })),
-      http.get('/api/repos', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [], total: 0, pageNum: 1, pageSize: 100 } })),
-      http.get('/api/skills', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [], total: 0, pageNum: 1, pageSize: 100 } })),
-      http.get('/api/memories', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: memoriesData, total: 2, pageNum: 1, pageSize: 100 } })),
-      http.get('/api/sdlcs', () => HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: { list: [], total: 0, pageNum: 1, pageSize: 100 } })),
       http.post('/api/agents/1/memories', async ({ request }) => {
         imported.push(await request.json() as { memoryId: number; source: string });
-        return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null });
+        return ok(null);
       }),
     );
 
-    // Regression guard: page must not throw (null.slice) during inline options computation.
     renderPage();
     expect(await screen.findByText(/编辑配置/)).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole('button', { name: /导入记忆/ }));
-    const dialog = await screen.findByRole('dialog', { name: /导入记忆/ });
-    await userEvent.click(within(dialog).getAllByRole('combobox')[0]);
+    const dialog = await openMemoryImportDialog();
 
-    // contentMd=null memory falls back to its title; normal memory keeps content prefix.
-    await screen.findByText('仅标题记忆');
-    expect(screen.getByText('React rules 正常内容')).toBeInTheDocument();
+    const option = await screen.findByText('已采纳记忆');
+    const dropdown = option.closest('.ant-select-dropdown') as HTMLElement;
+    expect(within(dropdown).queryByText('待审核记忆')).not.toBeInTheDocument();
+    expect(within(dropdown).queryByText('已驳回记忆')).not.toBeInTheDocument();
+    expect(within(dropdown).queryByText(/已采纳正文首行/)).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByText('仅标题记忆'));
+    await userEvent.click(option);
     await userEvent.click(within(dialog).getByRole('button', { name: /OK/ }));
 
-    await waitFor(() => expect(imported).toEqual([{ memoryId: 41, source: 'ORG' }]));
+    await waitFor(() => expect(imported).toEqual([{ memoryId: 42, source: 'ORG' }]));
+    expect(await within(await findMemoryCard()).findByText('已采纳记忆')).toBeInTheDocument();
+  });
+
+  it('falls back to #id for adopted memories without a usable title', async () => {
+    mockMemoryApis({
+      memories: [
+        { id: 51, title: '   ', contentMd: '空白标题正文', status: 'ADOPTED' },
+        { id: 52, title: null, contentMd: null, status: 'ADOPTED' },
+      ],
+    });
+
+    renderPage();
+    expect(await screen.findByText(/编辑配置/)).toBeInTheDocument();
+
+    await openMemoryImportDialog();
+
+    // Regression guard: null/blank title or contentMd must not throw while building options.
+    expect(await screen.findByText('#51')).toBeInTheDocument();
+    expect(screen.getByText('#52')).toBeInTheDocument();
+    expect(screen.queryByText(/空白标题正文/)).not.toBeInTheDocument();
+  });
+
+  it('falls back to #id when a bound memory is missing from the memory list', async () => {
+    mockMemoryApis({ memoryRefs: [{ memoryId: 77, source: 'ORG' }] });
+
+    renderPage();
+    expect(await screen.findByText(/编辑配置/)).toBeInTheDocument();
+
+    expect(await within(await findMemoryCard()).findByText('#77')).toBeInTheDocument();
+  });
+
+  it('keeps titles of bound unreviewed memories and hides them from the import dialog', async () => {
+    mockMemoryApis({
+      memoryRefs: [{ memoryId: 61, source: 'ORG' }],
+      memories: [
+        { id: 61, title: '历史待审核记忆', contentMd: '历史正文', status: 'PENDING' },
+        { id: 62, title: '可导入记忆', contentMd: '可导入正文', status: 'ADOPTED' },
+      ],
+    });
+
+    renderPage();
+    expect(await screen.findByText(/编辑配置/)).toBeInTheDocument();
+
+    // 已绑定的历史未审核记忆仍按标题展示，不退化为 #id。
+    expect(await within(await findMemoryCard()).findByText('历史待审核记忆')).toBeInTheDocument();
+
+    await openMemoryImportDialog();
+
+    const option = await screen.findByText('可导入记忆');
+    const dropdown = option.closest('.ant-select-dropdown') as HTMLElement;
+    expect(within(dropdown).queryByText('历史待审核记忆')).not.toBeInTheDocument();
   });
 });

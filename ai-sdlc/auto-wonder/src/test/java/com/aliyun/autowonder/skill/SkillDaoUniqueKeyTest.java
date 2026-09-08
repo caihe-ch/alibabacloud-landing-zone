@@ -160,4 +160,41 @@ class SkillDaoUniqueKeyTest {
         assertEquals(1, dao.softDelete(skill.getId(), TENANT, 0, USER));
         assertEquals("#deleted-" + skill.getId(), rawName(skill.getId()));
     }
+
+    @Test
+    void release_soft_deleted_name_frees_legacy_placeholder_so_insert_succeeds() throws Exception {
+        // 模拟历史数据：软删除行仍以原始名称占位，未执行 V044 清理
+        try (Connection c = DriverManager.getConnection(JDBC_URL, "sa", "");
+             Statement st = c.createStatement()) {
+            st.execute("INSERT INTO skill (tenant_id, type, name, is_deleted) "
+                    + "VALUES (" + TENANT + ", 'SKILL', 'legacy-skill', 1)");
+        }
+
+        assertEquals(1, dao.releaseSoftDeletedName(TENANT, "SKILL", "legacy-skill"));
+
+        SkillDO added = insertSkill("SKILL", "legacy-skill");
+        assertNotNull(added.getId());
+        assertEquals("legacy-skill", rawName(added.getId()));
+    }
+
+    @Test
+    void release_soft_deleted_name_never_touches_active_rows() throws Exception {
+        SkillDO active = insertSkill("SKILL", "in-use");
+
+        assertEquals(0, dao.releaseSoftDeletedName(TENANT, "SKILL", "in-use"));
+        assertEquals("in-use", rawName(active.getId()));
+    }
+
+    @Test
+    void release_soft_deleted_name_is_idempotent_and_scoped_to_tenant_and_type() throws Exception {
+        SkillDO skill = insertSkill("MCP", "scoped");
+        assertEquals(1, dao.softDelete(skill.getId(), TENANT, 0, USER));
+
+        // 已墓碑化后再次释放是幂等空操作
+        assertEquals(0, dao.releaseSoftDeletedName(TENANT, "MCP", "scoped"));
+        // type 不匹配、tenant 不匹配都不应命中
+        assertEquals(0, dao.releaseSoftDeletedName(TENANT, "SKILL", "scoped"));
+        assertEquals(0, dao.releaseSoftDeletedName(999L, "MCP", "scoped"));
+        assertEquals("#deleted-" + skill.getId(), rawName(skill.getId()));
+    }
 }

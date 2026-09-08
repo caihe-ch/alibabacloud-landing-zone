@@ -9,14 +9,25 @@ import com.aliyun.autowonder.storage.StoredObject;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.mock.web.MockMultipartFile;
+import org.yaml.snakeyaml.Yaml;
 
+import java.io.InputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Parameter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class PlatformBrandingServiceTest {
+
+    private static final String RECOMMENDED_VERSION_PLACEHOLDER =
+            "${autowonder.runtime.recommended-version:";
+    private static final String YAML_RECOMMENDED_VERSION_PLACEHOLDER =
+            "${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:";
+    private static final String EXPECTED_RECOMMENDED_RUNTIME_VERSION = "0.2.152";
 
     @Test
     void publicConfigFallsBackWhenDatabaseRowIsMissing() {
@@ -37,19 +48,16 @@ class PlatformBrandingServiceTest {
 
     @Test
     void recommendedRuntimeVersionConstructorDefaultIsPinned() {
-        String placeholder = "${autowonder.runtime.recommended-version:";
-        String foundDefault = null;
-        for (Constructor<?> constructor : PlatformBrandingService.class.getConstructors()) {
-            for (Parameter parameter : constructor.getParameters()) {
-                Value annotation = parameter.getAnnotation(Value.class);
-                if (annotation != null && annotation.value().startsWith(placeholder)
-                        && annotation.value().endsWith("}")) {
-                    foundDefault = annotation.value()
-                            .substring(placeholder.length(), annotation.value().length() - 1);
-                }
-            }
-        }
-        assertEquals("0.2.150", foundDefault);
+        assertEquals(EXPECTED_RECOMMENDED_RUNTIME_VERSION, constructorRecommendedRuntimeVersionDefault());
+    }
+
+    @Test
+    void applicationYmlRecommendedVersionDefaultIsPinnedAndMatchesConstructorDefault() throws Exception {
+        String yamlDefault = applicationYmlRecommendedVersionDefault();
+
+        assertEquals(EXPECTED_RECOMMENDED_RUNTIME_VERSION, yamlDefault);
+        assertEquals(constructorRecommendedRuntimeVersionDefault(), yamlDefault,
+                "application.yml 与 PlatformBrandingService @Value 的兜底版本必须一致，否则两处默认值会静默漂移");
     }
 
     @Test
@@ -277,6 +285,50 @@ class PlatformBrandingServiceTest {
                 "https://daily.auto-wonder.example.com", "0.3.0-beta.2", "x.x.x", false);
 
         assertEquals("0.3.0-beta.2", service.recommendedRuntimeVersion());
+    }
+
+    private static String constructorRecommendedRuntimeVersionDefault() {
+        String foundDefault = null;
+        for (Constructor<?> constructor : PlatformBrandingService.class.getConstructors()) {
+            for (Parameter parameter : constructor.getParameters()) {
+                Value annotation = parameter.getAnnotation(Value.class);
+                if (annotation != null && annotation.value().startsWith(RECOMMENDED_VERSION_PLACEHOLDER)
+                        && annotation.value().endsWith("}")) {
+                    foundDefault = annotation.value()
+                            .substring(RECOMMENDED_VERSION_PLACEHOLDER.length(),
+                                    annotation.value().length() - 1);
+                }
+            }
+        }
+        assertNotNull(foundDefault, "PlatformBrandingService 构造函数缺少 recommended-version 的 @Value 默认值");
+        return foundDefault;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String applicationYmlRecommendedVersionDefault() throws Exception {
+        // Community ships src/test/resources/application.yml, which shadows the real config on the test classpath.
+        Path mainConfig = Path.of("src/main/resources/application.yml");
+        assertTrue(Files.isRegularFile(mainConfig), "application.yml 必须存在于 src/main/resources");
+        try (InputStream in = Files.newInputStream(mainConfig)) {
+            Map<String, Object> root = new Yaml().loadAs(in, Map.class);
+            Map<String, Object> autowonder = childSection(root, "autowonder");
+            Map<String, Object> runtime = childSection(autowonder, "runtime");
+            Object value = runtime.get("recommended-version");
+            assertNotNull(value, "缺少配置项: autowonder.runtime.recommended-version");
+            String placeholder = String.valueOf(value);
+            assertTrue(placeholder.startsWith(YAML_RECOMMENDED_VERSION_PLACEHOLDER),
+                    "应保留 AUTOWONDER_RUNTIME_RECOMMENDED_VERSION 环境变量覆盖能力，实际: " + placeholder);
+            assertTrue(placeholder.endsWith("}"), "占位符必须闭合，实际: " + placeholder);
+            return placeholder.substring(YAML_RECOMMENDED_VERSION_PLACEHOLDER.length(),
+                    placeholder.length() - 1);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> childSection(Map<String, Object> parent, String key) {
+        Object value = parent.get(key);
+        assertNotNull(value, "缺少配置节: " + key);
+        return (Map<String, Object>) value;
     }
 
     private static PlatformBrandingService newService(PlatformBrandingDao dao) {

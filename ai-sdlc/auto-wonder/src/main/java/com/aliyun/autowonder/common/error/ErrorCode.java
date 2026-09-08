@@ -14,6 +14,12 @@ public enum ErrorCode {
     WORKSPACE_NOT_MEMBER("11001", "非该工作空间成员"),
     WORKSPACE_NAME_REQUIRED("11002", "工作空间名不能为空"),
     WORKSPACE_NAME_DUPLICATE("11003", "工作空间名称已存在"),
+    ORG_VERSION_CONFLICT("11004", "工作空间已被修改，请重试"),
+    ORG_DELETED_OR_DISABLED("11005", "工作空间已删除或已停用"),
+    // 回收站可见性统一用这一个码：区分“不存在”和“无权访问”会让调用方通过枚举 id
+    // 探测出别人工作空间的存在性。
+    ORG_NOT_FOUND_OR_NO_PERMISSION("11006", "工作空间不存在或无权访问"),
+    ORG_RESTORE_NAME_CONFLICT("11007", "已存在同名的在用工作空间，请改名后再恢复"),
     // 12xxx 工作空间访问等级
     WORKSPACE_ACCESS_LEVEL_INVALID("12007", "工作空间访问级别不合法"),
     WORKSPACE_ACCESS_INSUFFICIENT("12008", "工作空间访问级别不足"),
@@ -159,7 +165,13 @@ public enum ErrorCode {
     SCHEDULED_TASK_CRON_INVALID("30003", "Cron 表达式或时区不合法"),
     SCHEDULED_TASK_VALIDATION_FAILED("30004", "定时任务参数不合法"),
     SCHEDULED_TASK_INVALID_STATE("30005", "定时任务当前状态不允许该操作"),
-    SCHEDULED_TASK_SCHEMA_NOT_READY("30006", "当前环境尚未完成 7×24 能力升级");
+    SCHEDULED_TASK_SCHEMA_NOT_READY("30006", "当前环境尚未完成 7×24 能力升级"),
+    // 31xxx 平台管理员
+    SYSTEM_ADMIN_USER_REQUIRED("31001", "用户不能为空"),
+    SYSTEM_ADMIN_TARGET_NOT_FOUND("31002", "用户不存在或已不可用"),
+    SYSTEM_ADMIN_SELF_REMOVAL_FORBIDDEN("31003", "平台管理员不可移除自己"),
+    SYSTEM_ADMIN_LAST_ONE_FORBIDDEN("31004", "平台管理员至少保留一名，无法移除最后一名"),
+    SYSTEM_ADMIN_TARGET_NOT_ADMIN("31005", "该用户不是平台管理员");
 
     private final String code;
     private final String message;

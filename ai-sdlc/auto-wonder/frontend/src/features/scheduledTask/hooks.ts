@@ -53,6 +53,17 @@ export function useRunScheduledTaskNow() {
   });
 }
 
+export function useDeleteScheduledTask() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, version }: { id: number; version: number }) => api.deleteScheduledTask(id, version),
+    onSuccess: () => {
+      message.success('定时任务已删除');
+      client.invalidateQueries({ queryKey: ['scheduled-tasks'] });
+    },
+  });
+}
+
 export function useUploadScheduledTaskDocuments() {
   const client = useQueryClient();
   return useMutation({

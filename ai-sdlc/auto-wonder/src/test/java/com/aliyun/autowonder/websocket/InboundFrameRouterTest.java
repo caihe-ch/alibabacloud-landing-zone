@@ -9,9 +9,12 @@ import com.aliyun.autowonder.dispatch.HandoffResult;
 import com.aliyun.autowonder.dispatch.HandoffService;
 import com.aliyun.autowonder.dispatch.DispatchDO;
 import com.aliyun.autowonder.dispatch.ExecutionSourceType;
+import com.aliyun.autowonder.executor.ExecutorRegistry;
 import com.aliyun.autowonder.executor.ExecutorService;
+import com.aliyun.autowonder.executor.ProviderModelCatalogService;
 import com.aliyun.autowonder.guidance.GuidanceService;
 import com.aliyun.autowonder.guidance.InteractionWorkflowService;
+import com.aliyun.autowonder.redis.RedisManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -68,6 +71,30 @@ class InboundFrameRouterTest {
         return new ExecutorSession(executorId, agentId, tenantId, session);
     }
 
+    private LeaseRoutingFixture leaseRoutingFixture() {
+        RedisManager redisManager = mock(RedisManager.class);
+        java.util.Map<Object, Object> values = new java.util.HashMap<>();
+        when(redisManager.get(any())).thenAnswer(invocation -> values.get(invocation.getArgument(0)));
+        doAnswer(invocation -> {
+            values.put(invocation.getArgument(0), invocation.getArgument(1));
+            return true;
+        }).when(redisManager).set(any(), any(), anyInt());
+        doAnswer(invocation -> {
+            values.remove(invocation.getArgument(0));
+            return 1L;
+        }).when(redisManager).del(any());
+
+        ExecutorRegistry registry = spy(new ExecutorRegistry(redisManager));
+        DispatchService service = new DispatchService(null, null, null, null, null, null, null,
+                null, null, null, null, null, null, registry);
+        InboundFrameRouter registryRouter = new InboundFrameRouter(service, artifactService,
+                presenceManager, handoffService, drainScheduler, pauseService, guidanceService);
+        return new LeaseRoutingFixture(registryRouter, registry);
+    }
+
+    private record LeaseRoutingFixture(InboundFrameRouter router, ExecutorRegistry registry) {
+    }
+
     @Test
     void taskResultReplyUsesTheSameSerializedBasicWriterAsDispatchFrames() throws Exception {
         RemoteEndpoint.Async asyncRemote = mock(RemoteEndpoint.Async.class);
@@ -97,6 +124,50 @@ class InboundFrameRouterTest {
         verify(dispatchService).renewActiveLeases(100L, 1L, java.util.List.of(55L, 56L));
         verify(drainScheduler).request(10L);
         verify(dispatchService, never()).drainPending(anyLong());
+    }
+
+    @Test
+    void heartbeatWithExplicitEmptyRunningDispatchIdsPassesKnownEmptyLease() {
+        when(presenceManager.heartbeat(1L, 10L, 1)).thenReturn(true);
+
+        router.route(session(1L, 10L, 100L),
+                "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":[]}");
+
+        verify(dispatchService).renewActiveLeases(100L, 1L, java.util.List.of());
+    }
+
+    @Test
+    void heartbeatWithStringifiedRunningDispatchIdsClearsKnownEmptyLease() {
+        when(presenceManager.heartbeat(1L, 10L, 1)).thenReturn(true);
+        LeaseRoutingFixture fixture = leaseRoutingFixture();
+
+        fixture.router().route(session(1L, 10L, 100L),
+                "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":[]}");
+        assertTrue(fixture.registry().hasNoReportedRunningDispatches(1L));
+
+        fixture.router().route(session(1L, 10L, 100L),
+                "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":\"[]\"}");
+
+        verify(fixture.registry()).updateRunningDispatches(1L, java.util.List.of());
+        verify(fixture.registry()).updateRunningDispatches(1L, null);
+        assertFalse(fixture.registry().hasNoReportedRunningDispatches(1L));
+    }
+
+    @Test
+    void heartbeatWithNonnumericRunningDispatchIdClearsKnownEmptyLease() {
+        when(presenceManager.heartbeat(1L, 10L, 1)).thenReturn(true);
+        LeaseRoutingFixture fixture = leaseRoutingFixture();
+
+        fixture.router().route(session(1L, 10L, 100L),
+                "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":[]}");
+        assertTrue(fixture.registry().hasNoReportedRunningDispatches(1L));
+
+        fixture.router().route(session(1L, 10L, 100L),
+                "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":[\"not-a-number\"]}");
+
+        verify(fixture.registry()).updateRunningDispatches(1L, java.util.List.of());
+        verify(fixture.registry()).updateRunningDispatches(1L, null);
+        assertFalse(fixture.registry().hasNoReportedRunningDispatches(1L));
     }
 
     @Test
@@ -622,7 +693,7 @@ class InboundFrameRouterTest {
     }
 
     @Test
-    void heartbeatAccepted_triggersPersistHeartbeat() {
+    void heartbeatWithoutRunningDispatchIdsPersistsHeartbeatAndPassesUnknownLease() {
         ExecutorService executorService = mock(ExecutorService.class);
         InboundFrameRouter routerWithExecSvc = new InboundFrameRouter(dispatchService, artifactService,
                 presenceManager, handoffService, drainScheduler, pauseService, guidanceService,
@@ -632,7 +703,7 @@ class InboundFrameRouterTest {
         routerWithExecSvc.route(session(1L, 10L, 100L), "{\"type\":\"HEARTBEAT\"}");
 
         verify(executorService).persistHeartbeatIfNeeded(1L, 100L);
-        verify(dispatchService).renewActiveLeases(100L, 1L, java.util.List.of());
+        verify(dispatchService).renewActiveLeases(eq(100L), eq(1L), isNull());
     }
 
     @Test
@@ -657,6 +728,57 @@ class InboundFrameRouterTest {
 
         assertDoesNotThrow(() ->
                 router.route(session(1L, 10L, 100L), "{\"type\":\"HEARTBEAT\"}"));
-        verify(dispatchService).renewActiveLeases(100L, 1L, java.util.List.of());
+        verify(dispatchService).renewActiveLeases(eq(100L), eq(1L), isNull());
+    }
+
+    @Test
+    void acceptedHeartbeatRequestsProviderCatalogRefreshAfterNormalHeartbeatWork() {
+        ProviderModelCatalogService catalogService = mock(ProviderModelCatalogService.class);
+        router.setProviderModelCatalogService(catalogService);
+        when(presenceManager.heartbeat(1L, 10L, 1)).thenReturn(true);
+
+        router.route(session(1L, 10L, 100L), "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":[]}");
+
+        InOrder order = inOrder(dispatchService, drainScheduler, catalogService);
+        order.verify(dispatchService).renewActiveLeases(100L, 1L, java.util.List.of());
+        order.verify(drainScheduler).request(10L);
+        order.verify(catalogService).requestRefreshForExecutor(1L);
+    }
+
+    @Test
+    void rejectedHeartbeatDoesNotRequestProviderCatalogRefresh() {
+        ProviderModelCatalogService catalogService = mock(ProviderModelCatalogService.class);
+        router.setProviderModelCatalogService(catalogService);
+        when(presenceManager.heartbeat(1L, 10L, 1)).thenReturn(false);
+
+        router.route(session(1L, 10L, 100L), "{\"type\":\"HEARTBEAT\"}");
+
+        verifyNoInteractions(catalogService);
+    }
+
+    @Test
+    void heartbeatWithActiveDispatchesDoesNotRequestProviderCatalogRefresh() {
+        ProviderModelCatalogService catalogService = mock(ProviderModelCatalogService.class);
+        router.setProviderModelCatalogService(catalogService);
+        when(presenceManager.heartbeat(1L, 10L, 1)).thenReturn(true);
+
+        router.route(session(1L, 10L, 100L),
+                "{\"type\":\"HEARTBEAT\",\"runningDispatchIds\":[55]}");
+
+        verifyNoInteractions(catalogService);
+    }
+
+    @Test
+    void catalogResultFrameDelegatesToProviderCatalogService() {
+        ProviderModelCatalogService catalogService = mock(ProviderModelCatalogService.class);
+        router.setProviderModelCatalogService(catalogService);
+
+        router.route(session(1L, 10L, 100L),
+                "{\"type\":\"QODER_MODEL_CATALOG_RESULT\",\"requestId\":\"request-1\",\"provider\":\"qoder\","
+                        + "\"success\":true,\"models\":[{\"id\":\"qmodel\",\"name\":\"Qwen\"}]}");
+
+        verify(catalogService).complete(eq(100L), eq(1L), argThat(frame ->
+                "request-1".equals(frame.getString("requestId"))
+                        && "qoder".equals(frame.getString("provider"))));
     }
 }

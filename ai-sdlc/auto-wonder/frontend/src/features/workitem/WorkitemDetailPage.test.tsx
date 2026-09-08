@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { Link, MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { http, HttpResponse } from 'msw';
 import { server } from '@/test/mocks/server';
@@ -169,6 +169,21 @@ describe('WorkitemDetailPage', () => {
     // Title appears in both breadcrumb and heading — use role to target the heading
     expect(await screen.findByRole('heading', { name: '跨境支付重构' })).toBeInTheDocument();
     expect(screen.getByText('开发中')).toBeInTheDocument();
+  });
+
+  it('renders the detail page when the workitem contentMd is null', async () => {
+    server.use(
+      http.get('/api/workitems/1', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null,
+        data: { ...mockWorkitem, contentMd: null },
+      })),
+      ...setupHandlers().filter((h) => h.info.path !== '/api/workitems/1'),
+    );
+    renderPage();
+
+    expect(await screen.findByRole('heading', { name: '跨境支付重构' })).toBeInTheDocument();
+    expect(screen.getByTestId('workitem-content-section')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制内容' })).not.toBeInTheDocument();
   });
 
   it('shows the human intervention alert when assigned to a human', async () => {
@@ -415,7 +430,7 @@ describe('WorkitemDetailPage', () => {
     expect(await screen.findByText('需求文档已删除')).toBeInTheDocument();
   });
 
-  it.skip('renders provider-neutral external collaboration relations and hides empty groups', async () => {
+  it('renders provider-neutral external collaboration relations and hides empty groups', async () => {
     server.use(
       http.get('/api/workitems/1', () => HttpResponse.json({
         success: true, code: '0', message: '', traceId: null,
@@ -465,7 +480,7 @@ describe('WorkitemDetailPage', () => {
     renderPage();
 
     expect(await screen.findByText('创建者: 导入人（10009）')).toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: '重新指派' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /重新指派/ })).toBeInTheDocument();
     expect(await screen.findByText('外部协作')).toBeInTheDocument();
     expect(screen.getByText('需求提出人（001）')).toBeInTheDocument();
     expect(screen.getByText('业务负责人（002）')).toBeInTheDocument();
@@ -1338,7 +1353,7 @@ describe('WorkitemDetailPage', () => {
     }));
   });
 
-  it('shows the AI clarification entry and existing clarification material when enabled', async () => {
+  it('shows the AI clarification entry and result card when clarification data exists', async () => {
     server.use(
       http.get('/api/workitems/1/clarification', () => HttpResponse.json({
         success: true, code: '0', message: '', traceId: null,
@@ -1350,8 +1365,8 @@ describe('WorkitemDetailPage', () => {
 
     expect(await screen.findByText('交付进度跟踪')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /AI 需求澄清/ })).toBeInTheDocument();
-    expect(screen.getByText('澄清材料 (AI 生成)')).toBeInTheDocument();
-    expect(screen.getByText('补充风控口径')).toBeInTheDocument();
+    expect(await screen.findByText('澄清材料 (AI 生成)')).toBeInTheDocument();
+    expect(await screen.findByText('补充风控口径')).toBeInTheDocument();
   });
 
   it('renders CommentInput outside the scrollable area in a sticky bottom container', async () => {
@@ -1452,5 +1467,255 @@ describe('WorkitemDetailPage', () => {
     await user.click(screen.getByRole('button', { name: /^指\s*派$/ }));
 
     await waitFor(() => expect(assignBody).toMatchObject({ assigneeType: 'HUMAN', assigneeRef: '200' }));
+  });
+});
+
+describe('WorkitemDetailPage clarify URL persistence (工单 53035)', () => {
+  /** 把当前 search 和一条真实的「返回列表」链接挂在页面上，
+   *  既能断言 URL 写入，也能验证验收项 5：正常返回列表不受影响。 */
+  function LocationProbe() {
+    const location = useLocation();
+    return (
+      <div>
+        <span data-testid="location-search">{location.search}</span>
+        <span data-testid="location-pathname">{location.pathname}</span>
+        <Link to="/workitems" data-testid="back-to-list">返回列表</Link>
+      </div>
+    );
+  }
+
+  function renderPageAt(entry: string) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={[entry]}>
+          <Routes>
+            <Route
+              path="/workitems/:id"
+              element={(
+                <>
+                  <WorkitemDetailPage />
+                  <LocationProbe />
+                </>
+              )}
+            />
+            <Route path="/workitems" element={<div>工单列表</div>} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  function mockClarifyEndpoints() {
+    return [
+      http.get('/api/squads', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null,
+        data: { list: [], total: 0, pageNum: 1, pageSize: 100 },
+      })),
+      http.get('/api/squads/:squadId/members', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null, data: [],
+      })),
+      http.get('/api/workitems/1/clarification-conversations', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null, data: [],
+      })),
+      http.post('/api/workitems/1/clarification-conversations', async ({ request }) => {
+        const body = (await request.json()) as { agentId?: number };
+        return HttpResponse.json({
+          success: true, code: '0', message: '', traceId: null,
+          data: {
+            id: 5, agentId: body.agentId ?? 1, agentName: 'Agent-A', channelConversationId: 'ch-5',
+            status: 'ACTIVE', executorOnline: true, streamingSupported: true,
+            cliSessionRef: null, processingStatus: null, processingTurnId: null,
+            lastTurnAt: null, gmtCreate: '2026-01-01T00:00:00', turns: [],
+          },
+        });
+      }),
+      http.get('/api/workitems/1/clarification-conversations/:conversationId', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null, data: null,
+      })),
+      http.get('/api/workitems/1/clarification-conversations/:conversationId/events', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null, data: [],
+      })),
+    ];
+  }
+
+  function currentSearch() {
+    return screen.getByTestId('location-search').textContent ?? '';
+  }
+
+  beforeEach(() => {
+    useAuthStore.getState().clear();
+    useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'O', description: '' }, 'READ_WRITE');
+    if (!Element.prototype.setPointerCapture) {
+      Element.prototype.setPointerCapture = vi.fn();
+    }
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('writes the clarify view into the workitem URL', async () => {
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1');
+    await screen.findByRole('heading', { name: '跨境支付重构' });
+    expect(currentSearch()).toBe('');
+
+    await userEvent.click(screen.getByRole('button', { name: /AI 需求澄清/ }));
+
+    await waitFor(() => expect(currentSearch()).toContain('panel=clarify'));
+    // 澄清态挂在同一个工单路由上，不能变成另一条路由
+    expect(screen.getByTestId('location-pathname').textContent).toBe('/workitems/1');
+    expect(currentSearch()).not.toContain('fullscreen=1');
+  });
+
+  it('records fullscreen in the URL and drops it again on exit', async () => {
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1');
+    await screen.findByRole('heading', { name: '跨境支付重构' });
+
+    await userEvent.click(screen.getByRole('button', { name: /AI 需求澄清/ }));
+    await screen.findByTestId('clarify-resize-box');
+
+    await userEvent.click(screen.getByRole('button', { name: '全屏' }));
+    await waitFor(() => expect(currentSearch()).toContain('fullscreen=1'));
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(currentSearch()).not.toContain('fullscreen=1'));
+    // 退出全屏不等于离开澄清页
+    expect(currentSearch()).toContain('panel=clarify');
+  });
+
+  it('clears every clarify param when returning to progress', async () => {
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1?panel=clarify&fullscreen=1&agent=7&conversation=101');
+    const box = await screen.findByTestId('clarify-resize-box');
+    expect(box).toHaveStyle('position: fixed');
+
+    await userEvent.click(screen.getByRole('button', { name: /返回进度/ }));
+
+    await waitFor(() => expect(currentSearch()).toBe(''));
+    expect(screen.getByRole('button', { name: /AI 需求澄清/ })).toBeInTheDocument();
+  });
+
+  it('restores the fullscreen clarify page after a refresh', async () => {
+    // 刷新等价于用同一条 URL 重新挂载：必须停在全屏澄清页，而不是回到进度面板
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1?panel=clarify&fullscreen=1');
+
+    const box = await screen.findByTestId('clarify-resize-box');
+    expect(box).toHaveStyle({ position: 'fixed', zIndex: 1000 });
+    expect(screen.getByRole('button', { name: '退出全屏' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /AI 需求澄清/ })).toBeNull();
+    expect(screen.getByTestId('location-pathname').textContent).toBe('/workitems/1');
+  });
+
+  it('restores the docked clarify page after a refresh', async () => {
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1?panel=clarify');
+
+    const box = await screen.findByTestId('clarify-resize-box');
+    expect(box).toHaveStyle('position: relative');
+    expect(screen.getByTestId('resize-handle-vertical')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '全屏' })).toBeInTheDocument();
+  });
+
+  it('keeps the progress panel when the URL carries no clarify params', async () => {
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1');
+
+    await screen.findByRole('heading', { name: '跨境支付重构' });
+    expect(screen.getByRole('button', { name: /AI 需求澄清/ })).toBeInTheDocument();
+    expect(screen.queryByTestId('clarify-resize-box')).toBeNull();
+  });
+
+  it('records the picked agent and its conversation in the URL', async () => {
+    server.use(
+      http.get('/api/workitems/1/delivery-progress', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null,
+        data: {
+          ...mockDeliveryProgress,
+          // steps/durationMs 是 AgentDeliveryProgress 的必填项：DeliveryProgress 会对 agent.steps 做 map，缺失会把整棵树渲染崩掉
+          agents: [
+            { agentId: 1, agentName: 'Agent-A', status: 'active', durationMs: null, steps: [] },
+            { agentId: 2, agentName: 'Agent-B', status: 'active', durationMs: null, steps: [] },
+          ],
+        },
+      })),
+      ...mockClarifyEndpoints(),
+      ...setupHandlers().filter((h) => h.info.path !== '/api/workitems/1/delivery-progress'),
+    );
+    renderPageAt('/workitems/1');
+    await screen.findByRole('heading', { name: '跨境支付重构' });
+
+    await userEvent.click(screen.getByRole('button', { name: /AI 需求澄清/ }));
+    const selectionColumn = await screen.findByTestId('clarification-selection-column');
+    await userEvent.click(within(selectionColumn).getByText('Agent-A'));
+
+    // 选定数字人会自动全屏，两件事都得进 URL，否则刷新回来退化成窄面板 + 重新选人
+    await waitFor(() => expect(currentSearch()).toContain('agent=1'));
+    expect(currentSearch()).toContain('panel=clarify');
+    expect(currentSearch()).toContain('fullscreen=1');
+    await waitFor(() => expect(currentSearch()).toContain('conversation=5'));
+  });
+
+  it('restores the delivery agent conversation after a refresh without bouncing to the picker', async () => {
+    // CR53035-002：交付进度是轮询来的，挂载当帧 agents 必然为空。
+    // 这一帧把 agentId: null 写回 URL 就会抹掉自己的恢复源，刷新回来只能重新选人（CR53035-001）。
+    const restoredConversation = {
+      id: 101, agentId: 2, agentName: 'Agent-B', channelConversationId: 'ch-101',
+      status: 'ACTIVE', executorOnline: true, streamingSupported: true, cancelSupported: true,
+      cliSessionRef: null, processingStatus: null, processingTurnId: null,
+      lastTurnAt: '2026-01-01T00:00:00', gmtCreate: '2026-01-01T00:00:00',
+      turns: [{
+        id: 1010, direction: 'IN', content: '刷新前的澄清结论',
+        status: 'SUCCESS', error: null, gmtCreate: '2026-01-01T00:00:00',
+      }],
+    };
+    server.use(
+      http.get('/api/workitems/1/delivery-progress', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null,
+        data: {
+          ...mockDeliveryProgress,
+          // steps/durationMs 是 AgentDeliveryProgress 的必填项，缺失会把整棵树渲染崩掉
+          agents: [
+            { agentId: 2, agentName: 'Agent-B', status: 'active', durationMs: null, steps: [] },
+          ],
+        },
+      })),
+      http.get('/api/workitems/1/clarification-conversations', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null, data: [restoredConversation],
+      })),
+      http.get('/api/workitems/1/clarification-conversations/101', () => HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null, data: restoredConversation,
+      })),
+      ...mockClarifyEndpoints(),
+      ...setupHandlers().filter((h) => h.info.path !== '/api/workitems/1/delivery-progress'),
+    );
+
+    renderPageAt('/workitems/1?panel=clarify&fullscreen=1&agent=2&conversation=101');
+
+    // 会话正文只在恢复落定后才可能渲染（选人屏是早返回），所以它就是落定的信号
+    expect(await screen.findByText('刷新前的澄清结论')).toBeInTheDocument();
+    expect(screen.queryByTestId('clarification-selection-column')).toBeNull();
+    expect(screen.queryByText('选择数字人')).toBeNull();
+
+    // 恢复源没被自己的写回抹掉：URL 仍是同一个工单的同一条澄清会话
+    expect(currentSearch()).toContain('agent=2');
+    expect(currentSearch()).toContain('conversation=101');
+    expect(currentSearch()).toContain('fullscreen=1');
+    expect(screen.getByTestId('location-pathname').textContent).toBe('/workitems/1');
+  });
+
+  it('still navigates back to the workitem list from the restored clarify page', async () => {
+    // 验收项 5：URL 带上澄清参数后，正常返回列表不能被劫持
+    server.use(...mockClarifyEndpoints(), ...setupHandlers());
+    renderPageAt('/workitems/1?panel=clarify&fullscreen=1');
+    await screen.findByTestId('clarify-resize-box');
+
+    await userEvent.click(screen.getByTestId('back-to-list'));
+
+    expect(await screen.findByText('工单列表')).toBeInTheDocument();
+    expect(screen.queryByTestId('clarify-resize-box')).toBeNull();
   });
 });

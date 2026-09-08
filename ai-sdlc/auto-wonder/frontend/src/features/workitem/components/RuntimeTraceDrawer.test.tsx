@@ -87,6 +87,68 @@ describe('RuntimeTraceDrawer', () => {
   });
 });
 
+describe('RuntimeTraceDrawer usage display', () => {
+  function tracePayload(tokenUsage: unknown) {
+    return {
+      schemaVersion: 'autowonder.runtime-trace.v2', source: 'OSS', dispatchId: 45, provider: 'qoder', changed: true,
+      tokenUsage, events: [],
+      sessions: [{
+        sessionId: 's1', provider: 'qoder', status: 'COMPLETED', durationMs: 1200, tokenUsage, boundaries: [], eventIds: [], turns: [],
+      }],
+    };
+  }
+
+  const node = { key: 'dispatch:45', dispatchId: 45, agentName: '开发', status: 'SUCCEEDED' };
+
+  it('shows only credits for dispatch and session usage, never token counts', async () => {
+    server.use(
+      http.get('/api/dispatches/45/runtime-trace', () => HttpResponse.json({ success: true, code: '0', message: '', data: tracePayload({
+        available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100, credits: 12.34,
+      }) })),
+    );
+
+    render(<RuntimeTraceDrawer node={node} processGraph={{ nodes: [], edges: [] }} onClose={() => {}} />);
+    const drawer = await screen.findByTestId('runtime-trace-drawer');
+    await waitFor(() => expect(within(drawer).getAllByText(/12\.34 credits/).length).toBeGreaterThan(0));
+    expect(within(drawer).queryByText(/tokens/)).not.toBeInTheDocument();
+    expect(within(drawer).queryByText(/2,100/)).not.toBeInTheDocument();
+  });
+
+  it('renders no usage text when the trace still reports tokens without credits', async () => {
+    server.use(
+      http.get('/api/dispatches/45/runtime-trace', () => HttpResponse.json({ success: true, code: '0', message: '', data: tracePayload({
+        available: true, inputTokens: 1700, outputTokens: 400, reasoningTokens: 80, cacheReadTokens: 400, cacheWriteTokens: 0, totalTokens: 2100,
+      }) })),
+    );
+
+    render(<RuntimeTraceDrawer node={node} processGraph={{ nodes: [], edges: [] }} onClose={() => {}} />);
+    const drawer = await screen.findByTestId('runtime-trace-drawer');
+    await waitFor(() => expect(within(drawer).getByText(/Session s1/)).toBeInTheDocument());
+    expect(within(drawer).queryByText(/tokens/)).not.toBeInTheDocument();
+    expect(within(drawer).queryByText(/credits/)).not.toBeInTheDocument();
+    expect(within(drawer).queryByText(/💰/)).not.toBeInTheDocument();
+  });
+
+  it('renders no usage text when the trace payload omits usage entirely', async () => {
+    server.use(
+      http.get('/api/dispatches/45/runtime-trace', () => HttpResponse.json({ success: true, code: '0', message: '', data: {
+        schemaVersion: 'autowonder.runtime-trace.v2', source: 'OSS', dispatchId: 45, provider: 'qoder', changed: true,
+        events: [],
+        sessions: [{
+          sessionId: 's1', provider: 'qoder', status: 'COMPLETED', durationMs: 1200, boundaries: [], eventIds: [], turns: [],
+        }],
+      } })),
+    );
+
+    render(<RuntimeTraceDrawer node={node} processGraph={{ nodes: [], edges: [] }} onClose={() => {}} />);
+    const drawer = await screen.findByTestId('runtime-trace-drawer');
+    await waitFor(() => expect(within(drawer).getByText(/Session s1/)).toBeInTheDocument());
+    expect(within(drawer).queryByText(/credits/)).not.toBeInTheDocument();
+    expect(within(drawer).queryByText(/tokens/)).not.toBeInTheDocument();
+    expect(within(drawer).queryByText(/💰/)).not.toBeInTheDocument();
+  });
+});
+
 describe('dispatchFailureReason', () => {
   it('returns the reason of the latest failure event', () => {
     expect(dispatchFailureReason([

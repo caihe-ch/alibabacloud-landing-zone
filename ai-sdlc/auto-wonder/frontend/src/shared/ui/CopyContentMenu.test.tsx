@@ -23,6 +23,18 @@ describe('CopyContentMenu', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it('renders nothing instead of crashing when contentMd is null', () => {
+    const { container } = render(<CopyContentMenu contentMd={null} />);
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders nothing instead of crashing when contentMd is undefined', () => {
+    const { container } = render(<CopyContentMenu contentMd={undefined} />);
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it('copies the raw markdown unchanged', async () => {
     const md = '# 标题\n\n**重点** 与 [链接](https://example.com)';
     render(<CopyContentMenu contentMd={md} />);

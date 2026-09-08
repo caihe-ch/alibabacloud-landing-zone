@@ -4,6 +4,7 @@ import com.aliyun.autowonder.common.error.BizException;
 import com.aliyun.autowonder.common.error.ErrorCode;
 import com.aliyun.autowonder.common.result.Result;
 import com.aliyun.autowonder.context.AutoWonderContext;
+import com.aliyun.autowonder.dispatch.dto.RuntimeActivityTimelineVO;
 import com.aliyun.autowonder.dispatch.dto.RuntimeTraceVO;
 import com.aliyun.autowonder.access.WorkspaceAccessLevel;
 import com.aliyun.autowonder.access.RequireWorkspaceAccess;
@@ -37,6 +38,11 @@ public class RuntimeTraceController {
         }
         RuntimeTraceVO completed = artifactService.loadOutlineIfPresent(workspaceId, id);
         return Result.ok(completed == null ? traceService.get(workspaceId, id, afterSeq) : completed);
+    }
+
+    @GetMapping("/{id}/runtime-trace/activities")
+    public Result<RuntimeActivityTimelineVO> activities(@PathVariable("id") long id) {
+        return Result.ok(traceService.getActivities(currentWorkspaceId(), id));
     }
 
     @GetMapping("/{id}/runtime-trace/turns/{traceId}")

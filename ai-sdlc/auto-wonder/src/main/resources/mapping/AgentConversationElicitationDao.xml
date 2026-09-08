@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aliyun.autowonder.conversation.AgentConversationElicitationDao">
+
+    <resultMap id="BaseResultMap" type="com.aliyun.autowonder.conversation.AgentConversationElicitationDO">
+        <id column="id" property="id"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="conversation_id" property="conversationId"/>
+        <result column="turn_id" property="turnId"/>
+        <result column="request_id" property="requestId"/>
+        <result column="mode" property="mode"/>
+        <result column="message" property="message"/>
+        <result column="schema_json" property="schemaJson"/>
+        <result column="status" property="status"/>
+        <result column="answer_json" property="answerJson"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modified" property="gmtModified"/>
+    </resultMap>
+
+    <sql id="BaseColumns">
+        id, tenant_id, conversation_id, turn_id, request_id, mode, message,
+        schema_json, status, answer_json, gmt_create, gmt_modified
+    </sql>
+
+    <!-- INSERT IGNORE + uk_conv_request：事件分片重投时静默吞掉重复，避免热路径多一次查询。 -->
+    <insert id="insertIfAbsent" parameterType="com.aliyun.autowonder.conversation.AgentConversationElicitationDO"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT IGNORE INTO agent_conversation_elicitation
+        (tenant_id, conversation_id, turn_id, request_id, mode, message, schema_json, status)
+        VALUES
+        (#{tenantId}, #{conversationId}, #{turnId}, #{requestId}, #{mode}, #{message},
+         #{schemaJson}, #{status})
+    </insert>
+
+    <select id="findByRequestId" resultMap="BaseResultMap">
+        SELECT <include refid="BaseColumns"/> FROM agent_conversation_elicitation
+        WHERE tenant_id = #{tenantId}
+          AND conversation_id = #{conversationId}
+          AND request_id = #{requestId}
+    </select>
+
+    <select id="listPendingByTurn" resultMap="BaseResultMap">
+        SELECT <include refid="BaseColumns"/> FROM agent_conversation_elicitation
+        WHERE tenant_id = #{tenantId}
+          AND turn_id = #{turnId}
+          AND status = 'PENDING'
+        ORDER BY id ASC
+    </select>
+
+    <select id="listPendingByConversation" resultMap="BaseResultMap">
+        SELECT <include refid="BaseColumns"/> FROM agent_conversation_elicitation
+        WHERE tenant_id = #{tenantId}
+          AND conversation_id = #{conversationId}
+          AND status = 'PENDING'
+        ORDER BY id ASC
+    </select>
+
+    <!--
+      WHERE status = 'PENDING' 是乐观状态转移的关键：回答、取消、过期三条路径
+      竞争同一次转移，只有受影响行数为 1 的赢家才下发帧，否则执行器会收到重复
+      或矛盾的答案。
+    -->
+    <update id="settleIfPending">
+        UPDATE agent_conversation_elicitation
+        SET status = #{status},
+            answer_json = #{answerJson},
+            gmt_modified = CURRENT_TIMESTAMP
+        WHERE tenant_id = #{tenantId}
+          AND conversation_id = #{conversationId}
+          AND request_id = #{requestId}
+          AND status = 'PENDING'
+    </update>
+
+    <!--
+      投递失败后的状态补偿。WHERE status = #{expectedStatus} 保证只回滚自己刚写下的
+      那次转移：若过期 / 取消已经抢先改过状态，这里必须原地不动。
+      answer_json 一并清空，否则重答时库里会留着上一次的答案。
+    -->
+    <update id="restorePendingIfStatus">
+        UPDATE agent_conversation_elicitation
+        SET status = 'PENDING',
+            answer_json = NULL,
+            gmt_modified = CURRENT_TIMESTAMP
+        WHERE tenant_id = #{tenantId}
+          AND conversation_id = #{conversationId}
+          AND request_id = #{requestId}
+          AND status = #{expectedStatus}
+    </update>
+
+    <select id="listPendingOlderThan" resultMap="BaseResultMap">
+        SELECT <include refid="BaseColumns"/> FROM agent_conversation_elicitation
+        WHERE status = 'PENDING'
+          AND gmt_create &lt; #{cutoff}
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

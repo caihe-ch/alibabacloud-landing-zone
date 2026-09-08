@@ -758,38 +758,65 @@ public class DispatchService {
                     || source.getWorkitemId() != workitemId) {
                 throw new BizException(ErrorCode.DISPATCH_NOT_FOUND);
             }
-            DispatchDO latestForWorker = dispatchDao.listByWorkitem(workspaceId, workitemId).stream()
+            List<DispatchDO> workerDispatches = dispatchDao.listByWorkitem(workspaceId, workitemId).stream()
                     .filter(item -> java.util.Objects.equals(item.getAgentId(), source.getAgentId()))
+                    .toList();
+            DispatchDO latestAny = workerDispatches.stream()
                     .reduce((left, right) -> right)
                     .orElse(null);
-            if (latestForWorker == null || !latestForWorker.getId().equals(source.getId())) {
-                throw new BizException(ErrorCode.CONFLICT, "只能继续该 Worker 的最新一次执行");
+            DispatchDO target;
+            if (isInteractionDispatch(source)) {
+                // 交互记录本身：维持现行围栏语义，不转接（现网该调用在最新交互上可成功续跑）
+                if (latestAny == null || !latestAny.getId().equals(source.getId())) {
+                    throw new BizException(ErrorCode.CONFLICT, "只能继续该 Worker 的最新一次执行");
+                }
+                target = source;
+            } else {
+                // 仅当最新一条就是非终态交互才代表 Worker 正在处理评论；
+                // 被后续正式执行甩在身后的残留交互不得永久阻断继续
+                if (latestAny != null && isInteractionDispatch(latestAny)
+                        && !DispatchStatus.isTerminal(latestAny.getStatus())) {
+                    throw new BizException(ErrorCode.CONFLICT, "该 Worker 正在处理评论交互，请稍后再试");
+                }
+                target = workerDispatches.stream()
+                        .filter(item -> !isInteractionDispatch(item))
+                        .reduce((left, right) -> right)
+                        .orElse(null);
+                if (target == null) {
+                    throw new BizException(ErrorCode.CONFLICT, "只能继续该 Worker 的最新一次执行");
+                }
+                if (!target.getId().equals(source.getId())
+                        && !java.util.Objects.equals(target.getSdlcStepId(), source.getSdlcStepId())) {
+                    throw new BizException(ErrorCode.CONFLICT, "该 Worker 有更新的执行（dispatchId="
+                            + target.getId() + ", stepId=" + target.getSdlcStepId()
+                            + "），请刷新后对最新执行操作");
+                }
             }
-            String idem = "continue:" + sourceDispatchId;
+            String idem = "continue:" + target.getId();
             DispatchDO existing = dispatchDao.findByIdempotencyKey(workspaceId, idem);
             if (existing != null) {
                 return existing;
             }
-            if (!canContinue(source, System.currentTimeMillis())) {
+            if (!canContinue(target, System.currentTimeMillis())) {
                 throw new BizException(ErrorCode.CONFLICT, "当前执行仍在线或已成功，不能继续");
             }
-            if (!DispatchStatus.isTerminal(source.getStatus())
-                    && !transition(source, DispatchStatus.CANCELED, null, null, null, null,
+            if (!DispatchStatus.isTerminal(target.getStatus())
+                    && !transition(target, DispatchStatus.CANCELED, null, null, null, null,
                             DispatchFailureReason.MANUAL_CONTINUE)) {
                 throw new BizException(ErrorCode.CONFLICT, "执行状态已变化，请刷新后重试");
             }
             Integer maxAttempt = dispatchDao.findMaxAttempt(workspaceId, workitemId,
-                    source.getSdlcStepId());
+                    target.getSdlcStepId());
             DispatchDO recovery = new DispatchDO();
             recovery.setTenantId(workspaceId);
             recovery.setSourceType(ExecutionSourceType.WORKITEM.name());
             recovery.setWorkitemId(workitemId);
-            recovery.setSdlcStepId(source.getSdlcStepId());
-            recovery.setAgentId(source.getAgentId());
+            recovery.setSdlcStepId(target.getSdlcStepId());
+            recovery.setAgentId(target.getAgentId());
             recovery.setStatus(DispatchStatus.PENDING);
             recovery.setAttempt((maxAttempt == null ? 0 : maxAttempt) + 1);
             recovery.setIdempotencyKey(idem);
-            recovery.setResumeFromDispatchId(sourceDispatchId);
+            recovery.setResumeFromDispatchId(target.getId());
             recovery.setResumeMode("RECOVERY");
             recovery.setCreatorId(userId);
             recovery.setModifierId(userId);
@@ -1306,9 +1333,9 @@ public class DispatchService {
 
     private String firstText(JSONObject json, String... keys) {
         for (String key : keys) {
-            String value = json.getString(key);
-            if (value != null && !value.isBlank()) {
-                return value;
+            Object value = json.get(key);
+            if (value instanceof String text && !text.isBlank()) {
+                return text;
             }
         }
         return null;

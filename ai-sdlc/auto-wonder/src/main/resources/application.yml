@@ -55,7 +55,15 @@ autowonder:
   # 支持环境变量 AUTOWONDER_COMMUNITY_EDITION 覆盖。
   community-edition: ${AUTOWONDER_COMMUNITY_EDITION:true}
   runtime:
-    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.150}
+    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.152}
+  provider-model-catalog:
+    refresh-fixed-delay-ms: 86400000
+    refresh-lock-ttl-ms: 120000
+    request-timeout-seconds: 20
+    ticket-ttl-seconds: 30
+    max-candidates: 3
+    failure-cooldown-seconds: 300
+    worker-queue-capacity: 8
   scheduled-task:
     # Enabled by default: a fresh community install imports the complete
     # docs/autowonder-schema.sql, so the module is ready immediately. When

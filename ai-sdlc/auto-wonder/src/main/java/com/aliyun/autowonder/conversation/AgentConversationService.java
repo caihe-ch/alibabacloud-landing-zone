@@ -60,6 +60,7 @@ public class AgentConversationService {
     private static final String STATUS_CANCELED = "CANCELED";
     private static final String DIRECTION_IN = "IN";
     private static final String PROTOCOL_FEATURE_TURN_CANCEL = "CONVERSATION_TURN_CANCEL";
+    private static final String PROTOCOL_FEATURE_ACP_INTERACTION = "CONVERSATION_ACP_INTERACTION_V1";
     private static final long DEFAULT_CANCEL_ACK_TIMEOUT_SECONDS = 30;
     private static final String CANCELED_FALLBACK_CONTENT = "响应已终止";
 
@@ -72,7 +73,8 @@ public class AgentConversationService {
     private final ConversationChannelSinkRegistry sinkRegistry;
     private final ConversationRuntimePresence runtimePresence;
     private TransactionTemplate failureTransactionTemplate;
-    private ConversationTurnEventService conversationTurnEventService;
+    private ConversationBrowserEventPublisher browserEventPublisher;
+    private ConversationElicitationService conversationElicitationService;
     private final Map<Long, ScheduledFuture<?>> pendingCancels = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cancelTimeoutScheduler =
             Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -112,8 +114,14 @@ public class AgentConversationService {
     }
 
     @Autowired(required = false)
-    void setConversationTurnEventService(ConversationTurnEventService conversationTurnEventService) {
-        this.conversationTurnEventService = conversationTurnEventService;
+    void setBrowserEventPublisher(ConversationBrowserEventPublisher browserEventPublisher) {
+        this.browserEventPublisher = browserEventPublisher;
+    }
+
+    @Autowired(required = false)
+    void setConversationElicitationService(
+            ConversationElicitationService conversationElicitationService) {
+        this.conversationElicitationService = conversationElicitationService;
     }
 
     void setCancelAckTimeoutSeconds(long cancelAckTimeoutSeconds) {
@@ -166,7 +174,7 @@ public class AgentConversationService {
         if (executorId == null) {
             throw new IllegalStateException("no online executor for agent " + agentId);
         }
-        AgentIdentitySnapshot identity = resolveIdentity(agentId, channel);
+        AgentIdentitySnapshot identity = resolveIdentity(agentId, channel, executorId);
         AgentConversationDO conv = new AgentConversationDO();
         conv.setTenantId(tenantId);
         conv.setAgentId(agentId);
@@ -373,11 +381,11 @@ public class AgentConversationService {
     }
 
     private void publishCanceledStatusEvent(Long tenantId, Long conversationId, Long turnId) {
-        if (conversationTurnEventService == null) {
+        if (browserEventPublisher == null) {
             return;
         }
         try {
-            conversationTurnEventService.publishStatusEvent(tenantId, conversationId, turnId, "canceled");
+            browserEventPublisher.publishStatusEvent(tenantId, conversationId, turnId, "canceled");
         } catch (RuntimeException e) {
             log.warn("conversation canceled status event publish failed conversationId={} turnId={}",
                     conversationId, turnId, e);
@@ -385,10 +393,14 @@ public class AgentConversationService {
     }
 
     /** ACK 正常终结（非取消）时直推终态事件；否则轮次结束后浏览器端没有任何
-     *  触发重新拉取会话的事件，澄清界面会一直停留在"回复中"状态。 */
+     *  触发重新拉取会话的事件，澄清界面会一直停留在"回复中"状态。
+     *
+     *  <p>走 browserEventPublisher 而不是 ConversationTurnEventService：后者上的
+     *  同名方法只是转发到这里，为打断 Spring 循环依赖已随组件抽出而删除，绕回去
+     *  会把环装回来。 */
     private void publishAckTerminalStatusEvent(Long tenantId, Long conversationId, Long turnId,
             String status) {
-        if (conversationTurnEventService == null) {
+        if (browserEventPublisher == null) {
             return;
         }
         String terminalStatus;
@@ -400,7 +412,7 @@ public class AgentConversationService {
             return;
         }
         try {
-            conversationTurnEventService.publishStatusEvent(tenantId, conversationId, turnId,
+            browserEventPublisher.publishStatusEvent(tenantId, conversationId, turnId,
                     terminalStatus);
         } catch (RuntimeException e) {
             log.warn("conversation ack terminal status event publish failed conversationId={} turnId={}",
@@ -439,8 +451,59 @@ public class AgentConversationService {
             throw new BizException(ErrorCode.CONFLICT,
                     "runtime does not support conversation turn cancel");
         }
+        cancelPendingElicitations(tenantId, conversationId, turnId);
         transport.sendCancel(conv, turnId);
         scheduleCancelAckTimeout(conv, turnId);
+    }
+
+    /**
+     * 取消 / 重投前先把该轮所有挂起卡片 cancel 掉 —— ACP 要求挂起请求必须有终态，
+     * 否则执行器侧的 JSON-RPC 请求会一直悬着，用户也会对着一个投不进去的表单填。
+     *
+     * <p>状态转移留在调用方事务内：它可回滚，且必须与轮次状态原子生效。只有不可
+     * 回滚的部分（执行器 cancel 帧、浏览器推送）推迟到提交之后 —— 若帧先出门而
+     * 事务回滚，卡片回到 PENDING 但执行器侧 requestId 已取消，用户之后的回答会
+     * 被服务端接受却永远投不进去。
+     *
+     * <p>联动失败只记 warn：用户点了停止就必须停下来，不能被卡片状态拖住。
+     */
+    private void cancelPendingElicitations(Long tenantId, Long conversationId, Long turnId) {
+        if (conversationElicitationService == null) {
+            return;
+        }
+        List<AgentConversationElicitationDO> settled;
+        try {
+            settled = conversationElicitationService.settlePendingForTurn(tenantId, conversationId,
+                    turnId);
+        } catch (RuntimeException e) {
+            log.warn("conversation pending elicitation cancel failed conversationId={} turnId={}: {}",
+                    conversationId, turnId, e.getMessage());
+            return;
+        }
+        if (settled.isEmpty()) {
+            return;
+        }
+        runAfterCommit(() -> conversationElicitationService.notifyCanceled(settled));
+    }
+
+    /**
+     * 事务提交后执行 {@code action}；没有事务时立即执行。
+     *
+     * <p>只能放不可回滚的副作用：此处的执行上下文里数据库写入会被静默丢弃
+     * （MyBatis 的 SqlSession 已在 beforeCompletion 关闭）。
+     */
+    private void runAfterCommit(Runnable action) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()
+                || !TransactionSynchronizationManager.isActualTransactionActive()) {
+            action.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                action.run();
+            }
+        });
     }
 
     private void scheduleCancelAckTimeout(AgentConversationDO conv, Long turnId) {
@@ -575,6 +638,8 @@ public class AgentConversationService {
             }
             if (current.getDispatchAttempt() != null
                     && current.getDispatchAttempt() >= MAX_DISPATCH_ATTEMPTS) {
+                // 执行器已重启 / 掉线，它侧的挂起 requestId 不存在了：卡片必须立刻
+                // 失效，否则最长 30 分钟内用户的回答会落库成功却进黑洞（spec §4.6）。
                 String error = "conversation runtime did not acknowledge after "
                         + current.getDispatchAttempt() + " delivery attempts";
                 int finalized = turnDao.updateInboundStatusIfProcessing(stale.getTenantId(),
@@ -582,6 +647,8 @@ public class AgentConversationService {
                 if (finalized != 1) {
                     return null;
                 }
+                cancelPendingElicitations(stale.getTenantId(), stale.getConversationId(),
+                        stale.getId());
                 log.warn("conversation stale turn exhausted delivery attempts conversationId={} "
                                 + "turnId={} attempts={}", stale.getConversationId(), stale.getId(),
                         current.getDispatchAttempt());
@@ -592,6 +659,9 @@ public class AgentConversationService {
                     stale.getConversationId(), stale.getId(), cutoff)) {
                 return null;
             }
+            // 重投等于换了一个执行器进程，它侧的挂起 requestId 已经没有了。
+            cancelPendingElicitations(stale.getTenantId(), stale.getConversationId(),
+                    stale.getId());
             log.info("conversation stale turn redeliver conversationId={} turnId={} executorId={}",
                     stale.getConversationId(), stale.getId(), conv.getExecutorId());
             AgentIdentitySnapshot identity = refreshConversationIdentity(stale.getTenantId(), conv);
@@ -963,7 +1033,8 @@ public class AgentConversationService {
 
     private AgentIdentitySnapshot refreshConversationIdentity(Long tenantId,
             AgentConversationDO conv) {
-        AgentIdentitySnapshot identity = resolveIdentity(conv.getAgentId(), conv.getChannel());
+        AgentIdentitySnapshot identity = resolveIdentity(conv.getAgentId(), conv.getChannel(),
+                conv.getExecutorId());
         if (!identity.agentVersionId().equals(conv.getAgentVersionId())) {
             if (convDao.updateAgentVersion(tenantId, conv.getId(), identity.agentVersionId()) != 1) {
                 throw new IllegalStateException("conversation agent version refresh failed: "
@@ -974,7 +1045,7 @@ public class AgentConversationService {
         return identity;
     }
 
-    private AgentIdentitySnapshot resolveIdentity(Long agentId, String channel) {
+    private AgentIdentitySnapshot resolveIdentity(Long agentId, String channel, Long executorId) {
         AgentDO agent = agentDao.findById(agentId);
         if (agent == null || agent.getOnlineVersionId() == null) {
             throw new IllegalStateException("agent has no online version: " + agentId);
@@ -994,11 +1065,22 @@ public class AgentConversationService {
             throw new IllegalStateException("online agent version has no identity prompt: "
                     + agent.getOnlineVersionId());
         }
-        sb.append(API_MODE_SUFFIX);
+        // Agent 具备结构化提问能力时不再禁止交互工具：它的提问会经 elicitation/create
+        // 变成前端卡片，用户可以真的回答。老版本执行器没有这条通路，禁令必须保留，
+        // 否则 Agent 的提问会掉进黑洞 —— 用户看不到问题，Agent 也等不到回答。
+        if (!supportsAcpInteraction(executorId)) {
+            sb.append(API_MODE_SUFFIX);
+        }
         if ("WORKITEM_CLARIFICATION".equals(channel)) {
             sb.append(CLARIFICATION_MODE_SUFFIX);
         }
         return new AgentIdentitySnapshot(agent.getOnlineVersionId(), sb.toString());
+    }
+
+    private boolean supportsAcpInteraction(Long executorId) {
+        return executorId != null && runtimePresence != null
+                && runtimePresence.supportsProtocolFeature(executorId,
+                        PROTOCOL_FEATURE_ACP_INTERACTION);
     }
 
     private void appendIf(StringBuilder sb, String label, String value) {

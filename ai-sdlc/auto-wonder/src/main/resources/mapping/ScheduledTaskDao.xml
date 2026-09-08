@@ -137,4 +137,23 @@
           AND #{targetStatus} IN ('ACTIVE', 'PAUSED', 'EXHAUSTED', 'ARCHIVED')
           AND version = #{version} AND is_deleted = 0
     </update>
+
+    <!-- Delete is logical: is_deleted = 1 hides the row from every read path, while the retired
+         cursor (status = 'ARCHIVED', next_fire_at = NULL) keeps findDue and claimNextFire from ever
+         firing it again if a query forgets the is_deleted filter. version is the optimistic guard. -->
+    <update id="softDelete" databaseId="autowonder-source-aware">
+        UPDATE scheduled_task
+        SET is_deleted = 1, status = 'ARCHIVED', next_fire_at = NULL,
+            modifier_id = #{modifierId}, version = version + 1
+        WHERE workspace_id = #{workspaceId} AND id = #{id}
+          AND version = #{expectedVersion} AND is_deleted = 0
+    </update>
+
+    <!-- Bulk pause on workspace logical delete (D5): status = 'ACTIVE' is both the filter and the
+         optimistic guard, so a concurrent transition of one task cannot be overwritten. -->
+    <update id="pauseActiveByWorkspace" databaseId="autowonder-source-aware">
+        UPDATE scheduled_task
+        SET status = 'PAUSED', modifier_id = #{modifierId}, version = version + 1
+        WHERE workspace_id = #{workspaceId} AND status = 'ACTIVE' AND is_deleted = 0
+    </update>
 </mapper>

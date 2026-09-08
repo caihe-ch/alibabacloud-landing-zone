@@ -122,6 +122,11 @@ export function MarkdownView({ content, className, mentionNames, artifacts, onAr
       <ReactMarkdown
         allowedElements={markdownAllowedElements}
         components={{
+          // pre 的 UA 默认 white-space:pre 会关闭折行，外层 div 的 overflowWrap/wordBreak
+          // 因此对代码块整体失效，超长行会溢出正文右边界。这里只把溢出收敛成块内横向滚动。
+          pre: ({ node: _node, ...props }) => (
+            <pre {...props} style={{ maxWidth: '100%', overflowX: 'auto' }} />
+          ),
           code: ({ node: _node, className, children, ...props }) => {
             const label = childrenText(children);
             const artifact = label.includes('\n') ? null : findArtifactForPath(label.trim(), artifacts ?? []);

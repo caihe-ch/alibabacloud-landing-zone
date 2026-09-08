@@ -1,10 +1,11 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Card, Typography, Space, Spin, Collapse, Tag, Tooltip, Button } from 'antd';
 import { CheckCircleFilled, CloseCircleFilled, CompressOutlined, DownloadOutlined, EyeOutlined, FileTextOutlined, FullscreenOutlined, LoadingOutlined, PauseCircleOutlined, PlayCircleOutlined, ReloadOutlined, ZoomInOutlined, ZoomOutOutlined } from '@ant-design/icons';
 import type { AgentDeliveryProgress, Artifact, DeliveryProgress as DeliveryProgressModel, DeliveryStep, DispatchAttempt, ProcessGraph, ProcessGraphEdge, ProcessGraphNode, SubStep, WorkflowPlan } from '@/shared/types/workitem';
 import { basename } from '@/shared/lib/artifactLinking';
 import { getArtifactDownloadUrl } from '../api';
 import { ArtifactPreviewModal } from './ArtifactPreviewModal';
+import { DispatchActivityFeed } from './DispatchActivityFeed';
 import { RuntimeTraceDrawer } from './RuntimeTraceDrawer';
 import { TokenUsageBadge, StepTokenBadge } from './TokenUsageBadge';
 
@@ -12,6 +13,7 @@ const { Text } = Typography;
 
 type DisplayAttempt = DispatchAttempt & {
   displayIndex: number;
+  isActivityFeedHost: boolean;
 };
 
 interface GraphSelection {
@@ -205,7 +207,7 @@ function buildAttemptViews(steps: ConvergedDeliveryStep[]): Map<number, DisplayA
         relocatedActions.set(step.stepId, (relocatedActions.get(step.stepId) ?? new Set()).add(attempt.dispatchId));
         byStep.set(target.stepId, [
           ...(byStep.get(target.stepId) ?? []),
-          { ...attempt, displayIndex: i },
+          { ...attempt, displayIndex: i, isActivityFeedHost: true },
         ]);
       }
     });
@@ -213,11 +215,15 @@ function buildAttemptViews(steps: ConvergedDeliveryStep[]): Map<number, DisplayA
 
   steps.forEach((step) => {
     const strippedActionIds = relocatedActions.get(step.stepId);
-    const attempts = step.attempts?.map((attempt, i) => ({
-      ...attempt,
-      ...(strippedActionIds?.has(attempt.dispatchId) ? { canContinue: false, canPause: false } : {}),
-      displayIndex: i,
-    })) ?? [];
+    const attempts = step.attempts?.map((attempt, i) => {
+      const isRelocatedAction = strippedActionIds?.has(attempt.dispatchId) ?? false;
+      return {
+        ...attempt,
+        ...(isRelocatedAction ? { canContinue: false, canPause: false } : {}),
+        displayIndex: i,
+        isActivityFeedHost: !isRelocatedAction,
+      };
+    }) ?? [];
     byStep.set(step.stepId, [...attempts, ...(byStep.get(step.stepId) ?? [])]);
   });
 
@@ -313,8 +319,17 @@ function StepCard({ step, index, attempts, onContinue, continuingDispatchId, onP
   const primaryActionAttempt = attempts.find((attempt) =>
     (attempt.canContinue && onContinue) || (attempt.canPause && onPause));
   const hasAttemptDetails = attempts.length > 0 || Boolean(step.executorName) || Boolean(step.subSteps?.length);
-  const detailsDefaultActiveKey = isActive || isPaused || isFailed ? ['records'] : [];
+  const attentionStatus = isActive || isPaused || isFailed;
+  const [recordsOpen, setRecordsOpen] = useState(attentionStatus);
+  const previousAttentionStatus = useRef(attentionStatus);
   const attemptRecords = attempts.length > 0 ? attempts : [];
+
+  useEffect(() => {
+    if (attentionStatus && !previousAttentionStatus.current) {
+      setRecordsOpen(true);
+    }
+    previousAttentionStatus.current = attentionStatus;
+  }, [attentionStatus]);
 
   return (
     <div
@@ -369,7 +384,8 @@ function StepCard({ step, index, attempts, onContinue, continuingDispatchId, onP
           <Collapse
             ghost
             size="small"
-            defaultActiveKey={detailsDefaultActiveKey}
+            activeKey={recordsOpen ? ['records'] : []}
+            onChange={(keys) => setRecordsOpen((Array.isArray(keys) ? keys : [keys]).includes('records'))}
             items={[
               {
                 key: 'records',
@@ -381,21 +397,26 @@ function StepCard({ step, index, attempts, onContinue, continuingDispatchId, onP
                         执行者: {step.executorName}
                       </Text>
                     )}
-                    {attemptRecords.map((attempt) => (
-                      <div key={String(attempt.dispatchId)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Text type="secondary" style={{ fontSize: 11, flex: 1 }}>
-                          第{attempt.displayIndex + 1}次: {attempt.executorName ?? '—'} · {attempt.status ?? 'UNKNOWN'}
-                          {attempt.durationMs != null && ` · ${formatDuration(attempt.durationMs)}`}
-                          {attempt.error && ` · ${attempt.error}`}
-                        </Text>
-                        {attempt.dispatchId !== primaryActionAttempt?.dispatchId && (
-                          <AttemptActionButton
-                            attempt={attempt}
-                            onContinue={onContinue}
-                            continuingDispatchId={continuingDispatchId}
-                            onPause={onPause}
-                            pausingDispatchId={pausingDispatchId}
-                          />
+                    {recordsOpen && attemptRecords.map((attempt) => (
+                      <div key={String(attempt.dispatchId)}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <Text type="secondary" style={{ fontSize: 11, flex: 1 }}>
+                            第{attempt.displayIndex + 1}次: {attempt.executorName ?? '—'} · {attempt.status ?? 'UNKNOWN'}
+                            {attempt.durationMs != null && ` · ${formatDuration(attempt.durationMs)}`}
+                            {attempt.error && ` · ${attempt.error}`}
+                          </Text>
+                          {attempt.dispatchId !== primaryActionAttempt?.dispatchId && (
+                            <AttemptActionButton
+                              attempt={attempt}
+                              onContinue={onContinue}
+                              continuingDispatchId={continuingDispatchId}
+                              onPause={onPause}
+                              pausingDispatchId={pausingDispatchId}
+                            />
+                          )}
+                        </div>
+                        {recordsOpen && attempt.isActivityFeedHost && (
+                          <DispatchActivityFeed dispatchId={attempt.dispatchId} status={attempt.status} />
                         )}
                       </div>
                     ))}

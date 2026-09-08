@@ -17,7 +17,7 @@ class ScheduledTaskSpringConstructorInjectionTest {
         assertProductionConstructor(ScheduledTaskRunCompensationTask.class, 6);
         assertProductionConstructor(ScheduledTaskMetrics.class, 3);
         assertProductionConstructor(ScheduledTaskRunRecoveryService.class, 4);
-        assertProductionConstructor(ScheduledTaskService.class, 6);
+        assertProductionConstructor(ScheduledTaskService.class, 7);
     }
 
     private static void assertProductionConstructor(Class<?> beanType, int parameterCount) {

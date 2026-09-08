@@ -25,6 +25,10 @@ function recordStartedRequest({ request }: { request: Request }) {
   startedRequests.push(request.method + ' ' + request.url);
 }
 
+// The keyword reaches the network only after the 300ms debounce plus an MSW round trip, which
+// does not fit Testing Library's 1000ms default once vitest runs every file in parallel.
+const DEBOUNCED_FIND_TIMEOUT = 4000;
+
 const memberWorkspace: WorkspaceListItem = {
   id: 1,
   name: '星云工坊',
@@ -193,7 +197,8 @@ describe('AllWorkspacesTab', () => {
     expect(await screen.findByTestId('all-workspace-card-3')).toBeInTheDocument();
 
     await user.type(screen.getByPlaceholderText('搜索工作空间名称或描述'), '不存在的关键字');
-    expect(await screen.findByText(/没有匹配「不存在的关键字」的工作空间/)).toBeInTheDocument();
+    expect(await screen.findByText(/没有匹配「不存在的关键字」的工作空间/, {},
+      { timeout: DEBOUNCED_FIND_TIMEOUT })).toBeInTheDocument();
   });
 
   it('debounces the keyword into a request and resets to page 1', async () => {
@@ -220,7 +225,8 @@ describe('AllWorkspacesTab', () => {
 
     await user.type(screen.getByRole('textbox', { name: /搜索工作空间/ }), 'terra');
 
-    expect(await screen.findByText('Terra 空间')).toBeInTheDocument();
+    expect(await screen.findByText('Terra 空间', {},
+      { timeout: DEBOUNCED_FIND_TIMEOUT })).toBeInTheDocument();
     const keywordRequests = listRequests.filter((req) => req.keyword !== null);
     const terraRequests = keywordRequests.filter((req) => req.keyword === 'terra');
     expect(terraRequests).toHaveLength(1);
@@ -586,7 +592,8 @@ describe('AllWorkspacesTab', () => {
     // membership. Yanking the dialog away here would be over-eager: the id is still
     // valid and the backend remains the authority on whether the request is allowed.
     await user.type(screen.getByRole('textbox', { name: /搜索工作空间/ }), 'q');
-    expect(await screen.findByText('别的空间')).toBeInTheDocument();
+    expect(await screen.findByText('别的空间', {},
+      { timeout: DEBOUNCED_FIND_TIMEOUT })).toBeInTheDocument();
 
     expect(screen.getByText('申请加入「数据中台」')).toBeInTheDocument();
     expect(screen.queryByText(/加入状态已更新/)).not.toBeInTheDocument();
@@ -720,5 +727,92 @@ describe('AllWorkspacesTab', () => {
 
     expect(await screen.findByText('权限申请记录不存在')).toBeInTheDocument();
     expect(screen.queryByText('申请已撤销，可随时再次申请')).not.toBeInTheDocument();
+  });
+
+  // F7.5. The fade is applied as an inline style on one wrapper, so read it back from the
+  // inline style rather than through getComputedStyle, which jsdom fills with defaults that
+  // would make an unfaded element indistinguishable from a faded one.
+  function fadedBlocks(scope: HTMLElement): HTMLElement[] {
+    return Array.from(scope.querySelectorAll<HTMLElement>('*'))
+      .filter((element) => element.style.opacity === '0.62');
+  }
+
+  it('styles the apply control as an enabled brand button rather than a disabled one', async () => {
+    useListHandler(() => pageEnvelope([memberWorkspace, pendingWorkspace, notMemberWorkspace]));
+
+    renderTab();
+
+    await screen.findByTestId('all-workspace-card-3');
+    const apply = screen.getByTestId('apply-access-3');
+
+    // The class is the only hook the stylesheet has: without it the four states and the
+    // focus ring in workspaceLifecycle.css simply do not apply to this button.
+    expect(apply).toHaveClass('aw-apply-access-button');
+    // F7.4: an applicable state must not read as a disabled one.
+    expect(apply).toBeEnabled();
+    expect(apply).not.toHaveAttribute('aria-disabled');
+    expect(apply).not.toHaveAttribute('disabled');
+    expect(apply.tagName).toBe('BUTTON');
+    expect(apply).toHaveAttribute('type', 'button');
+    expect(apply).toHaveAccessibleName('申请权限');
+  });
+
+  it('fades only the descriptive half of a card, never the control that acts on it', async () => {
+    useListHandler(() => pageEnvelope([memberWorkspace, pendingWorkspace, notMemberWorkspace]));
+
+    renderTab();
+
+    const notMemberCard = await screen.findByTestId('all-workspace-card-3');
+    const faded = fadedBlocks(notMemberCard);
+    expect(faded).toHaveLength(1);
+    // The name, the description and the status badge are the informational half.
+    expect(faded[0]).toContainElement(within(notMemberCard).getByText('数据中台'));
+    expect(faded[0]).toContainElement(within(notMemberCard).getByText('离线与实时数据资产'));
+    expect(faded[0]).toContainElement(within(notMemberCard).getByText('未加入'));
+    // Fading the whole card used to drag 申请权限 down to 0.62 as well, which both drops its
+    // contrast below what F7 requires and makes an actionable state read as a disabled one.
+    expect(faded[0]).not.toContainElement(screen.getByTestId('apply-access-3'));
+    expect(screen.getByTestId('apply-access-3').parentElement).toBe(notMemberCard);
+
+    const pendingCard = screen.getByTestId('all-workspace-card-2');
+    const pendingFaded = fadedBlocks(pendingCard);
+    expect(pendingFaded).toHaveLength(1);
+    expect(pendingFaded[0]).toContainElement(within(pendingCard).getByText('审批中'));
+    expect(pendingFaded[0])
+      .not.toContainElement(within(pendingCard).getByRole('button', { name: /撤销申请/ }));
+  });
+
+  it('does not fade a member card, whose whole surface is the enter control', async () => {
+    useListHandler(() => pageEnvelope([memberWorkspace, notMemberWorkspace]));
+
+    renderTab();
+
+    const memberCard = await screen.findByTestId('all-workspace-card-1');
+    expect(fadedBlocks(memberCard)).toEqual([]);
+    expect(memberCard).toHaveStyle({ cursor: 'pointer' });
+
+    // The non-member card has no enter handler at all, so its cursor must not promise a
+    // click that enters — the only thing to click inside it is 申请权限.
+    const notMemberCard = screen.getByTestId('all-workspace-card-3');
+    expect(fadedBlocks(notMemberCard)).toHaveLength(1);
+    expect(notMemberCard).toHaveStyle({ cursor: 'default' });
+    expect(notMemberCard.tagName).not.toBe('BUTTON');
+  });
+
+  it('leaves the apply button reachable by keyboard', async () => {
+    const user = userEvent.setup();
+    useListHandler(() => pageEnvelope([memberWorkspace, notMemberWorkspace]));
+
+    renderTab();
+    await screen.findByTestId('all-workspace-card-3');
+
+    await user.tab();
+    expect(screen.getByRole('textbox', { name: /搜索工作空间/ })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByTestId('all-workspace-card-1')).toHaveFocus();
+    // The card itself is a <div> for non-members, so this is the only stop inside it —
+    // F7.3's visible focus ring has something to be visible on.
+    await user.tab();
+    expect(screen.getByTestId('apply-access-3')).toHaveFocus();
   });
 });

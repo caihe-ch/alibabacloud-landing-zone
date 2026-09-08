@@ -11,6 +11,7 @@ import { useDebouncedValue } from '@/shared/hooks/useDebouncedValue';
 import { refreshTenantScopedQueries } from '@/features/workitem/queryCache';
 import { useAllWorkspaces, useCancelAccessRequest } from './workspaceDiscoveryApi';
 import { AccessRequestModal } from './AccessRequestModal';
+import './workspaceLifecycle.css';
 
 const { Text } = Typography;
 
@@ -254,7 +255,7 @@ function WorkspaceDiscoveryCard({
   const isMember = workspace.membershipStatus === 'MEMBER';
   const testId = `all-workspace-card-${workspace.id}`;
 
-  const body = (
+  const description = (
     <>
       {workspace.membershipStatus === 'PENDING' && <span style={pendingBadgeStyle}>审批中</span>}
       {workspace.membershipStatus === 'NOT_MEMBER' && <span style={notMemberBadgeStyle}>未加入</span>}
@@ -263,6 +264,10 @@ function WorkspaceDiscoveryCard({
       <span style={descStyle}>{workspace.description || '暂无描述'}</span>
     </>
   );
+  // F7.5: the fade covers the descriptive half only. Fading the whole card used to pull the
+  // 申请权限 button down to 0.62 opacity as well, which both drops its contrast below what F7
+  // requires and makes an actionable state read as a disabled one.
+  const body = isMember ? description : <div style={fadedBodyStyle}>{description}</div>;
 
   if (isMember) {
     return (
@@ -324,7 +329,14 @@ function WorkspaceDiscoveryCard({
     <div data-testid={testId} style={getCardStyle(false)}>
       {body}
       {workspace.membershipStatus === 'NOT_MEMBER' ? (
-        <button type="button" style={applyButtonStyle} onClick={() => onApply(workspace)}>
+        // F7.4: the non-member card is a <div>, not a button, so there is no enter handler here
+        // for this click to reach — the isolation is structural rather than a stopPropagation.
+        <button
+          type="button"
+          className="aw-apply-access-button"
+          data-testid={`apply-access-${workspace.id}`}
+          onClick={() => onApply(workspace)}
+        >
           申请权限
         </button>
       ) : (
@@ -350,10 +362,13 @@ function getWorkspaceInitial(name: string) {
 function getCardStyle(isMember: boolean): CSSProperties {
   return {
     ...cardStyle,
-    opacity: isMember ? 1 : 0.62,
     cursor: isMember ? 'pointer' : 'default',
   };
 }
+
+const fadedBodyStyle: CSSProperties = {
+  opacity: 0.62,
+};
 
 const toolbarStyle: CSSProperties = {
   display: 'flex',
@@ -422,19 +437,6 @@ const actionStyle: CSSProperties = {
   color: BRAND_ORANGE_DARK,
   fontSize: 13,
   fontWeight: 700,
-};
-
-const applyButtonStyle: CSSProperties = {
-  marginTop: 18,
-  alignSelf: 'flex-start',
-  border: `1px solid ${BRAND_ORANGE}`,
-  background: '#fff',
-  color: BRAND_ORANGE_DARK,
-  borderRadius: 6,
-  padding: '5px 14px',
-  fontSize: 13,
-  fontWeight: 700,
-  cursor: 'pointer',
 };
 
 const pendingActionStyle: CSSProperties = {

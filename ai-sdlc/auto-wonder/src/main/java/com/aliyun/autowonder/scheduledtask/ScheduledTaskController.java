@@ -95,6 +95,14 @@ public class ScheduledTaskController {
         return Result.ok(taskService.archive(id, version, workspaceId(), userId()));
     }
 
+    @DeleteMapping("/{id}")
+    @RequireWorkspaceAccess(value = WorkspaceAccessLevel.READ_WRITE, action = "删除定时任务")
+    public Result<Void> delete(@PathVariable long id, @RequestParam Integer version) {
+        requireOwnerOrAdmin(taskService.get(id, workspaceId()).getCreatorId());
+        taskService.delete(id, version, workspaceId(), userId());
+        return Result.ok(null);
+    }
+
     @PostMapping("/{id}/run-now")
     @RequireWorkspaceAccess(value = WorkspaceAccessLevel.READ_WRITE, action = "立即运行定时任务")
     public Result<ScheduledTaskRunVO> runNow(@PathVariable long id, @RequestBody RunNowRequest request) {

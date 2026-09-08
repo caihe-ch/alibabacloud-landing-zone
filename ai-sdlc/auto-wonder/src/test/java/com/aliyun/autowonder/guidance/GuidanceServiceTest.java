@@ -237,14 +237,30 @@ class GuidanceServiceTest {
     }
 
     @Test
-    void commentWithoutExplicitTargetsResolvesUniqueLeadingAgentName() {
+    void commentWithoutExplicitTargetsResolvesUniqueMentionAnywhere() {
         ParticipantVO developer = participant(40013L, "AW全栈开发");
         ParticipantVO tester = participant(40015L, "AW测试工程师");
         when(workitemService.getParticipants(50L, 100L)).thenReturn(List.of(developer, tester));
 
-        service.createForComment(100L, 50L, 600L, "  @AW全栈开发 请重新修改", null, 7L);
+        service.createForComment(100L, 50L, 600L, "请 @AW全栈开发 重新修改", null, 7L);
 
         verify(guidanceDao).insert(argThat(row -> Long.valueOf(40013L).equals(row.getTargetAgentId())));
+    }
+
+    @Test
+    void plainTextMentionWithoutWhitespaceResolvesKnownAgentName() {
+        AgentDO terraformAgent = new AgentDO();
+        terraformAgent.setId(40037L);
+        terraformAgent.setTenantId(100L);
+        terraformAgent.setName("Terraform-PD数字人");
+        terraformAgent.setOnlineVersionId(40075L);
+        when(workitemService.getParticipants(50L, 100L)).thenReturn(List.of());
+        when(agentDao.listByTenant(100L)).thenReturn(List.of(terraformAgent));
+        when(agentDao.findById(40037L)).thenReturn(terraformAgent);
+
+        service.createForComment(100L, 50L, 600L, "请@Terraform-PD数字人处理一下", null, 7L);
+
+        verify(guidanceDao).insert(argThat(row -> Long.valueOf(40037L).equals(row.getTargetAgentId())));
     }
 
     @Test
@@ -272,6 +288,68 @@ class GuidanceServiceTest {
     }
 
     @Test
+    void aoneRichTextMentionResolvesExactAgentNameWithoutWorkerIdentitySuffix() {
+        AgentDO terraformAgent = new AgentDO();
+        terraformAgent.setId(40037L);
+        terraformAgent.setTenantId(100L);
+        terraformAgent.setName("Terraform-PD数字人");
+        terraformAgent.setOnlineVersionId(40075L);
+        when(workitemService.getParticipants(50L, 100L)).thenReturn(List.of());
+        when(agentDao.findByExactName(100L, "Terraform-PD数字人")).thenReturn(List.of(terraformAgent));
+        when(agentDao.findById(40037L)).thenReturn(terraformAgent);
+        String content = "<article class=\"4ever-article\">"
+                + "<p><span data-type=\"text\"></span></p>"
+                + "<p><span data-type=\"text\"></span>"
+                + "<span data-type=\"mention\" data-login=\"WORKER_1783582374386\">"
+                + "@Terraform-PD数字人(WORKER_1783582374386)</span>"
+                + "<span data-type=\"text\">看下截图报告为什么降级</span></p></article>";
+
+        service.createForComment(100L, 50L, 600L, content, null, 7L);
+
+        verify(agentDao).findByExactName(100L, "Terraform-PD数字人");
+        verify(guidanceDao).insert(argThat(row -> Long.valueOf(40037L).equals(row.getTargetAgentId())));
+    }
+
+    @Test
+    void aoneRichTextResolvesMentionAfterVisibleText() {
+        AgentDO terraformAgent = new AgentDO();
+        terraformAgent.setId(40037L);
+        terraformAgent.setTenantId(100L);
+        terraformAgent.setName("Terraform-PD数字人");
+        terraformAgent.setOnlineVersionId(40075L);
+        when(workitemService.getParticipants(50L, 100L)).thenReturn(List.of());
+        when(agentDao.findByExactName(100L, "Terraform-PD数字人")).thenReturn(List.of(terraformAgent));
+        when(agentDao.findById(40037L)).thenReturn(terraformAgent);
+        String content = "<article class=\"4ever-article\"><p>请 "
+                + "<span data-type=\"mention\" data-login=\"WORKER_1783582374386\">"
+                + "@Terraform-PD数字人(WORKER_1783582374386)</span> 看一下</p></article>";
+
+        service.createForComment(100L, 50L, 600L, content, null, 7L);
+
+        verify(agentDao).findByExactName(100L, "Terraform-PD数字人");
+        verify(guidanceDao).insert(argThat(row -> Long.valueOf(40037L).equals(row.getTargetAgentId())));
+    }
+
+    @Test
+    void aoneHtmlTextMentionTreatsNonBreakingSpaceAsSeparator() {
+        AgentDO terraformAgent = new AgentDO();
+        terraformAgent.setId(40037L);
+        terraformAgent.setTenantId(100L);
+        terraformAgent.setName("Terraform-PD数字人");
+        terraformAgent.setOnlineVersionId(40075L);
+        when(workitemService.getParticipants(50L, 100L)).thenReturn(List.of());
+        when(agentDao.findByExactName(100L, "Terraform-PD数字人")).thenReturn(List.of(terraformAgent));
+        when(agentDao.findById(40037L)).thenReturn(terraformAgent);
+        String content = "<article class=\"4ever-article\"><p><span data-type=\"text\">"
+                + "@Terraform-PD数字人&nbsp;看一下</span></p></article>";
+
+        service.createForComment(100L, 50L, 600L, content, null, 7L);
+
+        verify(agentDao).findByExactName(100L, "Terraform-PD数字人");
+        verify(guidanceDao).insert(argThat(row -> Long.valueOf(40037L).equals(row.getTargetAgentId())));
+    }
+
+    @Test
     void unpublishedTargetAgentFailsGuidanceWithoutCreatingPendingDispatch() {
         AgentDO draftAgent = new AgentDO();
         draftAgent.setId(40044L);
@@ -293,12 +371,11 @@ class GuidanceServiceTest {
     }
 
     @Test
-    void commentDoesNotResolveNonLeadingOrAmbiguousMention() {
+    void commentDoesNotResolveAmbiguousMention() {
         when(workitemService.getParticipants(50L, 100L)).thenReturn(List.of(
                 participant(40013L, "AW全栈开发"), participant(40016L, "AW全栈开发")));
 
         service.createForComment(100L, 50L, 600L, "请 @AW全栈开发 看一下", null, 7L);
-        service.createForComment(100L, 50L, 600L, "@AW全栈开发 看一下", null, 7L);
 
         verify(guidanceDao, never()).insert(any());
     }

@@ -1,5 +1,6 @@
 package com.aliyun.autowonder.user;
 
+import com.aliyun.autowonder.access.SystemAdminService;
 import com.aliyun.autowonder.common.error.BizException;
 
 import com.aliyun.autowonder.user.dto.RegisterRequest;
@@ -11,7 +12,7 @@ import static org.mockito.Mockito.*;
 class UserServiceRegisterTest {
 
     private UserService newService(UserDao dao) {
-        return new UserService(dao, null, null, null);
+        return new UserService(dao, null, null, null, null, mock(SystemAdminService.class));
     }
 
     @Test

@@ -12,4 +12,7 @@ public class WorkspaceListItemVO {
     private String membershipStatus;
     private String accessLevel;
     private Long pendingRequestId;
+    /** Wrapper type so Jackson emits {@code isOwner} rather than {@code owner}; see WorkspaceVO. */
+    private Boolean isOwner;
+    private Boolean canManage;
 }

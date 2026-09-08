@@ -79,6 +79,13 @@ const CAPABILITIES: CapabilityMeta[] = [
     match: (name) => name.includes('agent'),
   },
   {
+    key: 'executor',
+    title: '执行器管理',
+    description: '执行器的增删查、Token 查看、可选值查询与启动命令生成。',
+    color: 'geekblue',
+    match: (name) => name.includes('executor'),
+  },
+  {
     key: 'skill',
     title: '技能与插件',
     description: 'skills、MCP server 和 plugin 记录管理。',

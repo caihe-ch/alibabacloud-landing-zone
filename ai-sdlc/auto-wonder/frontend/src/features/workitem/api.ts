@@ -1,7 +1,7 @@
 import { apiClient } from '@/shared/api/client';
 import { useAuthStore } from '@/shared/auth/store';
 import type { PageResult } from '@/shared/types/common';
-import type { Workitem, WorkitemDetail, TimelineEvent, Comment, Participant, DeliveryProgress, TimelineItem, Clarification, Artifact, RuntimeTrace, RuntimeTraceObservation, RuntimeTraceTurn } from '@/shared/types/workitem';
+import type { Workitem, WorkitemDetail, TimelineEvent, Comment, Participant, DeliveryProgress, TimelineItem, Clarification, Artifact, RuntimeActivityTimeline, RuntimeTrace, RuntimeTraceObservation, RuntimeTraceTurn } from '@/shared/types/workitem';
 
 export type WorkitemStatusCategory = 'NEW' | 'IN_PROGRESS' | 'PENDING_DECISION' | 'DONE';
 
@@ -159,6 +159,14 @@ export async function getRuntimeTrace(dispatchId: number | string, afterSeq?: nu
   const resp = await apiClient.get<RuntimeTrace>(`/api/dispatches/${dispatchId}/runtime-trace`, {
     params: afterSeq == null ? undefined : { afterSeq },
   });
+  return resp.data;
+}
+
+export async function getRuntimeActivities(dispatchId: number | string, signal?: AbortSignal): Promise<RuntimeActivityTimeline> {
+  const resp = await apiClient.get<RuntimeActivityTimeline>(
+    `/api/dispatches/${dispatchId}/runtime-trace/activities`,
+    signal ? { signal } : undefined,
+  );
   return resp.data;
 }
 

@@ -180,6 +180,17 @@ class ExecutorServiceTest {
     }
 
     @Test
+    void getToken_blank_plaintext_throws() {
+        ExecutorDO e = exec(9L, 5L);
+        e.setTokenRef("b64:IA==");
+        when(executorDao.findById(9L)).thenReturn(e);
+        when(tokenService.resolve("b64:IA==")).thenReturn("   ");
+
+        BizException ex = assertThrows(BizException.class, () -> service.getToken(9L, 100L));
+        assertEquals("17004", ex.getCode());
+    }
+
+    @Test
     void delete_not_found_throws() {
         when(executorDao.findById(9L)).thenReturn(null);
         BizException ex = assertThrows(BizException.class, () -> service.delete(9L, 100L, 7L));
@@ -336,6 +347,64 @@ class ExecutorServiceTest {
         List<ExecutorVO> vos = service.listAll(100L);
 
         assertNotNull(vos.get(0).getLastHeartbeat());
+    }
+
+    @Test
+    void getDetail_returns_vo_with_live_status() {
+        ExecutorDO e = exec(9L, 5L);
+        e.setAgentName("Alpha");
+        e.setClientKind("QODER_CLI");
+        e.setLastConnectIp("203.0.113.50");
+        e.setLastHeartbeat(new Date());
+        when(executorDao.findById(9L)).thenReturn(e);
+        when(registry.isOnline(9L)).thenReturn(true);
+
+        ExecutorVO vo = service.getDetail(9L, 100L);
+
+        assertEquals(9L, vo.getId());
+        assertEquals(5L, vo.getAgentId());
+        assertEquals("Alpha", vo.getAgentName());
+        assertEquals("QODER_CLI", vo.getClientKind());
+        assertEquals("ONLINE", vo.getStatus());
+        assertEquals("203.0.113.50", vo.getLastConnectIp());
+        assertNotNull(vo.getLastHeartbeat());
+    }
+
+    @Test
+    void getDetail_offline_when_not_registered() {
+        when(executorDao.findById(9L)).thenReturn(exec(9L, 5L));
+        when(registry.isOnline(9L)).thenReturn(false);
+
+        assertEquals("OFFLINE", service.getDetail(9L, 100L).getStatus());
+    }
+
+    @Test
+    void getDetail_not_found_throws() {
+        when(executorDao.findById(9L)).thenReturn(null);
+
+        BizException ex = assertThrows(BizException.class, () -> service.getDetail(9L, 100L));
+
+        assertEquals("17001", ex.getCode());
+    }
+
+    @Test
+    void getDetail_wrong_tenant_throws() {
+        when(executorDao.findById(9L)).thenReturn(exec(9L, 5L));
+
+        BizException ex = assertThrows(BizException.class, () -> service.getDetail(9L, 999L));
+
+        assertEquals("17001", ex.getCode());
+    }
+
+    @Test
+    void getDetail_null_tenant_throws() {
+        ExecutorDO e = exec(9L, 5L);
+        e.setTenantId(null);
+        when(executorDao.findById(9L)).thenReturn(e);
+
+        BizException ex = assertThrows(BizException.class, () -> service.getDetail(9L, 100L));
+
+        assertEquals("17001", ex.getCode());
     }
 
     private ExecutorDO exec(long id, long agentId) {

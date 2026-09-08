@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { CLARIFICATION_THEME } from './theme';
 
 export type ReplyingIndicatorStyle = 'dots' | 'spinner' | 'cursor';
 
@@ -66,7 +67,10 @@ export function ReplyingIndicator({ agentName }: ReplyingIndicatorProps) {
   return (
     <div
       data-testid="clarification-replying-indicator"
-      style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', fontSize: 12, color: '#8c8c8c' }}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', fontSize: 12,
+        color: CLARIFICATION_THEME.textMuted,
+      }}
     >
       <style>{replyIndicatorCss}</style>
       {style === 'dots' ? (
@@ -75,7 +79,8 @@ export function ReplyingIndicator({ agentName }: ReplyingIndicatorProps) {
             <span
               key={i}
               style={{
-                width: 5, height: 5, borderRadius: '50%', backgroundColor: '#8c8c8c',
+                width: 5, height: 5, borderRadius: '50%',
+                backgroundColor: CLARIFICATION_THEME.textMuted,
                 animation: `aw-clarify-dot-bounce 1.2s infinite ${i * 0.2}s`,
               }}
             />
@@ -87,7 +92,10 @@ export function ReplyingIndicator({ agentName }: ReplyingIndicatorProps) {
           aria-hidden
           style={{
             width: 12, height: 12, borderRadius: '50%',
-            border: '2px solid #d9d9d9', borderTopColor: '#8c8c8c',
+            // 2px 控件环用 controlBorder（10%）而不是 hairline（6%）：后者是分割线级别的
+            // 淡度，画在 2px 圆环上几乎看不见。
+            border: `2px solid ${CLARIFICATION_THEME.controlBorder}`,
+            borderTopColor: CLARIFICATION_THEME.textMuted,
             animation: 'aw-clarify-spin 0.8s linear infinite',
           }}
         />

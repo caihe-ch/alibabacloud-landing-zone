@@ -24,8 +24,26 @@ export interface CreateExecutorRequest {
   clientKind: string;
 }
 
+export type ExecutorModelCatalogProvider = 'qoder' | 'qodercn';
+
+export interface ExecutorModelCatalogModel {
+  id: string;
+  name: string;
+}
+
+export interface ExecutorModelCatalog {
+  provider: ExecutorModelCatalogProvider;
+  models: ExecutorModelCatalogModel[];
+  lastSuccessfulAt: string | null;
+}
+
 export async function listExecutors(agentId?: number): Promise<ExecutorVO[]> {
   const resp = await apiClient.get<ExecutorVO[]>(agentId ? `/api/agents/${agentId}/executors` : '/api/executors');
+  return resp.data;
+}
+
+export async function getExecutorModelCatalog(provider: ExecutorModelCatalogProvider): Promise<ExecutorModelCatalog> {
+  const resp = await apiClient.get<ExecutorModelCatalog>(`/api/executor-model-catalogs/${provider}`);
   return resp.data;
 }
 

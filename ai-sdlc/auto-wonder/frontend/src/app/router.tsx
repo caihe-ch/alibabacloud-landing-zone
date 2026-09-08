@@ -5,6 +5,7 @@ import { RouteGuard } from './RouteGuard';
 import { LoginPage } from '@/features/auth/LoginPage';
 import { RegisterPage } from '@/features/auth/RegisterPage';
 import { WorkspaceSelectPage } from '@/features/auth/WorkspaceSelectPage';
+import { WorkspaceRecycleBinPage } from '@/features/auth/WorkspaceRecycleBinPage';
 import { WorkitemListPage } from '@/features/workitem/WorkitemListPage';
 import { WorkitemCreatePage } from '@/features/workitem/WorkitemCreatePage';
 import { WorkitemDetailPage } from '@/features/workitem/WorkitemDetailPage';
@@ -60,6 +61,12 @@ export function createAppRoutes(): RouteObject[] {
     {
       path: '/workspaces/branding',
       element: <RouteGuard requireWorkspace={false}><BrandingConfigPage /></RouteGuard>,
+    },
+    {
+      // requireWorkspace is false on purpose: the user may have just deleted the workspace their
+      // token was bound to, and F5 says restore must not depend on that workspace at all.
+      path: '/workspaces/recycle-bin',
+      element: <RouteGuard requireWorkspace={false}><WorkspaceRecycleBinPage /></RouteGuard>,
     },
     {
       element: <RouteGuard requireWorkspace={false}><AppLayout /></RouteGuard>,

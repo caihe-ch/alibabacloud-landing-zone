@@ -15,11 +15,26 @@ class ExecutorRegistryTest {
 
         registry.updateRunningDispatches(10L, java.util.List.of(55L, 56L));
         registry.updateRunningDispatches(10L, java.util.List.of());
+        when(redis.get(ExecutorRegistry.runningDispatchesKey(10L))).thenReturn(java.util.List.of());
 
         verify(redis).set(ExecutorRegistry.runningDispatchesKey(10L),
                 (java.io.Serializable) java.util.List.of(55L, 56L), 60);
         verify(redis).set(ExecutorRegistry.runningDispatchesKey(10L),
                 (java.io.Serializable) java.util.List.of(), 60);
+        assertTrue(registry.hasNoReportedRunningDispatches(10L));
+    }
+
+    @Test
+    void missingRunningDispatchesClearsLeaseAndRemainsUnknown() {
+        RedisManager redis = mock(RedisManager.class);
+        ExecutorRegistry registry = new ExecutorRegistry(redis);
+        String key = ExecutorRegistry.runningDispatchesKey(10L);
+
+        registry.updateRunningDispatches(10L, null);
+
+        verify(redis).del(key);
+        verify(redis, never()).set(eq(key), any(), anyInt());
+        assertFalse(registry.hasNoReportedRunningDispatches(10L));
     }
 
     @Test
@@ -119,5 +134,22 @@ class ExecutorRegistryTest {
 
         assertFalse(registry.isAvailable(10L));
         verify(redis, never()).exists(ExecutorRegistry.onlineKey(10L));
+    }
+
+    @Test
+    void reportsNoRunningDispatchesOnlyForKnownEmptyCollection() {
+        RedisManager redis = mock(RedisManager.class);
+        ExecutorRegistry registry = new ExecutorRegistry(redis);
+        when(redis.get(ExecutorRegistry.runningDispatchesKey(1L))).thenReturn(java.util.List.of());
+        when(redis.get(ExecutorRegistry.runningDispatchesKey(2L))).thenReturn(null);
+        when(redis.get(ExecutorRegistry.runningDispatchesKey(3L))).thenReturn(java.util.List.of(99L));
+        when(redis.get(ExecutorRegistry.runningDispatchesKey(4L))).thenReturn("unknown");
+        when(redis.get(ExecutorRegistry.runningDispatchesKey(5L))).thenThrow(new RuntimeException("redis unavailable"));
+
+        assertTrue(registry.hasNoReportedRunningDispatches(1L));
+        assertFalse(registry.hasNoReportedRunningDispatches(2L));
+        assertFalse(registry.hasNoReportedRunningDispatches(3L));
+        assertFalse(registry.hasNoReportedRunningDispatches(4L));
+        assertFalse(registry.hasNoReportedRunningDispatches(5L));
     }
 }

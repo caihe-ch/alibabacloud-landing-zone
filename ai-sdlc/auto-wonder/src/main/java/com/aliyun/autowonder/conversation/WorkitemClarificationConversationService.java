@@ -3,6 +3,7 @@ package com.aliyun.autowonder.conversation;
 import com.aliyun.autowonder.agent.AgentDO;
 import com.aliyun.autowonder.agent.AgentDao;
 import com.aliyun.autowonder.conversation.dto.ClarificationConversationVO;
+import com.aliyun.autowonder.conversation.dto.ClarificationElicitationVO;
 import com.aliyun.autowonder.conversation.dto.ClarificationTurnVO;
 import com.aliyun.autowonder.dispatch.ExecutorSelector;
 import org.slf4j.Logger;
@@ -28,17 +29,20 @@ public class WorkitemClarificationConversationService {
     private final AgentDao agentDao;
     private final ExecutorSelector executorSelector;
     private final ConversationRuntimePresence runtimePresence;
+    private final ConversationElicitationService elicitationService;
 
     public WorkitemClarificationConversationService(AgentConversationDao convDao,
             AgentConversationTurnDao turnDao, AgentConversationService conversationService,
             AgentDao agentDao, ExecutorSelector executorSelector,
-            ConversationRuntimePresence runtimePresence) {
+            ConversationRuntimePresence runtimePresence,
+            ConversationElicitationService elicitationService) {
         this.convDao = convDao;
         this.turnDao = turnDao;
         this.conversationService = conversationService;
         this.agentDao = agentDao;
         this.executorSelector = executorSelector;
         this.runtimePresence = runtimePresence;
+        this.elicitationService = elicitationService;
     }
 
     public void verifyConversationBelongsToWorkitem(Long tenantId, Long workitemId, Long conversationId) {
@@ -85,7 +89,29 @@ public class WorkitemClarificationConversationService {
         if (processing == null) {
             processing = turnDao.findNextQueuedInbound(tenantId, conversationId);
         }
-        return toVO(conv, turnVOs, processing);
+        // 仅详情接口查挂起卡片：列表页不需要，逐会话查会白跑 N 次。
+        return toVO(conv, turnVOs, processing, pendingElicitationVOs(tenantId, conversationId));
+    }
+
+    private List<ClarificationElicitationVO> pendingElicitationVOs(Long tenantId, Long conversationId) {
+        return elicitationService.listPending(tenantId, conversationId).stream()
+                .map(record -> ClarificationElicitationVO.builder()
+                        .requestId(record.getRequestId())
+                        .turnId(record.getTurnId())
+                        .mode(record.getMode())
+                        .message(record.getMessage())
+                        .requestedSchema(record.getSchemaJson())
+                        .status(record.getStatus())
+                        .gmtCreate(record.getGmtCreate())
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    /** 提交问答卡片的回答。归属校验先于卡片操作，避免跨工单猜 conversationId。 */
+    public void replyElicitation(Long tenantId, Long workitemId, Long conversationId,
+            String requestId, String action, String content) {
+        verifyConversationBelongsToWorkitem(tenantId, workitemId, conversationId);
+        elicitationService.reply(tenantId, conversationId, requestId, action, content);
     }
 
     @Transactional
@@ -157,11 +183,11 @@ public class WorkitemClarificationConversationService {
     }
 
     private ClarificationConversationVO toVO(AgentConversationDO conv, List<ClarificationTurnVO> turns) {
-        return toVO(conv, turns, null);
+        return toVO(conv, turns, null, List.of());
     }
 
     private ClarificationConversationVO toVO(AgentConversationDO conv, List<ClarificationTurnVO> turns,
-            AgentConversationTurnDO processing) {
+            AgentConversationTurnDO processing, List<ClarificationElicitationVO> pendingElicitations) {
         boolean executorOnline = conv.getExecutorId() != null
                 && runtimePresence != null
                 && runtimePresence.isExecutorOnline(conv.getExecutorId());
@@ -171,6 +197,11 @@ public class WorkitemClarificationConversationService {
         boolean cancelSupported = executorOnline
                 && runtimePresence != null
                 && runtimePresence.supportsProtocolFeature(conv.getExecutorId(), "CONVERSATION_TURN_CANCEL");
+        // 离线时卡片提交必然失败（回答要下发帧），所以入口也不该亮出来。
+        // executorOnline 已蕴含 runtimePresence 非空，无需重复判空。
+        boolean acpInteractionSupported = executorOnline
+                && runtimePresence.supportsProtocolFeature(conv.getExecutorId(),
+                        "CONVERSATION_ACP_INTERACTION_V1");
         AgentDO agent = agentDao.findById(conv.getAgentId());
         return ClarificationConversationVO.builder()
                 .id(conv.getId())
@@ -181,12 +212,14 @@ public class WorkitemClarificationConversationService {
                 .executorOnline(executorOnline)
                 .streamingSupported(streamingSupported)
                 .cancelSupported(cancelSupported)
+                .acpInteractionSupported(acpInteractionSupported)
                 .cliSessionRef(conv.getCliSessionRef())
                 .processingStatus(processing != null ? processing.getStatus() : null)
                 .processingTurnId(processing != null ? processing.getId() : null)
                 .lastTurnAt(conv.getLastTurnAt())
                 .gmtCreate(conv.getGmtCreate())
                 .turns(turns)
+                .pendingElicitations(pendingElicitations)
                 .build();
     }
 }

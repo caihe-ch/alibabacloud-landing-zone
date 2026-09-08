@@ -7,6 +7,7 @@ import com.aliyun.autowonder.context.AutoWonderContext;
 import com.aliyun.autowonder.executor.dto.CreateExecutorRequest;
 import com.aliyun.autowonder.executor.dto.ExecutorVO;
 import com.aliyun.autowonder.executor.dto.IssuedExecutorVO;
+import com.aliyun.autowonder.executor.dto.ProviderModelCatalogVO;
 import com.aliyun.autowonder.access.WorkspaceAccessLevel;
 import com.aliyun.autowonder.access.RequireWorkspaceAccess;
 import org.springframework.web.bind.annotation.*;
@@ -19,9 +20,11 @@ import java.util.List;
 public class ExecutorController {
 
     private final ExecutorService executorService;
+    private final ProviderModelCatalogService providerModelCatalogService;
 
-    public ExecutorController(ExecutorService executorService) {
+    public ExecutorController(ExecutorService executorService, ProviderModelCatalogService providerModelCatalogService) {
         this.executorService = executorService;
+        this.providerModelCatalogService = providerModelCatalogService;
     }
 
     @PostMapping("/agents/{agentId}/executors")
@@ -39,6 +42,11 @@ public class ExecutorController {
     @GetMapping("/executors")
     public Result<List<ExecutorVO>> listAll() {
         return Result.ok(executorService.listAll(currentWorkspaceId()));
+    }
+
+    @GetMapping("/executor-model-catalogs/{provider}")
+    public Result<ProviderModelCatalogVO> getModelCatalog(@PathVariable String provider) {
+        return Result.ok(providerModelCatalogService.read(provider));
     }
 
     @GetMapping("/executors/{id}/token")

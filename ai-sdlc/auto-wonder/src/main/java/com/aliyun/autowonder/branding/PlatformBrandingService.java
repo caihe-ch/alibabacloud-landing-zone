@@ -49,7 +49,7 @@ public class PlatformBrandingService {
                                    ObjectStorage objectStorage,
                                    OssProperties ossProperties,
                                    @Value("${autowonder.public-base-url:}") String publicBaseUrl,
-                                   @Value("${autowonder.runtime.recommended-version:0.2.150}") String recommendedRuntimeVersion,
+                                   @Value("${autowonder.runtime.recommended-version:0.2.152}") String recommendedRuntimeVersion,
                                    @Value("${autowonder.version:x.x.x}") String deploymentVersion,
                                    @Value("${autowonder.community-edition:false}") boolean communityEdition) {
         this.brandingDao = brandingDao;

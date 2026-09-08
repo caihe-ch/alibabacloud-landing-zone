@@ -266,7 +266,8 @@ class V037CompatibilityMatrixTest {
         SqlSession session = node.session();
         AgentDao agents = session.getMapper(AgentDao.class);
         ScheduledTaskService service = new ScheduledTaskService(
-                session.getMapper(ScheduledTaskDao.class), session.getMapper(SquadDao.class),
+                session.getMapper(ScheduledTaskDao.class), session.getMapper(ScheduledTaskRunDao.class),
+                session.getMapper(SquadDao.class),
                 session.getMapper(SquadMemberDao.class), agents,
                 new AuditLogService(session.getMapper(AuditLogDao.class), null, agents),
                 new ScheduledTaskSchedule());

@@ -172,6 +172,32 @@ public class RequirementDocumentService {
         return result;
     }
 
+    /**
+     * Reads the stored bytes of a single requirement document for the CLI download endpoint.
+     * Applies the same live visibility checks as {@link #list(long, long)}; returns the original
+     * filename (without the {@code requirements/} prefix) and a best-effort content type.
+     */
+    public DocumentContent readDocument(long workitemId, long artifactId, long workspaceId) {
+        ArtifactOwnerRef owner = workitemOwner(workitemId);
+        ensureOwner(owner, workspaceId, false);
+        ArtifactDO artifact = findArtifact(owner, workspaceId, artifactId);
+        if (!isRequirementDocument(artifact, workspaceId, owner)) {
+            throw new BizException(ErrorCode.ARTIFACT_NOT_FOUND);
+        }
+        byte[] bytes = storage.get(artifact.getOssRef());
+        if (bytes == null) {
+            throw new BizException(ErrorCode.ARTIFACT_NOT_FOUND);
+        }
+        String filename = stripPrefix(artifact.getName());
+        return new DocumentContent(filename, bytes, fileTypeFor(filename).contentType());
+    }
+
+    private static String stripPrefix(String name) {
+        return name != null && name.startsWith(PREFIX) ? name.substring(PREFIX.length()) : name;
+    }
+
+    public record DocumentContent(String filename, byte[] bytes, String contentType) { }
+
     public synchronized void delete(long workitemId, long artifactId, long workspaceId, long userId) {
         delete(workitemOwner(workitemId), artifactId, workspaceId, userId);
     }

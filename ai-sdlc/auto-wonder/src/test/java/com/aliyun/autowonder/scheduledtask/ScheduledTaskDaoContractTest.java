@@ -77,6 +77,23 @@ class ScheduledTaskDaoContractTest {
     }
 
     @Test
+    void softDeleteHidesTheRowRetiresTheCursorAndKeepsTheCasGuard() throws Exception {
+        assertNotNull(ScheduledTaskDao.class.getMethod(
+                "softDelete", Long.class, Long.class, Integer.class, Long.class));
+
+        String delete = statement(mapper("ScheduledTaskDao.xml"), "softDelete");
+
+        assertWorkspaceAndLive(delete);
+        assertTrue(delete.contains("id = #{id}"));
+        assertTrue(delete.contains("is_deleted = 1"));
+        assertTrue(delete.contains("status = 'ARCHIVED'"));
+        assertTrue(delete.contains("next_fire_at = NULL"));
+        assertTrue(delete.contains("modifier_id = #{modifierId}"));
+        assertTrue(delete.contains("version = #{expectedVersion}"));
+        assertTrue(delete.contains("version = version + 1"));
+    }
+
+    @Test
     void dueScanAndClaimMatchTheDueIndexAndUseOptimisticCas() throws Exception {
         String xml = mapper("ScheduledTaskDao.xml");
         String due = statement(xml, "findDue");

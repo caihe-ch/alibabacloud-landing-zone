@@ -231,6 +231,55 @@ class AuditLogServiceTest {
         assertFalse(detailJson.contains("x".repeat(513)));
     }
 
+    @Test
+    void recordClampsOverlongColumnValues() {
+        AuditLogRecord record = new AuditLogRecord();
+        record.setTenantId(100L);
+        record.setActorId(7L);
+        record.setModule("M".repeat(100));
+        record.setAction("A".repeat(100));
+        record.setTargetType("T".repeat(100));
+
+        service.record(record);
+
+        AuditLogDO saved = capturedInsert();
+        assertEquals("M".repeat(64), saved.getModule());
+        assertEquals("A".repeat(64), saved.getAction());
+        assertEquals("T".repeat(64), saved.getTargetType());
+    }
+
+    @Test
+    void recordRequiredClampsOverlongAction() {
+        AuditLogRecord record = validRecord();
+        record.setAction("CREATE_" + "A".repeat(100));
+
+        service.recordRequired(record);
+
+        AuditLogDO saved = capturedInsert();
+        assertEquals(64, saved.getAction().length());
+        assertTrue(saved.getAction().startsWith("CREATE_"));
+    }
+
+    @Test
+    void recordKeepsValuesWithinColumnWidthUntouched() {
+        AuditLogRecord record = validRecord();
+        record.setAction("A".repeat(64));
+        record.setTargetType(null);
+
+        service.record(record);
+
+        AuditLogDO saved = capturedInsert();
+        assertEquals("A".repeat(64), saved.getAction());
+        assertEquals("ORG", saved.getModule());
+        assertNull(saved.getTargetType());
+    }
+
+    private AuditLogDO capturedInsert() {
+        ArgumentCaptor<AuditLogDO> captor = ArgumentCaptor.forClass(AuditLogDO.class);
+        verify(auditLogDao).insert(captor.capture());
+        return captor.getValue();
+    }
+
     private static AuditLogRecord validRecord() {
         AuditLogRecord record = new AuditLogRecord();
         record.setTenantId(100L);

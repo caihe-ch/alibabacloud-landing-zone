@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 @Service
@@ -92,6 +93,11 @@ public class AccessRequestService {
             } else {
                 item.setMembershipStatus(MEMBERSHIP_NOT_MEMBER);
             }
+            // F8: computed here so the list page renders edit/delete without a per-row permission
+            // call. Owner is org.owner_id (D8) — there is no OWNER access level to compare against.
+            boolean owner = Objects.equals(workspace.getOwnerId(), currentUserId);
+            item.setIsOwner(owner);
+            item.setCanManage(owner || WorkspaceAccessLevel.ADMIN.name().equals(memberLevel));
             items.add(item);
         }
         return new PageResult<>(items, total, page, size);

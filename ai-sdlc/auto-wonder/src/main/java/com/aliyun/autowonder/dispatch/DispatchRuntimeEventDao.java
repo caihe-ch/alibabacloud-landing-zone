@@ -15,6 +15,9 @@ public interface DispatchRuntimeEventDao {
     List<DispatchRuntimeEventDO> listByDispatch(@Param("tenantId") Long tenantId,
                                                 @Param("dispatchId") Long dispatchId);
 
+    List<DispatchRuntimeEventDO> listByDispatchInArrivalOrder(@Param("tenantId") Long tenantId,
+                                                               @Param("dispatchId") Long dispatchId);
+
     DispatchRuntimeEventDO findLatestByDispatchAndType(@Param("tenantId") Long tenantId,
                                                        @Param("dispatchId") Long dispatchId,
                                                        @Param("eventType") String eventType);

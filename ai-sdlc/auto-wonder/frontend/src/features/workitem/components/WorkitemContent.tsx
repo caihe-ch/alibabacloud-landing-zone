@@ -10,33 +10,34 @@ const { TextArea } = Input;
 
 interface WorkitemContentProps {
   title: string;
-  contentMd: string;
+  contentMd: string | null;
   saving?: boolean;
   readOnly?: boolean;
   onSave?: (values: { title: string; contentMd: string }) => Promise<void> | void;
 }
 
 export function WorkitemContent({ title, contentMd, saving = false, readOnly = false, onSave }: WorkitemContentProps) {
+  const safeContentMd = contentMd ?? '';
   const accessCommand = useAccessCommand();
   const [editing, setEditing] = useState(false);
   const [draftTitle, setDraftTitle] = useState(title);
-  const [draftContent, setDraftContent] = useState(contentMd);
+  const [draftContent, setDraftContent] = useState(safeContentMd);
 
   useEffect(() => {
     if (!editing) {
       setDraftTitle(title);
-      setDraftContent(contentMd);
+      setDraftContent(safeContentMd);
     }
-  }, [contentMd, editing, title]);
+  }, [safeContentMd, editing, title]);
 
   const canSave = useMemo(() => {
     return Boolean(draftTitle.trim())
-      && (draftTitle.trim() !== title || draftContent !== contentMd);
-  }, [contentMd, draftContent, draftTitle, title]);
+      && (draftTitle.trim() !== title || draftContent !== safeContentMd);
+  }, [safeContentMd, draftContent, draftTitle, title]);
 
   const handleCancel = () => {
     setDraftTitle(title);
-    setDraftContent(contentMd);
+    setDraftContent(safeContentMd);
     setEditing(false);
   };
 
@@ -69,7 +70,7 @@ export function WorkitemContent({ title, contentMd, saving = false, readOnly = f
           <Text type="secondary">由外部工单维护</Text>
         ) : editing ? (
           <Space>
-            <CopyContentMenu contentMd={contentMd} />
+            <CopyContentMenu contentMd={safeContentMd} />
             <Button icon={<CloseOutlined />} onClick={handleCancel} disabled={saving}>
               取消
             </Button>
@@ -85,7 +86,7 @@ export function WorkitemContent({ title, contentMd, saving = false, readOnly = f
           </Space>
         ) : (
           <Space size={4}>
-            <CopyContentMenu contentMd={contentMd} />
+            <CopyContentMenu contentMd={safeContentMd} />
             <Button icon={<EditOutlined />}
               onClick={() => accessCommand('READ_WRITE', '编辑工单内容', () => setEditing(true))}>
               编辑
@@ -111,7 +112,7 @@ export function WorkitemContent({ title, contentMd, saving = false, readOnly = f
           />
         </Space>
       ) : (
-        <MarkdownView content={contentMd} />
+        <MarkdownView content={safeContentMd} />
       )}
     </div>
   );

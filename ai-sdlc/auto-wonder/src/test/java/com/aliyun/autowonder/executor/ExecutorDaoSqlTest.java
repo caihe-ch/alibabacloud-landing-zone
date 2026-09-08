@@ -38,4 +38,18 @@ class ExecutorDaoSqlTest {
         assertTrue(xml.contains("is_deleted = 0"),
                 "updateLastHeartbeat must filter by is_deleted = 0");
     }
+
+    @Test
+    void listByClientKindOrdersNewestHeartbeatFirst() throws Exception {
+        String xml = Files.readString(MAPPER_XML);
+
+        assertTrue(xml.contains("id=\"listByClientKind\""),
+                "mapper must contain listByClientKind statement");
+        assertTrue(xml.contains("client_kind = #{clientKind}"),
+                "candidate query must filter by client kind");
+        assertTrue(xml.contains("WHERE client_kind = #{clientKind} AND is_deleted = 0"),
+                "candidate query must exclude deleted executors");
+        assertTrue(xml.contains("ORDER BY last_heartbeat DESC, id ASC"),
+                "candidate query must prefer newest heartbeats deterministically");
+    }
 }

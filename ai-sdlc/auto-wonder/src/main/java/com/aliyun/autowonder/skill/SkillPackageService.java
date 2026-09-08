@@ -2,6 +2,9 @@ package com.aliyun.autowonder.skill;
 
 import com.aliyun.autowonder.common.error.BizException;
 import com.aliyun.autowonder.common.error.ErrorCode;
+import com.aliyun.autowonder.skill.dto.SkillPackageFileContentVO;
+import com.aliyun.autowonder.skill.dto.SkillPackageFileVO;
+import com.aliyun.autowonder.skill.dto.SkillPackageFilesVO;
 import com.aliyun.autowonder.skill.dto.SkillPackageInspectVO;
 import com.aliyun.autowonder.skill.dto.SkillVO;
 import com.aliyun.autowonder.storage.ObjectStorage;
@@ -15,10 +18,18 @@ import org.yaml.snakeyaml.Yaml;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +53,24 @@ public class SkillPackageService {
             "beforeRepoPrepare", "afterRepoPrepare", "beforeAgentStart", "afterAgentExit",
             "beforeStep", "afterStep", "beforeTool", "afterTool",
             "beforeCommit", "beforePush", "onFailure", "cleanup");
+
+    static final String KIND_DIR = "DIR";
+    static final String KIND_TEXT = "TEXT";
+    static final String KIND_IMAGE = "IMAGE";
+    static final String KIND_BINARY = "BINARY";
+    static final String FORMAT_ZIP = "zip";
+    static final String FORMAT_TAR_GZ = "tar.gz";
+    private static final int SNIFF_LIMIT = 8192;
+    private static final Set<String> IMAGE_EXTENSIONS = Set.of(
+            "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp");
+    private static final Set<String> TEXT_EXTENSIONS = Set.of(
+            "md", "markdown", "mdx", "txt", "text", "log",
+            "yaml", "yml", "json", "toml", "ini", "cfg", "conf", "properties", "env",
+            "xml", "html", "htm", "css", "scss", "less", "csv", "tsv",
+            "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte",
+            "py", "rb", "sh", "bash", "zsh", "fish", "bat", "ps1",
+            "java", "kt", "go", "rs", "c", "h", "cpp", "hpp", "cs", "php", "swift", "scala",
+            "sql", "graphql", "proto", "gitignore", "gitattributes", "editorconfig");
 
     private final SkillDao skillDao;
     private final SkillService skillService;
@@ -133,6 +162,392 @@ public class SkillPackageService {
         return updatePackage(id, file, null, null, null, tenantId, userId);
     }
 
+    /**
+     * 只读列出技能包内条目清单（隐式目录自动补齐）。实时从对象存储取回整包并流式解析，
+     * 不落盘、不写库、不加缓存，因此本能力上线前上传的存量技能同样可查。
+     *
+     * 不复用 parse()/parseByType()：那条路径强制要求根 SKILL.md，PLUGIN 与 HOOK 包并不满足。
+     * 这里只复用底层的 zip / tar.gz 迭代与上传侧同一套资源防护。
+     */
+    public SkillPackageFilesVO listPackageFiles(SkillVO skill) {
+        PackageRef ref = packageRef(skill);
+        List<SkillPackageFileVO> files = ".tar.gz".equals(ref.suffix())
+                ? listTarGzEntries(ref.bytes())
+                : listZipEntries(ref.bytes());
+        return new SkillPackageFilesVO(files, format(ref.suffix()));
+    }
+
+    /** 只读读取包内单个文本文件的完整内容；单次只展开被命中的那个条目，其余条目跳过不解压。 */
+    public SkillPackageFileContentVO readPackageFile(SkillVO skill, String path) {
+        // 先校验路径再回源：非法路径不应触发任何 OSS 读取
+        String target = normalizeRequestedPath(path);
+        PackageRef ref = packageRef(skill);
+        byte[] content = ".tar.gz".equals(ref.suffix())
+                ? readTarGzEntry(ref.bytes(), target)
+                : readZipEntry(ref.bytes(), target);
+        if (content == null) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "包内不存在该文件: " + target);
+        }
+        if (!KIND_TEXT.equals(resolveKind(target, sniffWindow(content)))) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "该文件不支持在线预览");
+        }
+        return new SkillPackageFileContentVO(target, entryName(target), decodeUtf8(content));
+    }
+
+    /** 取回原始技能包字节，供下载端点按原格式（zip / tar.gz）下发。 */
+    public PackageDownload loadPackage(SkillVO skill) {
+        PackageRef ref = packageRef(skill);
+        return new PackageDownload(ref.fileName(), format(ref.suffix()), ref.bytes());
+    }
+
+    private PackageRef packageRef(SkillVO skill) {
+        if (skill == null || !SOURCE_TYPE_OSS_ZIP.equals(skill.getSourceType())
+                || skill.getPackageOssRef() == null || skill.getPackageOssRef().isBlank()) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "该技能无上传包");
+        }
+        String ossRef = skill.getPackageOssRef().trim();
+        byte[] bytes = storage.get(ossRef);
+        if (bytes == null || bytes.length == 0 || bytes.length > MAX_PACKAGE_SIZE) {
+            throw invalid();
+        }
+        String fileName = skill.getPackageFileName() == null || skill.getPackageFileName().isBlank()
+                ? fileNameFromRef(ossRef) : skill.getPackageFileName().trim();
+        return new PackageRef(ossRef, fileName, resolveSuffix(fileName, bytes), bytes);
+    }
+
+    private List<SkillPackageFileVO> listZipEntries(byte[] bytes) {
+        List<SkillPackageFileVO> files = new ArrayList<>();
+        Set<String> listed = new LinkedHashSet<>();
+        int entries = 0;
+        long inflatedSize = 0;
+        byte[] buffer = new byte[8192];
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(bytes))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (++entries > MAX_ENTRIES) {
+                    throw tooManyEntries();
+                }
+                validateEntryName(entry.getName());
+                String path = normalizeEntryPath(entry.getName());
+                if (path.isEmpty()) {
+                    continue;
+                }
+                if (entry.isDirectory()) {
+                    addDirectory(files, listed, path);
+                    continue;
+                }
+                boolean sniff = kindByExtension(path) == null;
+                byte[] head = null;
+                long size = 0;
+                int read;
+                while ((read = zis.read(buffer)) >= 0) {
+                    if (sniff && size < SNIFF_LIMIT) {
+                        head = concat(head, buffer, (int) Math.min(read, SNIFF_LIMIT - size));
+                    }
+                    size += read;
+                    inflatedSize += read;
+                    if (inflatedSize > MAX_PACKAGE_SIZE) {
+                        throw tooLarge();
+                    }
+                }
+                addDirectory(files, listed, parentPath(path));
+                files.add(new SkillPackageFileVO(path, entryName(path), false, size, resolveKind(path, head)));
+                listed.add(path);
+            }
+        } catch (IOException e) {
+            throw invalid();
+        }
+        return files;
+    }
+
+    private List<SkillPackageFileVO> listTarGzEntries(byte[] bytes) {
+        List<SkillPackageFileVO> files = new ArrayList<>();
+        Set<String> listed = new LinkedHashSet<>();
+        int entries = 0;
+        long inflatedSize = 0;
+        try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(bytes))) {
+            byte[] header = new byte[512];
+            while (readFully(gis, header) == 512) {
+                if (isZeroBlock(header)) {
+                    break;
+                }
+                if (++entries > MAX_ENTRIES) {
+                    throw tooManyEntries();
+                }
+                String raw = tarString(header, 0, 100);
+                long size = tarSize(header);
+                char type = (char) header[156];
+                validateEntryName(raw);
+                if (type == '2') {
+                    throw invalid();
+                }
+                String path = normalizeEntryPath(raw);
+                byte[] head = null;
+                if (type != '5') {
+                    if (size < 0) {
+                        throw invalid();
+                    }
+                    inflatedSize += size;
+                    if (inflatedSize > MAX_PACKAGE_SIZE) {
+                        throw tooLarge();
+                    }
+                    if (!path.isEmpty() && kindByExtension(path) == null) {
+                        head = gis.readNBytes((int) Math.min(size, SNIFF_LIMIT));
+                        skipFully(gis, size - head.length);
+                    } else {
+                        skipFully(gis, size);
+                    }
+                    skipFully(gis, tarPadding(size));
+                }
+                // 名字规范化后为空的条目仍须先消费完 payload 再丢弃，否则 512 字节头会错位
+                if (path.isEmpty()) {
+                    continue;
+                }
+                if (type == '5') {
+                    addDirectory(files, listed, path);
+                    continue;
+                }
+                addDirectory(files, listed, parentPath(path));
+                files.add(new SkillPackageFileVO(path, entryName(path), false, size, resolveKind(path, head)));
+                listed.add(path);
+            }
+        } catch (IOException | ArithmeticException e) {
+            throw invalid();
+        }
+        return files;
+    }
+
+    private byte[] readZipEntry(byte[] bytes, String targetPath) {
+        int entries = 0;
+        long inflatedSize = 0;
+        byte[] buffer = new byte[8192];
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(bytes))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (++entries > MAX_ENTRIES) {
+                    throw tooManyEntries();
+                }
+                validateEntryName(entry.getName());
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                if (normalizeEntryPath(entry.getName()).equals(targetPath)) {
+                    byte[] content = readEntryBytes(zis);
+                    if (inflatedSize + content.length > MAX_PACKAGE_SIZE) {
+                        throw tooLarge();
+                    }
+                    return content;
+                }
+                // 跳过的条目也要累加解压量：单条目上限之外还需与清单路径同款的全局防线
+                int read;
+                while ((read = zis.read(buffer)) >= 0) {
+                    inflatedSize += read;
+                    if (inflatedSize > MAX_PACKAGE_SIZE) {
+                        throw tooLarge();
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw invalid();
+        }
+        return null;
+    }
+
+    private byte[] readTarGzEntry(byte[] bytes, String targetPath) {
+        int entries = 0;
+        long inflatedSize = 0;
+        try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(bytes))) {
+            byte[] header = new byte[512];
+            while (readFully(gis, header) == 512) {
+                if (isZeroBlock(header)) {
+                    break;
+                }
+                if (++entries > MAX_ENTRIES) {
+                    throw tooManyEntries();
+                }
+                String raw = tarString(header, 0, 100);
+                long size = tarSize(header);
+                char type = (char) header[156];
+                validateEntryName(raw);
+                if (type == '2') {
+                    throw invalid();
+                }
+                if (type == '5') {
+                    continue;
+                }
+                if (size < 0 || size > MAX_PACKAGE_SIZE) {
+                    throw invalid();
+                }
+                // tar 头已声明 size，跳过的条目同样计入全局解压总量
+                inflatedSize += size;
+                if (inflatedSize > MAX_PACKAGE_SIZE) {
+                    throw tooLarge();
+                }
+                if (normalizeEntryPath(raw).equals(targetPath)) {
+                    byte[] content = gis.readNBytes(Math.toIntExact(size));
+                    if (content.length != size) {
+                        throw invalid();
+                    }
+                    return content;
+                }
+                skipFully(gis, size);
+                skipFully(gis, tarPadding(size));
+            }
+        } catch (IOException | ArithmeticException e) {
+            throw invalid();
+        }
+        return null;
+    }
+
+    static void addDirectory(List<SkillPackageFileVO> files, Set<String> listed, String dirPath) {
+        if (dirPath == null || dirPath.isEmpty()) {
+            return;
+        }
+        List<String> missing = new ArrayList<>();
+        String current = dirPath;
+        while (!current.isEmpty() && listed.add(current)) {
+            missing.add(current);
+            current = parentPath(current);
+        }
+        Collections.reverse(missing);
+        for (String path : missing) {
+            files.add(new SkillPackageFileVO(path, entryName(path), true, 0L, KIND_DIR));
+        }
+    }
+
+    private static String parentPath(String path) {
+        int index = path.lastIndexOf('/');
+        return index < 0 ? "" : path.substring(0, index);
+    }
+
+    private static String entryName(String path) {
+        int index = path.lastIndexOf('/');
+        return index < 0 ? path : path.substring(index + 1);
+    }
+
+    private static String normalizeEntryPath(String name) {
+        String path = name.trim();
+        while (path.startsWith("./")) {
+            path = path.substring(2);
+        }
+        while (path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1);
+        }
+        return path;
+    }
+
+    /** 路径双闸门第一道：先过与上传校验同款的条目名规则，拒绝 ..、绝对路径与反斜杠。 */
+    private static String normalizeRequestedPath(String path) {
+        validateEntryName(path);
+        String normalized = normalizeEntryPath(path);
+        if (normalized.isEmpty()) {
+            throw invalid();
+        }
+        return normalized;
+    }
+
+    static String resolveKind(String path, byte[] head) {
+        String byExtension = kindByExtension(path);
+        return byExtension != null ? byExtension : (looksTextual(head) ? KIND_TEXT : KIND_BINARY);
+    }
+
+    private static String kindByExtension(String path) {
+        String extension = extension(path);
+        if (extension.isEmpty()) {
+            return null;
+        }
+        if (IMAGE_EXTENSIONS.contains(extension)) {
+            return KIND_IMAGE;
+        }
+        return TEXT_EXTENSIONS.contains(extension) ? KIND_TEXT : null;
+    }
+
+    private static String extension(String path) {
+        String name = entryName(path).toLowerCase(Locale.ROOT);
+        int index = name.lastIndexOf('.');
+        if (index < 0) {
+            return "";
+        }
+        // 点文件（如 .gitignore）没有"主名.扩展名"结构，去掉前导点后整体即标识
+        return index == 0 ? name.substring(1) : name.substring(index + 1);
+    }
+
+    /** 嗅探窗口封顶：分类只读前 SNIFF_LIMIT 字节，避免大文件被整段扫描或分配等长 CharBuffer。 */
+    private static byte[] sniffWindow(byte[] content) {
+        if (content.length <= SNIFF_LIMIT) {
+            return content;
+        }
+        return Arrays.copyOf(content, SNIFF_LIMIT);
+    }
+
+    private static boolean looksTextual(byte[] head) {
+        if (head == null || head.length == 0) {
+            return true;
+        }
+        for (byte value : head) {
+            int unsigned = value & 0xff;
+            if (unsigned == 0) {
+                return false;
+            }
+            if (unsigned < 0x09 || (unsigned > 0x0d && unsigned < 0x20 && unsigned != 0x1b)) {
+                return false;
+            }
+        }
+        return decodableAsUtf8(head);
+    }
+
+    private static boolean decodableAsUtf8(byte[] head) {
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        // endOfInput=false：嗅探窗口可能截断多字节字符，末尾不完整序列返回 UNDERFLOW 而非错误。
+        // REPORT 动作下非法序列通过返回值上报，不会抛异常，必须检查 CoderResult。
+        return !decoder.decode(ByteBuffer.wrap(head), CharBuffer.allocate(head.length + 1), false).isError();
+    }
+
+    /** 非法字节由 String 构造器替换为 U+FFFD，满足"不导致接口失败"。 */
+    private static String decodeUtf8(byte[] content) {
+        return new String(content, StandardCharsets.UTF_8);
+    }
+
+    private static String format(String suffix) {
+        return ".tar.gz".equals(suffix) ? FORMAT_TAR_GZ : FORMAT_ZIP;
+    }
+
+    private static String resolveSuffix(String fileName, byte[] bytes) {
+        if (fileName != null && !fileName.isBlank()) {
+            String normalized = fileName.trim().toLowerCase(Locale.ROOT);
+            if (normalized.endsWith(".tar.gz")) {
+                return ".tar.gz";
+            }
+            if (normalized.endsWith(".zip")) {
+                return ".zip";
+            }
+        }
+        // 存量行的 packageFileName 可能缺失或后缀异常，退回魔数探测
+        return isGzip(bytes) ? ".tar.gz" : ".zip";
+    }
+
+    private static boolean isGzip(byte[] bytes) {
+        return bytes.length >= 2 && (bytes[0] & 0xff) == 0x1f && (bytes[1] & 0xff) == 0x8b;
+    }
+
+    private static byte[] concat(byte[] head, byte[] buffer, int length) {
+        byte[] existing = head == null ? new byte[0] : head;
+        byte[] merged = new byte[existing.length + length];
+        System.arraycopy(existing, 0, merged, 0, existing.length);
+        System.arraycopy(buffer, 0, merged, existing.length, length);
+        return merged;
+    }
+
+    private static BizException tooManyEntries() {
+        return new BizException(ErrorCode.PARAM_INVALID, "技能包条目数超过上限 " + MAX_ENTRIES);
+    }
+
+    private static BizException tooLarge() {
+        return new BizException(ErrorCode.PARAM_INVALID, "技能包解压后大小超过上限 100MB");
+    }
+
     private SkillVO createFromPackageBytes(String fileName, byte[] bytes, String type, String name, String description,
                                            List<String> providers, long tenantId, long userId,
                                            String idempotencyKey) {
@@ -147,6 +562,7 @@ public class SkillPackageService {
             }
             throw new BizException(ErrorCode.SKILL_DUPLICATE_NAME);
         }
+        skillDao.releaseSoftDeletedName(tenantId, normalizedType, parsed.name);
         SkillDO skill = new SkillDO();
         skill.setTenantId(tenantId);
         skill.setType(normalizedType);
@@ -179,6 +595,7 @@ public class SkillPackageService {
         if (duplicate != null && !duplicate.getId().equals(id)) {
             throw new BizException(ErrorCode.SKILL_DUPLICATE_NAME);
         }
+        skillDao.releaseSoftDeletedName(tenantId, type, parsed.name);
         StoredObject stored = putPackage(tenantId, id, parsed.bytes);
         updatePackageRecord(id, tenantId, type, providers, parsed, stored, existing.getVersion(), userId);
         return skillService.get(id);
@@ -648,6 +1065,13 @@ public class SkillPackageService {
     }
 
     private record HookMetadata(String name, String trigger) {
+    }
+
+    /** 读路径的入参解析结果：一次 OSS 拉取，列目录/读文件/下载三处共用，避免重复回源。 */
+    private record PackageRef(String ossRef, String fileName, String suffix, byte[] bytes) {
+    }
+
+    public record PackageDownload(String fileName, String format, byte[] bytes) {
     }
 
     private static class ByteArrayOutputStreamWithLimit extends java.io.ByteArrayOutputStream {

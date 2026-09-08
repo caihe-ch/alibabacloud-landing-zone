@@ -1,5 +1,6 @@
 package com.aliyun.autowonder.workspace;
 
+import com.aliyun.autowonder.access.SystemAdminService;
 import com.aliyun.autowonder.access.WorkspaceAccessLevel;
 import com.aliyun.autowonder.audit.AuditLogRecord;
 import com.aliyun.autowonder.audit.AuditLogService;
@@ -7,22 +8,33 @@ import com.aliyun.autowonder.auth.jwt.JwtService;
 import com.aliyun.autowonder.auth.jwt.TokenPayload;
 import com.aliyun.autowonder.common.error.BizException;
 import com.aliyun.autowonder.common.error.ErrorCode;
+import com.aliyun.autowonder.common.result.PageResult;
 import com.aliyun.autowonder.context.AutoWonderContext;
 import com.aliyun.autowonder.workspace.dto.CreateWorkspaceRequest;
 import com.aliyun.autowonder.workspace.dto.CurrentMembershipVO;
 import com.aliyun.autowonder.workspace.dto.MemberCandidateVO;
 import com.aliyun.autowonder.workspace.dto.MemberVO;
+import com.aliyun.autowonder.workspace.dto.RecycleBinItemVO;
+import com.aliyun.autowonder.workspace.dto.RestoreWorkspaceRequest;
+import com.aliyun.autowonder.workspace.dto.WorkspaceUpdateRequest;
 import com.aliyun.autowonder.workspace.dto.WorkspaceVO;
 import com.aliyun.autowonder.workspace.dto.SwitchWorkspaceResponse;
+import com.aliyun.autowonder.workspace.event.WorkspaceDeletedEvent;
 import com.aliyun.autowonder.statemachine.StatusTemplateSeeder;
 import com.aliyun.autowonder.user.UserDO;
 import com.aliyun.autowonder.user.UserDao;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
@@ -31,42 +43,67 @@ public class WorkspaceService {
     private static final String AUDIT_ACTOR_HUMAN = "HUMAN";
     private static final String AUDIT_MODULE_ORG = "ORG";
 
+    /** org.name is VARCHAR(128); rejecting longer input beats a database truncation error. */
+    private static final int NAME_MAX_LENGTH = 128;
+    /** org.description is VARCHAR(512). */
+    private static final int DESCRIPTION_MAX_LENGTH = 512;
+    private static final int RECYCLE_BIN_MAX_PAGE_SIZE = 100;
+
     private final WorkspaceDao workspaceDao;
     private final WorkspaceMemberDao workspaceMemberDao;
     private final StatusTemplateSeeder statusTemplateSeeder;
     private final JwtService jwtService;
     private final UserDao userDao;
     private final AuditLogService auditLogService;
+    private final SystemAdminService systemAdminService;
+    private final WorkspaceDeletionLinkage deletionLinkage;
+    private final ApplicationEventPublisher eventPublisher;
 
     public WorkspaceService(WorkspaceDao workspaceDao, WorkspaceMemberDao workspaceMemberDao,
                       StatusTemplateSeeder statusTemplateSeeder, JwtService jwtService,
-                      UserDao userDao, AuditLogService auditLogService) {
+                      UserDao userDao, AuditLogService auditLogService,
+                      SystemAdminService systemAdminService,
+                      WorkspaceDeletionLinkage deletionLinkage,
+                      ApplicationEventPublisher eventPublisher) {
         this.workspaceDao = workspaceDao;
         this.workspaceMemberDao = workspaceMemberDao;
         this.statusTemplateSeeder = statusTemplateSeeder;
         this.jwtService = jwtService;
         this.userDao = userDao;
         this.auditLogService = auditLogService;
+        this.systemAdminService = systemAdminService;
+        this.deletionLinkage = deletionLinkage;
+        this.eventPublisher = eventPublisher;
     }
 
     @Transactional
     public WorkspaceVO create(CreateWorkspaceRequest req, long ownerUserId) {
-        if (req == null || req.getName() == null || req.getName().isBlank()) {
+        if (req == null) {
             throw new BizException(ErrorCode.WORKSPACE_NAME_REQUIRED);
         }
-        String trimmedName = req.getName().trim();
+        String trimmedName = requireName(req.getName());
         if (workspaceDao.findByName(trimmedName) != null) {
             throw new BizException(ErrorCode.WORKSPACE_NAME_DUPLICATE);
         }
 
         WorkspaceDO workspace = new WorkspaceDO();
         workspace.setName(trimmedName);
-        workspace.setDescription(req.getDescription());
-        workspace.setBackground(req.getBackground());
+        // D2: the unique key is active_name_key, not name, so a row written without it would never
+        // collide and two workspaces could share a name.
+        workspace.setActiveNameKey(trimmedName);
+        workspace.setDescription(normalizeDescription(req.getDescription()));
+        workspace.setBackground(normalizeBackground(req.getBackground()));
         workspace.setOwnerId(ownerUserId);
         workspace.setStatus(0);
         workspace.setCreatorId(ownerUserId);
-        workspaceDao.insert(workspace);
+        workspace.setVersion(0);
+        try {
+            workspaceDao.insert(workspace);
+        } catch (DuplicateKeyException race) {
+            // Two concurrent creates of the same name: uk_active_name lets exactly one through and
+            // the loser surfaces the same business error the pre-check would have.
+            throw new BizException(ErrorCode.WORKSPACE_NAME_DUPLICATE);
+        }
 
         WorkspaceMemberDO owner = new WorkspaceMemberDO();
         owner.setTenantId(workspace.getId());
@@ -79,17 +116,32 @@ public class WorkspaceService {
 
         statusTemplateSeeder.seed(workspace.getId(), ownerUserId);
 
-        WorkspaceVO result = new WorkspaceVO();
-        result.setId(workspace.getId());
-        result.setName(workspace.getName());
-        result.setDescription(workspace.getDescription());
+        WorkspaceVO result = toVO(workspace);
+        result.setAccessLevel(WorkspaceAccessLevel.ADMIN);
+        result.setIsOwner(true);
+        result.setCanManage(true);
         return result;
     }
 
     public List<WorkspaceVO> listByUser(long userId) {
+        // Levels come from one bulk membership read rather than a per-card query: the card renders
+        // its edit/delete entries from canManage, and the edit modal needs version + background,
+        // which only the full org row carries.
+        Map<Long, String> levelByWorkspaceId = new HashMap<>();
+        for (WorkspaceMembershipDO membership : workspaceDao.listMembershipsByUser(userId)) {
+            levelByWorkspaceId.put(membership.getId(), membership.getAccessLevel());
+        }
         List<WorkspaceVO> result = new ArrayList<>();
         for (WorkspaceDO workspace : workspaceDao.listByUser(userId)) {
-            result.add(toVO(workspace));
+            WorkspaceVO value = toVO(workspace);
+            WorkspaceAccessLevel accessLevel =
+                    exactAccessLevel(levelByWorkspaceId.get(workspace.getId()));
+            value.setAccessLevel(accessLevel);
+            // D8: ownership is org.owner_id — there is no OWNER access level to compare against.
+            boolean owner = Objects.equals(workspace.getOwnerId(), userId);
+            value.setIsOwner(owner);
+            value.setCanManage(owner || accessLevel == WorkspaceAccessLevel.ADMIN);
+            result.add(value);
         }
         return result;
     }
@@ -101,7 +153,13 @@ public class WorkspaceService {
             value.setId(membership.getId());
             value.setName(membership.getName());
             value.setDescription(membership.getDescription());
-            value.setAccessLevel(exactAccessLevel(membership.getAccessLevel()));
+            WorkspaceAccessLevel accessLevel = exactAccessLevel(membership.getAccessLevel());
+            value.setAccessLevel(accessLevel);
+            // F8: the card renders edit/delete from these two flags, computed from the same single
+            // join, so no per-card permission round trip is needed.
+            boolean owner = Objects.equals(membership.getOwnerId(), userId);
+            value.setIsOwner(owner);
+            value.setCanManage(owner || accessLevel == WorkspaceAccessLevel.ADMIN);
             result.add(value);
         }
         return result;
@@ -132,6 +190,8 @@ public class WorkspaceService {
         value.setId(workspace.getId());
         value.setName(workspace.getName());
         value.setDescription(workspace.getDescription());
+        value.setBackground(workspace.getBackground());
+        value.setVersion(workspace.getVersion());
         return value;
     }
 
@@ -338,6 +398,270 @@ public class WorkspaceService {
                 .detail("operatorId", operatorId)
                 .detail("targetUserId", targetUserId);
         auditLogService.recordRequired(audit);
+    }
+
+    /** F1: edit name/description/background under an optimistic lock. Owner or ADMIN only. */
+    @Transactional
+    public WorkspaceVO updateWorkspace(long workspaceId, WorkspaceUpdateRequest req, long operatorId) {
+        if (req == null) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "请求体不能为空");
+        }
+        if (req.getVersion() == null) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "version 不能为空");
+        }
+        WorkspaceDO workspace = requireManageableWorkspace(workspaceId, operatorId);
+        String name = requireName(req.getName());
+        String description = normalizeDescription(req.getDescription());
+        String background = normalizeBackground(req.getBackground());
+        // excludeId is this row, so saving an untouched name is not reported as a duplicate.
+        if (workspaceDao.countActiveByName(name, workspaceId) > 0) {
+            throw new BizException(ErrorCode.WORKSPACE_NAME_DUPLICATE);
+        }
+        int updated = workspaceDao.updateDetail(workspaceId, name, name, description, background,
+                req.getVersion(), operatorId);
+        if (updated != 1) {
+            // The row was locked above, so a miss means the client's version went stale: somebody
+            // else saved between the modal opening and this submit.
+            throw new BizException(ErrorCode.ORG_VERSION_CONFLICT);
+        }
+
+        AuditLogRecord audit = audit(workspaceId, operatorId, "ORG_UPDATED", "ORG", workspaceId);
+        audit.detail("oldName", workspace.getName())
+                .detail("newName", name)
+                .detail("operatorId", operatorId);
+        auditLogService.recordRequired(audit);
+
+        WorkspaceVO result = toVO(workspace);
+        result.setName(name);
+        result.setDescription(description);
+        result.setBackground(background);
+        result.setVersion(req.getVersion() + 1);
+        applyManageFlags(result, workspace, operatorId);
+        return result;
+    }
+
+    /**
+     * F2: logical delete. Members and business data are kept, the name is released in the same
+     * statement, and ACTIVE scheduled tasks are paused inside this transaction (D5). The dispatch
+     * half is published as an event because it calls remote executors, which must not happen while
+     * row locks are held.
+     */
+    @Transactional
+    public WorkspaceVO deleteWorkspace(long workspaceId, long operatorId) {
+        WorkspaceDO workspace = requireManageableWorkspace(workspaceId, operatorId);
+        int deleted = workspaceDao.softDelete(workspaceId, operatorId);
+        if (deleted != 1) {
+            throw new BizException(ErrorCode.CONFLICT, "工作空间已被删除");
+        }
+        int pausedTasks = deletionLinkage.pauseScheduledTasks(workspaceId, operatorId);
+
+        AuditLogRecord audit = audit(workspaceId, operatorId, "ORG_DELETED", "ORG", workspaceId);
+        audit.detail("name", workspace.getName())
+                .detail("operatorId", operatorId)
+                // scheduled_task has no reason column, so the mandated pause reason is kept here.
+                .detail("reason", WorkspaceDeletionLinkage.DELETION_REASON)
+                .detail("pausedScheduledTasks", pausedTasks);
+        auditLogService.recordRequired(audit);
+
+        eventPublisher.publishEvent(
+                new WorkspaceDeletedEvent(workspaceId, workspace.getName(), operatorId));
+
+        WorkspaceVO result = toVO(workspace);
+        applyManageFlags(result, workspace, operatorId);
+        return result;
+    }
+
+    /**
+     * F4: recycle bin. Visibility — original Owner, original effective ADMIN, or platform admin —
+     * is decided entirely in SQL, because filtering in memory after the query would both leak the
+     * existence of ids the caller may not see and desynchronize the page from its total.
+     */
+    public PageResult<RecycleBinItemVO> pageRecycleBin(String keyword, int page, int size, long operatorId) {
+        int normalizedPage = Math.max(page, 1);
+        int normalizedSize = Math.min(Math.max(size, 1), RECYCLE_BIN_MAX_PAGE_SIZE);
+        String normalizedKeyword = keyword == null || keyword.isBlank() ? null : keyword.trim();
+        boolean systemAdmin = systemAdminService.isSystemAdmin(operatorId);
+        int offset = (normalizedPage - 1) * normalizedSize;
+
+        List<WorkspaceDO> rows = workspaceDao.pageRecycleBin(
+                operatorId, systemAdmin, normalizedKeyword, offset, normalizedSize);
+        long total = workspaceDao.countRecycleBin(operatorId, systemAdmin, normalizedKeyword);
+
+        Set<String> takenNames = takenActiveNames(rows);
+        Map<Long, String> userNames = userNames(rows);
+
+        List<RecycleBinItemVO> items = new ArrayList<>(rows.size());
+        for (WorkspaceDO row : rows) {
+            RecycleBinItemVO item = new RecycleBinItemVO();
+            item.setId(row.getId());
+            item.setName(row.getName());
+            item.setDescription(row.getDescription());
+            item.setOwnerId(row.getOwnerId());
+            item.setOwnerName(userNames.get(row.getOwnerId()));
+            item.setDeletedAt(row.getDeletedAt());
+            item.setDeletedBy(row.getDeletedBy());
+            item.setDeletedByName(userNames.get(row.getDeletedBy()));
+            // A display hint only; the identity filtering above already decided which rows exist.
+            item.setRestorable(!takenNames.contains(row.getName()));
+            items.add(item);
+        }
+        return new PageResult<>(items, total, normalizedPage, normalizedSize);
+    }
+
+    /**
+     * F5: restore. Deliberately never consults the deleted workspace's own token context — the
+     * caller's token points at some other workspace by now — and decides permission from the stored
+     * owner_id plus the member rows that logical delete preserved.
+     */
+    @Transactional
+    public WorkspaceVO restoreWorkspace(long workspaceId, RestoreWorkspaceRequest req, long operatorId) {
+        WorkspaceDO workspace = workspaceDao.findByIdAnyState(workspaceId);
+        // One code for "no such workspace" and "not yours": distinguishing them would let a caller
+        // enumerate other tenants' deleted workspaces by guessing ids.
+        if (workspace == null || !canManageDeleted(workspace, operatorId)) {
+            throw new BizException(ErrorCode.ORG_NOT_FOUND_OR_NO_PERMISSION);
+        }
+        if (!isDeleted(workspace)) {
+            // Duplicate or concurrent restore: the wanted end state already holds, and only one
+            // state change ever happens because the UPDATE is conditional on is_deleted = 1.
+            return restoredView(workspace, operatorId);
+        }
+        // D4: rename-on-restore, so a name taken since the delete can be resolved in one request.
+        String requestedName = req == null ? null : req.getNewName();
+        String name = requestedName == null || requestedName.isBlank()
+                ? requireName(workspace.getName())
+                : requireName(requestedName);
+        if (workspaceDao.countActiveByName(name, null) > 0) {
+            throw new BizException(ErrorCode.ORG_RESTORE_NAME_CONFLICT);
+        }
+        int restored = workspaceDao.restore(workspaceId, name, name, operatorId);
+        if (restored != 1) {
+            WorkspaceDO current = workspaceDao.findByIdAnyState(workspaceId);
+            if (current == null || isDeleted(current)) {
+                throw new BizException(ErrorCode.ORG_NOT_FOUND_OR_NO_PERMISSION);
+            }
+            return restoredView(current, operatorId);
+        }
+
+        AuditLogRecord audit = audit(workspaceId, operatorId, "ORG_RESTORED", "ORG", workspaceId);
+        audit.detail("name", name)
+                .detail("deletedName", workspace.getName())
+                .detail("operatorId", operatorId)
+                // D6: restore leaves scheduled tasks PAUSED for a human to re-enable on purpose.
+                .detail("scheduledTasksResumed", false);
+        auditLogService.recordRequired(audit);
+
+        WorkspaceVO result = toVO(workspace);
+        result.setName(name);
+        result.setVersion(workspace.getVersion() == null ? 1 : workspace.getVersion() + 1);
+        applyManageFlags(result, workspace, operatorId);
+        return result;
+    }
+
+    private WorkspaceVO restoredView(WorkspaceDO workspace, long operatorId) {
+        WorkspaceVO result = toVO(workspace);
+        applyManageFlags(result, workspace, operatorId);
+        return result;
+    }
+
+    private WorkspaceDO requireManageableWorkspace(long workspaceId, long operatorId) {
+        WorkspaceDO workspace = workspaceDao.findByIdForUpdate(workspaceId);
+        if (workspace == null || !canManage(workspace, operatorId)) {
+            throw new BizException(ErrorCode.ORG_NOT_FOUND_OR_NO_PERMISSION);
+        }
+        return workspace;
+    }
+
+    private boolean canManage(WorkspaceDO workspace, long operatorId) {
+        // D8: ownership is org.owner_id — there is no OWNER access level to compare against.
+        return Objects.equals(workspace.getOwnerId(), operatorId)
+                || isAdminMember(workspace.getId(), operatorId);
+    }
+
+    private boolean canManageDeleted(WorkspaceDO workspace, long operatorId) {
+        // F4/F5: a platform admin may not be a member of the workspace at all.
+        return canManage(workspace, operatorId) || systemAdminService.isSystemAdmin(operatorId);
+    }
+
+    private boolean isAdminMember(long workspaceId, long operatorId) {
+        WorkspaceMemberDO member = workspaceMemberDao.findByWorkspaceAndUser(workspaceId, operatorId);
+        return isActiveMember(member) && isExactLevel(member, WorkspaceAccessLevel.ADMIN);
+    }
+
+    private boolean isDeleted(WorkspaceDO workspace) {
+        return Integer.valueOf(1).equals(workspace.getIsDeleted());
+    }
+
+    private void applyManageFlags(WorkspaceVO value, WorkspaceDO workspace, long operatorId) {
+        boolean owner = Objects.equals(workspace.getOwnerId(), operatorId);
+        value.setIsOwner(owner);
+        value.setCanManage(owner || isAdminMember(workspace.getId(), operatorId));
+    }
+
+    private Set<String> takenActiveNames(List<WorkspaceDO> rows) {
+        List<String> names = rows.stream()
+                .map(WorkspaceDO::getName)
+                .filter(Objects::nonNull)
+                .toList();
+        // listActiveNames builds an IN (...) list, and an empty one is a SQL syntax error.
+        if (names.isEmpty()) {
+            return Set.of();
+        }
+        return new HashSet<>(workspaceDao.listActiveNames(names));
+    }
+
+    /** One bulk lookup for both the owner and the deleter, deduplicated: usually the same person. */
+    private Map<Long, String> userNames(List<WorkspaceDO> rows) {
+        Set<Long> userIds = new HashSet<>();
+        for (WorkspaceDO row : rows) {
+            if (row.getOwnerId() != null) {
+                userIds.add(row.getOwnerId());
+            }
+            if (row.getDeletedBy() != null) {
+                userIds.add(row.getDeletedBy());
+            }
+        }
+        if (userIds.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, String> names = new HashMap<>();
+        for (UserDO user : userDao.listByIds(userIds)) {
+            names.put(user.getId(), displayName(user));
+        }
+        return names;
+    }
+
+    private String displayName(UserDO user) {
+        String nickname = user.getNickname();
+        return nickname == null || nickname.isBlank() ? user.getUsername() : nickname;
+    }
+
+    private String requireName(String rawName) {
+        if (rawName == null || rawName.isBlank()) {
+            throw new BizException(ErrorCode.WORKSPACE_NAME_REQUIRED);
+        }
+        String trimmed = rawName.trim();
+        if (trimmed.length() > NAME_MAX_LENGTH) {
+            throw new BizException(ErrorCode.PARAM_INVALID,
+                    "工作空间名称不能超过 " + NAME_MAX_LENGTH + " 个字符");
+        }
+        return trimmed;
+    }
+
+    private String normalizeDescription(String description) {
+        if (description == null || description.isBlank()) {
+            return null;
+        }
+        String trimmed = description.trim();
+        if (trimmed.length() > DESCRIPTION_MAX_LENGTH) {
+            throw new BizException(ErrorCode.PARAM_INVALID,
+                    "工作空间描述不能超过 " + DESCRIPTION_MAX_LENGTH + " 个字符");
+        }
+        return trimmed;
+    }
+
+    private String normalizeBackground(String background) {
+        return background == null || background.isBlank() ? null : background.trim();
     }
 
     private WorkspaceMemberDO requireActiveMember(WorkspaceMemberDO member) {

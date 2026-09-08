@@ -1,10 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { http, HttpResponse } from 'msw';
+import { server } from '@/test/mocks/server';
 import type { ReactNode } from 'react';
 import { createElement } from 'react';
 import {
   useClarificationEvents,
+  useTurnEvents,
+  useReplyElicitation,
+  assembleTurnEvents,
+  hasPersistedReplyForTurn,
+  findPairedInboundTurnId,
   useClarificationConversation,
   isClarificationReplyingStatus,
   clarificationConversationRefetchInterval,
@@ -24,9 +31,12 @@ vi.mock('@/shared/realtime/useRealtime', () => ({
   },
 }));
 
-vi.mock('./api', () => ({
-  getClarificationConversation: vi.fn(),
-}));
+// 只桩掉轮询兜底用例要计数的那一个：整模块替换会让其余 api 函数变成
+// undefined，走 msw 真实请求的用例就静默不发请求了（表现是断言 0 !== 1）。
+vi.mock('./api', async () => {
+  const actual = await vi.importActual<typeof import('./api')>('./api');
+  return { ...actual, getClarificationConversation: vi.fn() };
+});
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -358,6 +368,329 @@ describe('useClarificationEvents', () => {
     expect(invalidateSpy).toHaveBeenCalledTimes(3);
 
     vi.useRealTimers();
+  });
+});
+
+describe('useClarificationEvents 时间线与命令快照', () => {
+  beforeEach(() => {
+    capturedCallback = null;
+  });
+
+  it('exposes an eventSeq-ordered timeline instead of type-bucketed text', () => {
+    const { result } = renderHook(() => useClarificationEvents('100', 1, 10), { wrapper });
+
+    act(() => {
+      emitTurnEvent(capturedCallback!, makeEvent(10, 2, 'text', '答案'));
+      emitTurnEvent(capturedCallback!, makeEvent(10, 1, 'thinking', '先想想'));
+      emitTurnEvent(capturedCallback!, {
+        conversationId: 1, turnId: 10, eventSeq: 3, eventType: 'acp_plan',
+        payload: { type: 'acp_plan', data: { entries: [{ content: '写测试', priority: 'high', status: 'pending' }] } },
+      });
+    });
+
+    expect(result.current.timeline.map((n) => n.kind)).toEqual(['thinking', 'text', 'plan']);
+    expect(result.current.timeline[2].plan?.entries).toHaveLength(1);
+  });
+
+  // 斜杠命令是会话级能力，不能因为轮次切换就丢掉候选。
+  it('keeps the latest command snapshot across turn boundaries', () => {
+    const { result, rerender } = renderHook(
+      ({ ptid }: { ptid: number | null }) => useClarificationEvents('100', 1, ptid),
+      { wrapper, initialProps: { ptid: 10 as number | null } },
+    );
+
+    expect(result.current.availableCommands).toEqual([]);
+
+    act(() => {
+      emitTurnEvent(capturedCallback!, {
+        conversationId: 1, turnId: 10, eventSeq: 1, eventType: 'acp_commands',
+        payload: { type: 'acp_commands', data: { availableCommands: [{ name: 'quest', description: '问卷' }] } },
+      });
+    });
+
+    expect(result.current.availableCommands.map((c) => c.name)).toEqual(['quest']);
+
+    rerender({ ptid: 20 });
+    expect(result.current.availableCommands.map((c) => c.name)).toEqual(['quest']);
+  });
+
+  it('reports the streamed turn id so the panel can match persisted replies', () => {
+    const { result } = renderHook(() => useClarificationEvents('100', 1, null), { wrapper });
+
+    expect(result.current.streamedTurnId).toBeNull();
+
+    act(() => {
+      emitTurnEvent(capturedCallback!, makeEvent(42, 1, 'text', 'hi'));
+    });
+
+    expect(result.current.streamedTurnId).toBe(42);
+  });
+
+  it('prefers the processing turn id over the last streamed event', () => {
+    const { result } = renderHook(() => useClarificationEvents('100', 1, 7), { wrapper });
+    expect(result.current.streamedTurnId).toBe(7);
+  });
+});
+
+describe('hasPersistedReplyForTurn', () => {
+  const turn = (id: number, direction: string, status: string) => ({ id, direction, status });
+
+  // F25：旧判定用纯文本相等（turn.content === streamedText）。引入非文本事件后
+  // 落库正文与流式文本不再逐字相同，会误判成「还没落库」而多出一个重复气泡。
+  it('detects the persisted reply by turn id and terminal status, not by text equality', () => {
+    const turns = [turn(3, 'INBOUND', 'COMPLETED'), turn(4, 'OUTBOUND', 'COMPLETED')];
+    expect(hasPersistedReplyForTurn(turns, 3)).toBe(true);
+  });
+
+  it('accepts every terminal status the backend can persist', () => {
+    for (const status of ['COMPLETED', 'SUCCESS', 'CANCELED', 'FAILED', 'completed']) {
+      expect(hasPersistedReplyForTurn([turn(4, 'OUT', status)], 3)).toBe(true);
+    }
+  });
+
+  it('is false while the reply turn is still being written', () => {
+    expect(hasPersistedReplyForTurn([turn(4, 'OUTBOUND', 'PROCESSING')], 3)).toBe(false);
+  });
+
+  it('ignores user turns and replies that belong to an earlier turn', () => {
+    expect(hasPersistedReplyForTurn([turn(4, 'INBOUND', 'COMPLETED')], 3)).toBe(false);
+    expect(hasPersistedReplyForTurn([turn(2, 'OUTBOUND', 'COMPLETED')], 3)).toBe(false);
+    expect(hasPersistedReplyForTurn([turn(3, 'OUTBOUND', 'COMPLETED')], 3)).toBe(false);
+  });
+
+  it('is false without a streamed turn to compare against', () => {
+    expect(hasPersistedReplyForTurn([turn(4, 'OUTBOUND', 'COMPLETED')], null)).toBe(false);
+    expect(hasPersistedReplyForTurn([], 3)).toBe(false);
+  });
+});
+
+describe('findPairedInboundTurnId', () => {
+  const turn = (id: number, direction: string) => ({ id, direction });
+
+  // 阻塞项：事件按 IN 轮次落库，用 OUT 轮次 id 去查按轮次端点线上恒空。
+  it('resolves the nearest preceding inbound turn for an outbound turn', () => {
+    const turns = [turn(1, 'IN'), turn(2, 'OUT'), turn(3, 'IN'), turn(4, 'OUT')];
+    expect(findPairedInboundTurnId(turns, 1)).toBe(1);
+    expect(findPairedInboundTurnId(turns, 3)).toBe(3);
+  });
+
+  it('accepts both direction spellings the backend can emit', () => {
+    expect(findPairedInboundTurnId([turn(5, 'INBOUND'), turn(6, 'OUTBOUND')], 1)).toBe(5);
+  });
+
+  it('returns null when no inbound turn precedes the outbound turn', () => {
+    expect(findPairedInboundTurnId([turn(2, 'OUT')], 0)).toBeNull();
+    expect(findPairedInboundTurnId([turn(2, 'OUT'), turn(3, 'OUT')], 1)).toBeNull();
+  });
+
+  // 卡片挂起时用户再输入会立刻插入一个 QUEUED 的 IN 轮次，它排在 OUT 之前但
+  // 还没被处理过，不可能产出这个 OUT。取「紧邻前一个 IN」会配到它，详情又空了。
+  it('skips a queued inbound turn that cannot have produced the outbound turn', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'SUCCESS' },
+      { id: 2, direction: 'IN', status: 'QUEUED' },
+      { id: 3, direction: 'OUT', status: 'SUCCESS' },
+    ];
+    expect(findPairedInboundTurnId(turns, 2)).toBe(1);
+  });
+
+  // 排队中的轮次被取消后状态变 CANCELED 并带出自己的「已取消」OUT 气泡。之后
+  // 真正在跑的那一轮产出 OUT 时，不能配到这个从未执行过的轮次上。
+  it('skips a canceled inbound turn when pairing a later outbound turn', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'PROCESSING' },
+      { id: 2, direction: 'IN', status: 'CANCELED' },
+      { id: 3, direction: 'OUT', status: 'CANCELED' },
+      { id: 4, direction: 'OUT', status: 'SUCCESS' },
+    ];
+    expect(findPairedInboundTurnId(turns, 3)).toBe(1);
+  });
+
+  it('matches status regardless of case', () => {
+    const turns = [
+      { id: 1, direction: 'IN', status: 'SUCCESS' },
+      { id: 2, direction: 'IN', status: 'queued' },
+      { id: 3, direction: 'OUT', status: 'success' },
+    ];
+    expect(findPairedInboundTurnId(turns, 2)).toBe(1);
+  });
+
+  it('still pairs when status is absent', () => {
+    const turns = [turn(1, 'IN'), turn(2, 'OUT')];
+    expect(findPairedInboundTurnId(turns, 1)).toBe(1);
+  });
+});
+
+describe('assembleTurnEvents', () => {
+  const row = (over: Record<string, unknown>) => ({
+    id: 1, conversationId: 1, turnId: 9, dispatchAttempt: 1, eventSeq: 1,
+    chunkIndex: 0, chunkCount: 1, eventType: 'text',
+    payloadFragment: '{"type":"text","content":"hi"}',
+    gmtCreate: '', ...over,
+  });
+
+  it('joins chunks by chunkIndex and orders logical events by eventSeq', () => {
+    const events = assembleTurnEvents([
+      row({ id: 3, eventSeq: 2, eventType: 'status', payloadFragment: '{"type":"status","status":"completed"}' }),
+      row({ id: 2, chunkIndex: 1, chunkCount: 2, payloadFragment: 'content":"拼回来了"}' }),
+      row({ id: 1, chunkIndex: 0, chunkCount: 2, payloadFragment: '{"type":"text","' }),
+    ]);
+
+    expect(events.map((e) => e.eventSeq)).toEqual([1, 2]);
+    expect(events[0].payload?.content).toBe('拼回来了');
+    expect(events[1].payload?.status).toBe('completed');
+  });
+
+  // stale 重投会把整套逻辑事件再发一遍（dispatchAttempt=2），不去重历史详情
+  // 内容直接翻倍。同一 (turnId, eventSeq) 只保留 dispatchAttempt 最大的那一组。
+  it('keeps only the latest dispatch attempt for the same (turnId, eventSeq)', () => {
+    const events = assembleTurnEvents([
+      row({ id: 1, dispatchAttempt: 1 }),
+      row({ id: 2, dispatchAttempt: 2, payloadFragment: '{"type":"text","content":"重投"}' }),
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0].payload?.content).toBe('重投');
+  });
+
+  it('resolves the latest attempt independently per turn', () => {
+    const events = assembleTurnEvents([
+      row({ id: 1, turnId: 9, dispatchAttempt: 2, payloadFragment: '{"type":"text","content":"九重投"}' }),
+      row({ id: 2, turnId: 9, dispatchAttempt: 1 }),
+      row({ id: 3, turnId: 10, dispatchAttempt: 1, payloadFragment: '{"type":"text","content":"十首投"}' }),
+    ]);
+    expect(events.map((e) => [e.turnId, e.payload?.content])).toEqual([
+      [9, '九重投'],
+      [10, '十首投'],
+    ]);
+  });
+
+  it('orders logical events by the composite (turnId, eventSeq) key', () => {
+    const events = assembleTurnEvents([
+      row({ id: 1, turnId: 10, eventSeq: 1, payloadFragment: '{"type":"text","content":"b"}' }),
+      row({ id: 2, turnId: 9, eventSeq: 2, payloadFragment: '{"type":"text","content":"a2"}' }),
+      row({ id: 3, turnId: 9, eventSeq: 1, payloadFragment: '{"type":"text","content":"a1"}' }),
+    ]);
+    expect(events.map((e) => e.payload?.content)).toEqual(['a1', 'a2', 'b']);
+  });
+
+  // 分片不全宁可整条丢弃：拼出半截 JSON 只会让整个详情面板炸掉。
+  it('drops logical events whose chunks are incomplete', () => {
+    const events = assembleTurnEvents([row({ chunkIndex: 0, chunkCount: 3 })]);
+    expect(events).toEqual([]);
+  });
+
+  it('yields a null payload for unparseable JSON rather than throwing', () => {
+    const events = assembleTurnEvents([row({ payloadFragment: '{oops' })]);
+    expect(events).toHaveLength(1);
+    expect(events[0].payload).toBeNull();
+  });
+
+  it('treats a missing chunkCount as a single chunk', () => {
+    const events = assembleTurnEvents([row({ chunkCount: undefined as never })]);
+    expect(events).toHaveLength(1);
+    expect(events[0].payload?.content).toBe('hi');
+  });
+
+  it('returns nothing for no rows', () => {
+    expect(assembleTurnEvents([])).toEqual([]);
+  });
+});
+
+describe('useTurnEvents', () => {
+  const url = '/api/workitems/:workitemId/clarification-conversations/:conversationId/turns/:turnId/events';
+
+  it('sends no request while disabled and fetches once enabled', async () => {
+    let calls = 0;
+    server.use(
+      http.get(url, () => {
+        calls += 1;
+        return HttpResponse.json({
+          success: true, code: '0', message: '', traceId: null,
+          data: [{
+            id: 1, conversationId: 1, turnId: 9, dispatchAttempt: 1, eventSeq: 1,
+            chunkIndex: 0, chunkCount: 1, eventType: 'text',
+            payloadFragment: '{"type":"text","content":"历史"}', gmtCreate: '',
+          }],
+        });
+      }),
+    );
+
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useTurnEvents('100', 1, 9, enabled),
+      { wrapper, initialProps: { enabled: false } },
+    );
+
+    await new Promise((r) => setTimeout(r, 120));
+    expect(calls).toBe(0);
+    expect(result.current.timeline).toEqual([]);
+
+    rerender({ enabled: true });
+
+    await waitFor(() => expect(calls).toBe(1));
+    await waitFor(() => expect(result.current.timeline).toHaveLength(1));
+    expect(result.current.timeline[0].text).toBe('历史');
+  });
+
+  it('stays disabled without a conversation or turn id', async () => {
+    let calls = 0;
+    server.use(http.get(url, () => {
+      calls += 1;
+      return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: [] });
+    }));
+
+    renderHook(() => useTurnEvents('100', null, 9, true), { wrapper });
+    renderHook(() => useTurnEvents('100', 1, null, true), { wrapper });
+
+    await new Promise((r) => setTimeout(r, 120));
+    expect(calls).toBe(0);
+  });
+});
+
+describe('useReplyElicitation', () => {
+  it('posts the answer to the per-request reply endpoint', async () => {
+    const seen: Array<{ requestId: string; body: unknown }> = [];
+    server.use(
+      http.post(
+        '/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply',
+        async ({ params, request }) => {
+          seen.push({ requestId: String(params.requestId), body: await request.json() });
+          return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null });
+        },
+      ),
+    );
+
+    const { result } = renderHook(() => useReplyElicitation('100', 1), { wrapper });
+
+    act(() => {
+      result.current.mutate({ requestId: 'abc123', action: 'accept', content: { q0: 'A' } });
+    });
+
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0].requestId).toBe('abc123');
+    // content 以字符串透传：requestedSchema 是任意 JSON Schema，服务端不解释也不重排
+    expect(seen[0].body).toEqual({ action: 'accept', content: '{"q0":"A"}' });
+  });
+
+  it('omits content when the user skips the card', async () => {
+    const bodies: unknown[] = [];
+    server.use(
+      http.post(
+        '/api/workitems/:workitemId/clarification-conversations/:conversationId/elicitations/:requestId/reply',
+        async ({ request }) => {
+          bodies.push(await request.json());
+          return HttpResponse.json({ success: true, code: '0', message: '', traceId: null, data: null });
+        },
+      ),
+    );
+
+    const { result } = renderHook(() => useReplyElicitation('100', 1), { wrapper });
+
+    act(() => {
+      result.current.mutate({ requestId: 'abc123', action: 'decline' });
+    });
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toEqual({ action: 'decline', content: null });
   });
 });
 

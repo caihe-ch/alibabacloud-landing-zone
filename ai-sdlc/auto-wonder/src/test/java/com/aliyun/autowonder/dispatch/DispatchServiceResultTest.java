@@ -133,6 +133,31 @@ class DispatchServiceResultTest {
     }
 
     @Test
+    void onProgressOnlyPersistsNativeStringRuntimeSummaries() {
+        when(dispatchDao.findById(500L)).thenReturn(at(DispatchStatus.ACKED), at(DispatchStatus.RUNNING));
+        JSONObject structured = new JSONObject();
+        structured.put("type", "TASK_PROGRESS");
+        structured.put("eventType", "agent.message");
+        structured.put("message", new JSONObject().fluentPut("token", "raw message"));
+        structured.put("error", java.util.List.of("raw error"));
+        JSONObject text = new JSONObject();
+        text.put("type", "TASK_PROGRESS");
+        text.put("eventType", "agent.message");
+        text.put("message", "readable message");
+        text.put("error", "readable error");
+
+        service.onProgress(TENANT, 500L, structured);
+        service.onProgress(TENANT, 500L, text);
+
+        ArgumentCaptor<DispatchRuntimeEventDO> events = ArgumentCaptor.forClass(DispatchRuntimeEventDO.class);
+        verify(runtimeEventDao, times(2)).insert(events.capture());
+        assertNull(events.getAllValues().get(0).getMessage());
+        assertNull(events.getAllValues().get(0).getError());
+        assertEquals("readable message", events.getAllValues().get(1).getMessage());
+        assertEquals("readable error", events.getAllValues().get(1).getError());
+    }
+
+    @Test
     void onProgressPersistsWorkflowPlanEvent() {
         when(dispatchDao.findById(500L)).thenReturn(at(DispatchStatus.RUNNING));
         JSONObject frame = JSONObject.parseObject("""
@@ -458,6 +483,14 @@ class DispatchServiceResultTest {
         service.renewActiveLeases(TENANT, 9L, java.util.List.of());
 
         verify(executorRegistry).updateRunningDispatches(9L, java.util.List.of());
+        verify(dispatchDao, never()).touchOwnedActive(anyLong(), anyLong(), anyList());
+    }
+
+    @Test
+    void missingRunningDispatchesClearsRegistryLeaseWithoutTouchingDispatchRows() {
+        service.renewActiveLeases(TENANT, 9L, null);
+
+        verify(executorRegistry).updateRunningDispatches(9L, null);
         verify(dispatchDao, never()).touchOwnedActive(anyLong(), anyLong(), anyList());
     }
 }

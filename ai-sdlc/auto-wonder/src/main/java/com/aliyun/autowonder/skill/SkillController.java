@@ -8,12 +8,21 @@ import com.aliyun.autowonder.access.WorkspaceAccessLevel;
 import com.aliyun.autowonder.access.RequireWorkspaceAccess;
 import com.aliyun.autowonder.skill.dto.CreateSkillRequest;
 import com.aliyun.autowonder.skill.dto.SkillConnectionTestVO;
+import com.aliyun.autowonder.skill.dto.SkillPackageFileContentVO;
+import com.aliyun.autowonder.skill.dto.SkillPackageFilesVO;
 import com.aliyun.autowonder.skill.dto.SkillPackageInspectVO;
 import com.aliyun.autowonder.skill.dto.SkillVO;
 import com.aliyun.autowonder.skill.dto.UpdateSkillRequest;
+import com.alibaba.fastjson.JSON;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 @RestController
@@ -56,6 +65,59 @@ public class SkillController {
     @GetMapping("/{id}")
     public Result<SkillVO> get(@PathVariable("id") Long id) {
         return Result.ok(skillService.get(id));
+    }
+
+    // 以下三个包内容端点不加方法级 @RequireWorkspaceAccess：
+    // 刻意继承类级 READ_ONLY，使"能看到技能详情"与"能看到包内容"的可见性完全一致。
+
+    @GetMapping("/{id}/package/files")
+    public Result<SkillPackageFilesVO> packageFiles(@PathVariable("id") Long id) {
+        return Result.ok(skillPackageService.listPackageFiles(skillService.get(id)));
+    }
+
+    @GetMapping("/{id}/package/file")
+    public Result<SkillPackageFileContentVO> packageFile(@PathVariable("id") Long id,
+            @RequestParam("path") String path) {
+        return Result.ok(skillPackageService.readPackageFile(skillService.get(id), path));
+    }
+
+    @GetMapping("/{id}/package/download")
+    public ResponseEntity<byte[]> downloadPackage(@PathVariable("id") Long id) {
+        try {
+            SkillPackageService.PackageDownload download = skillPackageService.loadPackage(skillService.get(id));
+            ContentDisposition disposition = ContentDisposition.attachment()
+                    .filename(download.fileName(), StandardCharsets.UTF_8)
+                    .build();
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentDisposition(disposition);
+            headers.setContentType(packageMediaType(download.format()));
+            headers.set("X-Content-Type-Options", "nosniff");
+            return new ResponseEntity<>(download.bytes(), headers, HttpStatus.OK);
+        } catch (BizException ex) {
+            // 响应体是裸字节而非 Result，全局异常处理器给出的 JSON 拿不到正确的 Content-Type，
+            // 前端用原生 fetch 下载时必须能读到 message，所以这里自己组装错误体。
+            byte[] body = JSON.toJSONString(Result.fail(ex.getCode(), ex.getMessage()))
+                    .getBytes(StandardCharsets.UTF_8);
+            return ResponseEntity.status(downloadStatusFor(ex.getCode()))
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .header("X-Content-Type-Options", "nosniff")
+                    .body(body);
+        }
+    }
+
+    private static MediaType packageMediaType(String format) {
+        return SkillPackageService.FORMAT_TAR_GZ.equals(format)
+                ? MediaType.valueOf("application/gzip")
+                : MediaType.valueOf("application/zip");
+    }
+
+    private static HttpStatus downloadStatusFor(String code) {
+        if (ErrorCode.SKILL_NOT_FOUND.getCode().equals(code)) {
+            return HttpStatus.NOT_FOUND;
+        }
+        // 未登录/越权由 @Around 切面在方法体之外抛出，进不了 downloadPackage 的 catch，
+        // 因此这里无需处理 UNAUTHORIZED——它由 GlobalExceptionHandler 统一响应。
+        return HttpStatus.BAD_REQUEST;
     }
 
     @PostMapping("/{id}/connection-test")

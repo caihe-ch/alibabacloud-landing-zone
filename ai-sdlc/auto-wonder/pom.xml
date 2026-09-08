@@ -159,12 +159,10 @@
             <artifactId>fastjson</artifactId>
             <version>1.2.72_noneautotype</version>
         </dependency>
-        <!-- Declared explicitly: master receives fastjson2 transitively from the
-             Alibaba-internal SDKs that the community build excludes. -->
         <dependency>
             <groupId>com.alibaba.fastjson2</groupId>
             <artifactId>fastjson2</artifactId>
-            <version>2.0.58</version>
+            <version>2.0.31</version>
         </dependency>
         <!-- Web (Tomcat) -->
         <dependency>
@@ -365,6 +363,31 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <!--
+              覆盖率报告。刻意不配 check 规则的全局阈值：存量覆盖率未知，
+              加全局门槛会让构建直接红掉。增量覆盖率靠 target/site/jacoco
+              的报告逐类核对。
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.12</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>pl.project13.maven</groupId>

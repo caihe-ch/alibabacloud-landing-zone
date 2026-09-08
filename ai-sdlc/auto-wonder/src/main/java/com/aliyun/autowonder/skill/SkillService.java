@@ -53,13 +53,15 @@ public class SkillService {
             throw new BizException(ErrorCode.SKILL_TYPE_REQUIRED);
         }
         rejectGenericPackagedCapabilityWrite(req.getType());
-        if (skillDao.findByTypeAndName(tenantId, req.getType(), req.getName()) != null) {
+        String name = req.getName().trim();
+        if (skillDao.findByTypeAndName(tenantId, req.getType(), name) != null) {
             throw new BizException(ErrorCode.SKILL_DUPLICATE_NAME);
         }
+        skillDao.releaseSoftDeletedName(tenantId, req.getType(), name);
         SkillDO s = new SkillDO();
         s.setTenantId(tenantId);
         s.setType(req.getType());
-        s.setName(req.getName().trim());
+        s.setName(name);
         s.setInstallSpec(normalizeInstallSpecForStorage(req.getType(), req.getInstallSpec(), null));
         s.setDescription(req.getDescription());
         s.setSourceType("INSTALL_SPEC");
@@ -116,13 +118,15 @@ public class SkillService {
 			throw new BizException(ErrorCode.SKILL_TYPE_REQUIRED);
 		}
 		rejectGenericPackagedCapabilityWrite(req.getType());
-		if (skillDao.findByTypeAndName(tenantId, req.getType(), req.getName()) != null) {
+		String name = req.getName().trim();
+		if (skillDao.findByTypeAndName(tenantId, req.getType(), name) != null) {
 			throw new BizException(ErrorCode.SKILL_DUPLICATE_NAME);
 		}
+		skillDao.releaseSoftDeletedName(tenantId, req.getType(), name);
 		SkillDO skill = new SkillDO();
 		skill.setTenantId(tenantId);
 		skill.setType(req.getType());
-		skill.setName(req.getName().trim());
+		skill.setName(name);
         skill.setInstallSpec(normalizeInstallSpecForStorage(req.getType(), req.getInstallSpec(), null));
 		skill.setDescription(req.getDescription());
 		skill.setSourceType("OSS_ZIP");

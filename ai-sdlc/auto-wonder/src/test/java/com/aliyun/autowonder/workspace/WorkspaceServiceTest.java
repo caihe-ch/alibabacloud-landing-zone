@@ -1,5 +1,6 @@
 package com.aliyun.autowonder.workspace;
 
+import com.aliyun.autowonder.access.SystemAdminService;
 import com.aliyun.autowonder.access.WorkspaceAccessLevel;
 import com.aliyun.autowonder.audit.AuditLogRecord;
 import com.aliyun.autowonder.audit.AuditLogService;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.core.env.Environment;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -53,6 +55,9 @@ class WorkspaceServiceTest {
     private JwtService jwtService;
     private UserDao userDao;
     private AuditLogService auditLogService;
+    private SystemAdminService systemAdminService;
+    private WorkspaceDeletionLinkage deletionLinkage;
+    private ApplicationEventPublisher eventPublisher;
     private WorkspaceService service;
 
     @BeforeEach
@@ -62,13 +67,17 @@ class WorkspaceServiceTest {
         statusTemplateSeeder = mock(StatusTemplateSeeder.class);
         userDao = mock(UserDao.class);
         auditLogService = mock(AuditLogService.class);
+        systemAdminService = mock(SystemAdminService.class);
+        deletionLinkage = mock(WorkspaceDeletionLinkage.class);
+        eventPublisher = mock(ApplicationEventPublisher.class);
         Environment env = mock(Environment.class);
         when(env.getActiveProfiles()).thenReturn(new String[]{"daily"});
         JwtProperties props = new JwtProperties(env);
         props.setSecret("test-secret-key-that-is-long-enough-32bytes!");
         jwtService = new JwtService(props);
         service = new WorkspaceService(workspaceDao, workspaceMemberDao, statusTemplateSeeder,
-                jwtService, userDao, auditLogService);
+                jwtService, userDao, auditLogService, systemAdminService, deletionLinkage,
+                eventPublisher);
     }
 
     @AfterEach

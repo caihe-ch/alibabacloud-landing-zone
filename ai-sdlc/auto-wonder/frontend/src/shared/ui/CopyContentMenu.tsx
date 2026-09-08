@@ -4,16 +4,18 @@ import { copyTextToClipboard } from '@/shared/lib/clipboard';
 import { markdownToPlainText } from '@/shared/lib/markdownToPlainText';
 
 interface CopyContentMenuProps {
-  contentMd: string;
+  contentMd?: string | null;
   tooltip?: string;
 }
 
 export function CopyContentMenu({ contentMd, tooltip = '复制内容' }: CopyContentMenuProps) {
-  if (!contentMd.trim()) return null;
+  // Workitem bodies may arrive as null from the server; trimming null crashes the whole route.
+  const content = contentMd ?? '';
+  if (!content.trim()) return null;
 
   const handleMenuClick = async ({ key }: { key: string }) => {
     const plain = key === 'plaintext';
-    const copied = await copyTextToClipboard(plain ? markdownToPlainText(contentMd) : contentMd);
+    const copied = await copyTextToClipboard(plain ? markdownToPlainText(content) : content);
     if (!copied) {
       message.error('复制失败，请检查浏览器剪贴板权限');
       return;

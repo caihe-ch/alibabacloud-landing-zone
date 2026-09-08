@@ -8,6 +8,7 @@ import com.aliyun.autowonder.branding.PlatformBrandingService;
 import com.aliyun.autowonder.common.error.BizException;
 import com.aliyun.autowonder.common.error.ErrorCode;
 import com.aliyun.autowonder.mcp.dto.WorkitemCliUploadTokenVO;
+import com.aliyun.autowonder.mcp.dto.WorkitemCliDownloadTokenVO;
 import com.aliyun.autowonder.storage.InMemoryObjectStorage;
 import com.aliyun.autowonder.storage.OssProperties;
 import com.aliyun.autowonder.workitem.WorkitemDO;
@@ -28,6 +29,19 @@ import com.aliyun.autowonder.guidance.GuidanceService;
 import com.aliyun.autowonder.dispatch.DispatchDO;
 import com.aliyun.autowonder.dispatch.DispatchDao;
 import com.aliyun.autowonder.dispatch.DispatchPauseService;
+import com.aliyun.autowonder.executor.ExecutorLaunchCommandService;
+import com.aliyun.autowonder.executor.ExecutorLaunchOptionsService;
+import com.aliyun.autowonder.executor.ExecutorService;
+import com.aliyun.autowonder.executor.ProviderModelCatalogService;
+import com.aliyun.autowonder.executor.dto.CreateExecutorRequest;
+import com.aliyun.autowonder.executor.dto.CreatedExecutorVO;
+import com.aliyun.autowonder.executor.dto.ExecutorLaunchCommandVO;
+import com.aliyun.autowonder.executor.dto.ExecutorLaunchOptionsVO;
+import com.aliyun.autowonder.executor.dto.ExecutorVO;
+import com.aliyun.autowonder.executor.dto.IssuedExecutorVO;
+import com.aliyun.autowonder.executor.dto.ProviderModelCatalogItemVO;
+import com.aliyun.autowonder.executor.dto.ProviderModelCatalogVO;
+import com.aliyun.autowonder.executor.dto.SelectOptionVO;
 import com.aliyun.autowonder.mcp.dto.McpToolVO;
 import com.aliyun.autowonder.memory.MemoryService;
 import com.aliyun.autowonder.memory.dto.CreateMemoryRequest;
@@ -81,6 +95,7 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.core.env.Environment;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
@@ -106,10 +121,14 @@ class McpToolServiceTest {
     DispatchDao dispatchDao;
     RequirementDocumentService requirementDocumentService;
     WorkitemCliUploadTokenService workitemCliUploadTokenService;
+    WorkitemCliDownloadTokenService workitemCliDownloadTokenService;
     MemoryService memoryService;
     RepoService repoService;
     SquadService squadService;
     DispatchPauseService dispatchPauseService;
+    ExecutorService executorService;
+    ProviderModelCatalogService providerModelCatalogService;
+    PlatformBrandingService launchBrandingService;
     McpToolService service;
     McpAccessTokenService.Principal principal;
     ScheduledTaskCapabilityGuard capabilityGuard;
@@ -137,17 +156,32 @@ class McpToolServiceTest {
                 "npx -y autowonder@0.2.130 scheduled-task upload --server-url https://daily.auto-wonder.example.com"
                         + " --scheduled-task-id <scheduled-task-id>"
                         + " --file <filepath-1> --file <filepath-2> --file <images-1> --json");
+        workitemCliDownloadTokenService = mock(WorkitemCliDownloadTokenService.class);
+        when(workitemCliDownloadTokenService.commandTemplate()).thenReturn(
+                "npx -y autowonder@0.2.130 workitem download --server-url https://daily.auto-wonder.example.com"
+                        + " --workitem-id <workitem-id>"
+                        + " --file <name-or-id> --output-dir <dir> --json");
         memoryService = mock(MemoryService.class);
         repoService = mock(RepoService.class);
         squadService = mock(SquadService.class);
         dispatchPauseService = mock(DispatchPauseService.class);
+        executorService = mock(ExecutorService.class);
+        providerModelCatalogService = mock(ProviderModelCatalogService.class);
+        launchBrandingService = mock(PlatformBrandingService.class);
+        when(launchBrandingService.trustedPublicBaseUrl()).thenReturn("https://auto-wonder.example.com");
+        when(launchBrandingService.recommendedRuntimeVersion()).thenReturn("0.2.152");
         capabilityGuard = mock(ScheduledTaskCapabilityGuard.class);
         service = new McpToolService(workspaceService, workitemService, guidanceService, skillService,
                 skillPackageService, sdlcService, agentService, statusTemplateService,
                 new PlatformSkillCatalog(), dispatchDao, requirementDocumentService,
-                workitemCliUploadTokenService, memoryService, repoService,
+                workitemCliUploadTokenService, workitemCliDownloadTokenService, memoryService, repoService,
                 squadService, dispatchPauseService);
         ReflectionTestUtils.setField(service, "capabilityGuard", capabilityGuard);
+        ReflectionTestUtils.setField(service, "executorService", executorService);
+        ReflectionTestUtils.setField(service, "executorLaunchOptionsService",
+                new ExecutorLaunchOptionsService(providerModelCatalogService));
+        ReflectionTestUtils.setField(service, "executorLaunchCommandService",
+                new ExecutorLaunchCommandService(launchBrandingService));
         principal = principal(WorkspaceAccessLevel.READ_WRITE);
     }
 
@@ -159,6 +193,7 @@ class McpToolServiceTest {
                 "autowonder.get_workitem",
                 "autowonder.list_workitem_comments",
                 "autowonder.list_workitem_documents",
+                "autowonder.workitem_cli_download_token",
                 "autowonder.list_status_templates",
                 "autowonder.get_status_template",
                 "autowonder.list_sdlcs",
@@ -180,7 +215,11 @@ class McpToolServiceTest {
                 "autowonder.get_squad",
                 "autowonder.list_scheduled_tasks",
                 "autowonder.get_scheduled_task",
-                "autowonder.get_scheduled_task_run");
+                "autowonder.get_scheduled_task_run",
+                "autowonder.list_executors",
+                "autowonder.get_executor",
+                "autowonder.list_executor_client_kinds",
+                "autowonder.get_executor_launch_options");
         Set<String> fullCatalog = service.listTools().stream()
                 .map(McpToolVO::getName)
                 .collect(java.util.stream.Collectors.toSet());
@@ -190,15 +229,29 @@ class McpToolServiceTest {
                         .collect(java.util.stream.Collectors.toSet());
 
         assertEquals(expectedReadOnly, readOnlyCatalog);
-        assertEquals(fullCatalog,
+
+        Set<String> readWriteCatalog =
                 service.listTools(scopedPrincipal(WorkspaceAccessLevel.READ_WRITE)).stream()
                         .map(McpToolVO::getName)
-                        .collect(java.util.stream.Collectors.toSet()));
-        assertEquals(fullCatalog,
+                        .collect(java.util.stream.Collectors.toSet());
+        Set<String> adminCatalog =
                 service.listTools(scopedPrincipal(WorkspaceAccessLevel.ADMIN)).stream()
                         .map(McpToolVO::getName)
-                        .collect(java.util.stream.Collectors.toSet()));
-        assertEquals(84, fullCatalog.size());
+                        .collect(java.util.stream.Collectors.toSet());
+
+        // 执行器写操作是目录中唯一的 ADMIN 级工具，READ_WRITE 主体必须看不到它们。
+        Set<String> adminOnlyTools = Set.of(
+                "autowonder.create_executor",
+                "autowonder.get_executor_token",
+                "autowonder.delete_executor",
+                "autowonder.build_executor_launch_command");
+        Set<String> hiddenFromReadWrite = new java.util.HashSet<>(fullCatalog);
+        hiddenFromReadWrite.removeAll(readWriteCatalog);
+
+        assertEquals(adminOnlyTools, hiddenFromReadWrite);
+        assertEquals(fullCatalog, adminCatalog);
+        assertEquals(93, fullCatalog.size());
+        assertEquals(89, readWriteCatalog.size());
     }
 
     @Test
@@ -527,13 +580,95 @@ class McpToolServiceTest {
     }
 
     @Test
+    void workitemCliDownloadTokenInvocationDelegatesForPersonalCredential() {
+        WorkitemCliDownloadTokenVO vo = new WorkitemCliDownloadTokenVO();
+        vo.setToken("awdownload_xyz");
+        when(workitemCliDownloadTokenService.mint(
+                McpAccessTokenService.CredentialType.LONG_LIVED, USER_ID, 50063L))
+                .thenReturn(vo);
+
+        Object result = call(principal, "autowonder.workitem_cli_download_token", Map.of("id", 50063L));
+
+        assertSame(vo, result);
+        verify(workitemCliDownloadTokenService).mint(
+                McpAccessTokenService.CredentialType.LONG_LIVED, USER_ID, 50063L);
+    }
+
+    @Test
+    void workitemCliDownloadTokenInvocationDelegatesForDispatchCredential() {
+        WorkitemCliDownloadTokenVO vo = new WorkitemCliDownloadTokenVO();
+        vo.setToken("awdownload_dispatch");
+        when(workitemCliDownloadTokenService.mint(
+                McpAccessTokenService.CredentialType.DISPATCH, USER_ID, 50063L))
+                .thenReturn(vo);
+
+        Object result = call(dispatchPrincipal(5L), "autowonder.workitem_cli_download_token", Map.of("id", 50063L));
+
+        assertSame(vo, result);
+        verify(workitemCliDownloadTokenService).mint(
+                McpAccessTokenService.CredentialType.DISPATCH, USER_ID, 50063L);
+    }
+
+    @Test
+    void workitemCliDownloadTokenInvocationDelegatesForConversationCredential() {
+        WorkitemCliDownloadTokenVO vo = new WorkitemCliDownloadTokenVO();
+        vo.setToken("awdownload_conversation");
+        when(workitemCliDownloadTokenService.mint(
+                McpAccessTokenService.CredentialType.CONVERSATION, USER_ID, 50063L))
+                .thenReturn(vo);
+
+        Object result = call(scopedPrincipal(WorkspaceAccessLevel.ADMIN),
+                "autowonder.workitem_cli_download_token", Map.of("id", 50063L));
+
+        assertSame(vo, result);
+        verify(workitemCliDownloadTokenService).mint(
+                McpAccessTokenService.CredentialType.CONVERSATION, USER_ID, 50063L);
+    }
+
+    @Test
+    void workitemCliDownloadTokenDescriptionPointsAtDownloadCommand() {
+        McpToolVO tool = toolByName("autowonder.workitem_cli_download_token");
+
+        assertTrue(tool.getDescription().contains("autowonder.workitem_cli_download_token")
+                || tool.getDescription().contains("workitem download"));
+        assertTrue(tool.getDescription().contains(
+                "npx -y autowonder@0.2.130 workitem download --server-url https://daily.auto-wonder.example.com"
+                        + " --workitem-id <workitem-id> --file <name-or-id> --output-dir <dir> --json"));
+        assertTrue(tool.getDescription().contains("list_workitem_documents"));
+    }
+
+    @Test
+    void listWorkitemDocumentsDescriptionGuidesTowardCliDownload() {
+        McpToolVO tool = toolByName("autowonder.list_workitem_documents");
+
+        assertTrue(tool.getDescription().contains("never the document body"));
+        assertTrue(tool.getDescription().contains("autowonder.workitem_cli_download_token"));
+        assertTrue(tool.getDescription().contains("workitem download"));
+    }
+
+    @Test
+    void workitemCliDownloadTokenDeclaresIdOnlyInputAndTokenOutput() {
+        McpToolVO tool = toolByName("autowonder.workitem_cli_download_token");
+
+        String schema = com.alibaba.fastjson.JSON.toJSONString(tool.getInputSchema());
+        assertTrue(schema.contains("\"id\""), schema);
+        assertTrue(tool.getOutputSchema() != null);
+        String output = com.alibaba.fastjson.JSON.toJSONString(tool.getOutputSchema());
+        assertTrue(output.contains("awdownload_"), output);
+        assertTrue(output.contains("AUTOWONDER_DOWNLOAD_TOKEN"), output);
+    }
+
+    @Test
     void privateDeploymentDescriptionsAndResultsNeverExposeDefaults() {
         WorkitemCliUploadTokenService realTokenService = realTokenService(
+                "http://autowonder.internal.example.com:8080", "0.9.9-rc.1");
+        WorkitemCliDownloadTokenService realDownloadTokenService = realDownloadTokenService(
                 "http://autowonder.internal.example.com:8080", "0.9.9-rc.1");
         McpToolService privateService = new McpToolService(workspaceService, workitemService, guidanceService,
                 skillService, skillPackageService, sdlcService, agentService, statusTemplateService,
                 new PlatformSkillCatalog(), dispatchDao, requirementDocumentService,
-                realTokenService, memoryService, repoService, squadService, dispatchPauseService);
+                realTokenService, realDownloadTokenService, memoryService, repoService, squadService,
+                dispatchPauseService);
 
         List<McpToolVO> tools = privateService.listTools();
         String tokenDescription = tools.stream()
@@ -593,6 +728,7 @@ class McpToolServiceTest {
             assertNullableField(workitem, "health", "string");
             assertNullableField(workitem, "healthReason", "string");
             assertNullableField(workitem, "deletableReason", "string");
+            assertWorkitemNullableActorFields(workitem);
         }
 
         Map<String, Object> listWorkitems = outputSchemaFor("autowonder.list_workitems");
@@ -604,6 +740,10 @@ class McpToolServiceTest {
         assertNullableField(listItemProperties, "health", "string");
         assertNullableField(listItemProperties, "healthReason", "string");
         assertNullableField(listItemProperties, "deletableReason", "string");
+        assertWorkitemNullableActorFields(listItemProperties);
+
+        Map<String, Object> runDetail = outputSchemaFor("autowonder.get_scheduled_task_run");
+        assertWorkitemNullableActorFields(properties(itemSchema(property(runDetail, "derivedWorkitems"))));
 
         Map<String, Object> comment = properties(itemSchema(
                 property(outputSchemaFor("autowonder.list_workitem_comments"), "items")));
@@ -612,6 +752,21 @@ class McpToolServiceTest {
         Map<String, Object> document = properties(itemSchema(
                 property(outputSchemaFor("autowonder.list_workitem_documents"), "items")));
         assertNullableField(document, "gmtCreate", "string");
+    }
+
+    /** Workitem columns that are DEFAULT NULL, plus actor names that stay unresolved for deleted agents or users. */
+    private void assertWorkitemNullableActorFields(Map<String, Object> workitem) {
+        assertNullableField(workitem, "contentMd", "string");
+        assertNullableField(workitem, "templateId", "integer");
+        assertNullableField(workitem, "statusNodeId", "integer");
+        assertNullableField(workitem, "statusName", "string");
+        assertNullableField(workitem, "assigneeType", "string");
+        assertNullableField(workitem, "assigneeRef", "integer");
+        assertNullableField(workitem, "assigneeName", "string");
+        assertNullableField(workitem, "assigneeDisplayName", "string");
+        assertNullableField(workitem, "creatorId", "integer");
+        assertNullableField(workitem, "creatorName", "string");
+        assertNullableField(workitem, "creatorDisplayName", "string");
     }
 
     @Test
@@ -681,6 +836,85 @@ class McpToolServiceTest {
         assertTrue(allowed.contains(jsonType),
                 "outputSchema declares " + field + " as " + allowed
                         + " but the Spring Jackson serializer emits a " + jsonType);
+    }
+
+    @Test
+    void serializedWorkitemNullsAreDeclaredNullableInOutputSchema() {
+        // Faithful reproduction of the client-side failure: WorkitemService.toVO leaves the actor names null
+        // when the assignee agent or the creator user cannot be resolved, so qodercli rejected the whole
+        // tools/call response with "-32602 ... data/assigneeName must be string, data/assigneeDisplayName
+        // must be string". Serialize with the app's real mapper so the mismatch is caught here.
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(JacksonAutoConfiguration.class))
+                .withUserConfiguration(JacksonConfig.class)
+                .run(context -> {
+                    ObjectMapper appMapper = context.getBean(ObjectMapper.class);
+                    Map<String, Object> getWorkitem = properties(outputSchemaFor("autowonder.get_workitem"));
+                    Map<String, Object> listItems = properties(itemSchema(
+                            property(outputSchemaFor("autowonder.list_workitems"), "items")));
+
+                    WorkitemVO unresolvedActors = new WorkitemVO();
+                    unresolvedActors.setId(53033L);
+                    unresolvedActors.setWorkType("BUG");
+                    unresolvedActors.setTitle("mcp agent 调用总是异常");
+                    unresolvedActors.setAssigneeType("AGENT");
+                    unresolvedActors.setAssigneeRef(40999L);
+                    unresolvedActors.setPriority(2);
+                    unresolvedActors.setVersion(3);
+                    unresolvedActors.setSourceType("NATIVE");
+                    unresolvedActors.setDeletable(true);
+                    unresolvedActors.setPendingDecision(false);
+                    unresolvedActors.setTags(List.of());
+
+                    JsonNode serialized = appMapper.readTree(appMapper.writeValueAsString(unresolvedActors));
+                    assertSerializedAsNull(serialized, "assigneeName");
+                    assertSerializedAsNull(serialized, "assigneeDisplayName");
+                    assertSerializedNullsAreNullable(serialized, getWorkitem);
+                    assertSerializedNullsAreNullable(serialized, listItems);
+
+                    WorkitemVO unassignedWithoutBody = new WorkitemVO();
+                    unassignedWithoutBody.setId(53049L);
+                    unassignedWithoutBody.setWorkType("TASK");
+                    unassignedWithoutBody.setTitle("未指派且无正文");
+                    unassignedWithoutBody.setPriority(2);
+                    unassignedWithoutBody.setVersion(0);
+                    unassignedWithoutBody.setSourceType("NATIVE");
+                    unassignedWithoutBody.setDeletable(true);
+                    unassignedWithoutBody.setPendingDecision(false);
+                    unassignedWithoutBody.setTags(List.of());
+                    JsonNode serializedUnassigned =
+                            appMapper.readTree(appMapper.writeValueAsString(unassignedWithoutBody));
+                    assertSerializedAsNull(serializedUnassigned, "assigneeType");
+                    assertSerializedAsNull(serializedUnassigned, "contentMd");
+                    assertSerializedNullsAreNullable(serializedUnassigned, getWorkitem);
+                    assertSerializedNullsAreNullable(serializedUnassigned, listItems);
+                });
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertSerializedNullsAreNullable(JsonNode serialized, Map<String, Object> declaredProperties) {
+        List<String> violations = new ArrayList<>();
+        serialized.fields().forEachRemaining(entry -> {
+            Map<String, Object> declared = (Map<String, Object>) declaredProperties.get(entry.getKey());
+            if (!entry.getValue().isNull() || declared == null) {
+                return;
+            }
+            Object type = declared.get("type");
+            List<String> allowed = type instanceof List
+                    ? (List<String>) type
+                    : List.of(String.valueOf(type));
+            if (!allowed.contains("null")) {
+                violations.add(entry.getKey() + " declared as " + allowed);
+            }
+        });
+        assertTrue(violations.isEmpty(),
+                "outputSchema rejects the serialized null values: " + violations);
+    }
+
+    private void assertSerializedAsNull(JsonNode serialized, String field) {
+        JsonNode value = serialized.get(field);
+        assertNotNull(value, "serializer dropped " + field + "; null values must reach the MCP client");
+        assertTrue(value.isNull(), field + " must serialize as null in this scenario");
     }
 
     @Test
@@ -3016,6 +3250,533 @@ class McpToolServiceTest {
         assertEquals("Workspace: 100=Alpha;300=Zeta", desc);
     }
 
+    @Test
+    void executorToolsAreRegisteredWithPageParityInputSchemas() {
+        assertEquals(List.of("workspaceId"), schemaFor("autowonder.list_executors").get("required"));
+        assertEquals(List.of("workspaceId"),
+                schemaFor("autowonder.list_executor_client_kinds").get("required"));
+        for (String tool : List.of("autowonder.get_executor", "autowonder.get_executor_token",
+                "autowonder.delete_executor", "autowonder.build_executor_launch_command")) {
+            assertEquals(List.of("workspaceId", "id"), schemaFor(tool).get("required"), tool);
+        }
+        assertEquals(List.of("workspaceId", "clientKind"),
+                schemaFor("autowonder.get_executor_launch_options").get("required"));
+        assertEquals(List.of("workspaceId", "agentId", "name", "clientKind"),
+                schemaFor("autowonder.create_executor").get("required"));
+
+        List<String> clientKinds = List.of("QODER_CLI", "QODER_CN_CLI");
+        assertEquals(clientKinds, enumValues("autowonder.create_executor", "clientKind"));
+        assertEquals(clientKinds, enumValues("autowonder.get_executor_launch_options", "clientKind"));
+        List<String> memoryModes = List.of("platform", "provider-local", "none");
+        assertEquals(memoryModes, enumValues("autowonder.create_executor", "memoryMode"));
+        assertEquals(memoryModes, enumValues("autowonder.build_executor_launch_command", "memoryMode"));
+        List<String> reasoningEfforts = List.of("max", "xhigh", "high", "medium", "low", "none");
+        assertEquals(reasoningEfforts, enumValues("autowonder.create_executor", "reasoningEffort"));
+        assertEquals(reasoningEfforts,
+                enumValues("autowonder.build_executor_launch_command", "reasoningEffort"));
+        List<String> contextWindows = List.of("1000000", "400000", "260000");
+        assertEquals(contextWindows, enumValues("autowonder.create_executor", "contextWindow"));
+        assertEquals(contextWindows,
+                enumValues("autowonder.build_executor_launch_command", "contextWindow"));
+        assertEquals(List.of("posix", "windows"),
+                enumValues("autowonder.build_executor_launch_command", "os"));
+        assertEquals(List.of("bash", "powershell"),
+                enumValues("autowonder.build_executor_launch_command", "shell"));
+    }
+
+    @Test
+    void executorModelDescriptionPublishesTheIdsRedisCurrentlyHolds() {
+        when(providerModelCatalogService.read("qoder")).thenReturn(new ProviderModelCatalogVO("qoder",
+                List.of(new ProviderModelCatalogItemVO("auto", "Auto (default)"),
+                        new ProviderModelCatalogItemVO("ultimate", "Ultimate")), new Date()));
+        when(providerModelCatalogService.read("qodercn")).thenReturn(new ProviderModelCatalogVO("qodercn",
+                List.of(new ProviderModelCatalogItemVO("qmodel_latest", "Qwen3.7-Max")), new Date()));
+
+        for (String tool : List.of("autowonder.create_executor", "autowonder.build_executor_launch_command")) {
+            String description = modelDescription(tool, principal);
+            assertTrue(description.contains("Current ids — qoder: auto, ultimate; qodercn: qmodel_latest."),
+                    tool + " must publish the live ids: " + description);
+            assertTrue(description.contains("assembled server-side"), tool);
+            assertFalse(description.contains("launch dialog pre-fills"), tool);
+        }
+    }
+
+    @Test
+    void executorModelDescriptionListsOnlyTheProvidersRedisActuallyHolds() {
+        when(providerModelCatalogService.read("qoder")).thenReturn(new ProviderModelCatalogVO("qoder",
+                List.of(new ProviderModelCatalogItemVO("auto", "Auto (default)")), new Date()));
+        when(providerModelCatalogService.read("qodercn")).thenReturn(new ProviderModelCatalogVO("qodercn",
+                List.of(), null));
+
+        String description = modelDescription("autowonder.create_executor", principal);
+
+        assertTrue(description.contains("Current ids — qoder: auto."), description);
+        assertFalse(description.contains("qodercn"), description);
+    }
+
+    @Test
+    void executorModelDescriptionFallsBackToTheStaticWordingWithoutALiveCatalog() {
+        when(providerModelCatalogService.read("qoder")).thenReturn(new ProviderModelCatalogVO("qoder",
+                List.of(), null));
+
+        String description = modelDescription("autowonder.create_executor", principal);
+
+        assertTrue(description.contains("assembled server-side"), description);
+        assertTrue(description.contains("never hardcode one"), description);
+        assertTrue(description.contains("autowonder.get_executor_launch_options"), description);
+        assertFalse(description.contains("Current ids"), description);
+        assertFalse(description.contains("launch dialog pre-fills"), description);
+    }
+
+    @Test
+    void executorModelDescriptionSurvivesAMissingOptionsBeanAndAnUnavailableCatalogStore() {
+        String withoutBean;
+        ReflectionTestUtils.setField(service, "executorLaunchOptionsService", null);
+        try {
+            withoutBean = modelDescription("autowonder.build_executor_launch_command", principal);
+        } finally {
+            ReflectionTestUtils.setField(service, "executorLaunchOptionsService",
+                    new ExecutorLaunchOptionsService(providerModelCatalogService));
+        }
+        assertTrue(withoutBean.contains("assembled server-side"), withoutBean);
+        assertFalse(withoutBean.contains("Current ids"), withoutBean);
+
+        when(providerModelCatalogService.read(anyString())).thenThrow(new IllegalStateException("redis down"));
+
+        String withFailingStore = modelDescription("autowonder.build_executor_launch_command", principal);
+        assertTrue(withFailingStore.contains("assembled server-side"), withFailingStore);
+        assertFalse(withFailingStore.contains("Current ids"), withFailingStore);
+    }
+
+    @Test
+    void thePrincipalLessCatalogNeverReadsRedisForTheModelDescription() {
+        when(providerModelCatalogService.read("qoder")).thenReturn(new ProviderModelCatalogVO("qoder",
+                List.of(new ProviderModelCatalogItemVO("auto", "Auto (default)")), new Date()));
+
+        List<McpToolVO> tools = service.listTools();
+
+        for (McpToolVO tool : tools) {
+            Map<String, Object> props = properties(tool.getInputSchema());
+            if (props != null && props.containsKey("model")) {
+                assertFalse(String.valueOf(((Map<?, ?>) props.get("model")).get("description"))
+                        .contains("Current ids"), tool.getName() + " must not read Redis");
+            }
+        }
+        verify(providerModelCatalogService, never()).read(anyString());
+    }
+
+    private String modelDescription(String tool, McpAccessTokenService.Principal caller) {
+        McpToolVO found = service.listTools(caller).stream()
+                .filter(candidate -> tool.equals(candidate.getName()))
+                .findFirst().orElseThrow();
+        return (String) property(found.getInputSchema(), "model").get("description");
+    }
+
+    @Test
+    void executorOutputSchemasUseObjectEnvelopesAndDeclareNullableFields() {
+        assertListOutputSchema(outputSchemaFor("autowonder.list_executors"),
+                "id", "agentId", "name", "clientKind", "status", "lastHeartbeat", "gmtCreate");
+        Map<String, Object> executorItem = properties(itemSchema(
+                property(outputSchemaFor("autowonder.list_executors"), "items")));
+        assertNullableField(executorItem, "agentName", "string");
+        assertNullableField(executorItem, "lastConnectIp", "string");
+        assertNullableField(executorItem, "lastHeartbeat", "string");
+        assertNullableField(executorItem, "gmtCreate", "string");
+
+        assertListOutputSchema(outputSchemaFor("autowonder.list_executor_client_kinds"), "value", "label");
+
+        Map<String, Object> optionsSchema = outputSchemaFor("autowonder.get_executor_launch_options");
+        Map<String, Object> options = properties(optionsSchema);
+        assertTrue(options.keySet().containsAll(List.of("clientKind", "provider", "models", "reasoningEfforts",
+                "contextWindows", "memoryModes", "defaultModel", "defaultCreateModel", "defaultReasoningEffort",
+                "defaultContextWindow", "defaultMemoryMode")));
+        assertNullableField(options, "modelCatalogLastSuccessfulAt", "string");
+        Map<String, Object> models = property(optionsSchema, "models");
+        assertEquals("array", models.get("type"));
+        assertTrue(properties(itemSchema(models)).keySet().containsAll(List.of("value", "label")));
+
+        assertTrue(properties(outputSchemaFor("autowonder.create_executor")).keySet().containsAll(
+                List.of("id", "agentId", "name", "token", "clientKind", "memoryMode", "model",
+                        "reasoningEffort", "contextWindow")));
+        assertTrue(properties(outputSchemaFor("autowonder.get_executor_token")).keySet()
+                .containsAll(List.of("id", "token")));
+        assertTrue(properties(outputSchemaFor("autowonder.delete_executor")).containsKey("deleted"));
+
+        Map<String, Object> command = properties(outputSchemaFor("autowonder.build_executor_launch_command"));
+        assertTrue(command.keySet().containsAll(List.of("executorId", "clientKind", "provider", "memoryMode",
+                "wsUrl", "runtimeVersion", "os", "debug", "command")));
+        assertNullableField(command, "model", "string");
+        assertNullableField(command, "reasoningEffort", "string");
+        assertNullableField(command, "contextWindow", "string");
+        assertNullableField(command, "shell", "string");
+        assertNullableField(command, "logFileName", "string");
+    }
+
+    @Test
+    void listExecutorsDelegatesWithAndWithoutTheAgentFilter() {
+        ExecutorVO every = executor(9L, 5L, "QODER_CLI");
+        ExecutorVO scoped = executor(10L, 5L, "QODER_CN_CLI");
+        when(executorService.listAll(WORKSPACE_ID)).thenReturn(List.of(every));
+        when(executorService.listByAgent(5L, WORKSPACE_ID)).thenReturn(List.of(scoped));
+
+        assertEquals(List.of(every), call(principal, "autowonder.list_executors", Map.of()));
+        assertEquals(List.of(scoped),
+                call(principal, "autowonder.list_executors", Map.of("agentId", 5L)));
+
+        verify(executorService).listAll(WORKSPACE_ID);
+        verify(executorService).listByAgent(5L, WORKSPACE_ID);
+    }
+
+    @Test
+    void getExecutorTokenAndDeleteDelegateToExecutorService() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        ExecutorVO executor = executor(9L, 5L, "QODER_CLI");
+        when(executorService.getDetail(9L, WORKSPACE_ID)).thenReturn(executor);
+        when(executorService.getToken(9L, WORKSPACE_ID)).thenReturn("awexec_plain");
+
+        assertSame(executor, call(admin, "autowonder.get_executor", Map.of("id", 9L)));
+        assertEquals(Map.of("id", 9L, "token", "awexec_plain"),
+                call(admin, "autowonder.get_executor_token", Map.of("id", 9L)));
+        assertEquals(Map.of("deleted", true),
+                call(admin, "autowonder.delete_executor", Map.of("id", 9L)));
+
+        verify(executorService).delete(9L, WORKSPACE_ID, USER_ID);
+    }
+
+    @Test
+    void getExecutorTokenSurfacesAnUnreadableCredential() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.getToken(9L, WORKSPACE_ID))
+                .thenThrow(new BizException(ErrorCode.EXECUTOR_TOKEN_NOT_RETRIEVABLE));
+
+        BizException exception = assertThrows(BizException.class,
+                () -> call(admin, "autowonder.get_executor_token", Map.of("id", 9L)));
+
+        assertEquals("17004", exception.getCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void listExecutorClientKindsOffersOnlyTheCreatableQoderFamily() {
+        List<SelectOptionVO> kinds =
+                (List<SelectOptionVO>) call(principal, "autowonder.list_executor_client_kinds", Map.of());
+
+        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI"),
+                kinds.stream().map(SelectOptionVO::getValue).toList());
+        assertEquals(List.of("Qoder CLI", "Qoder CLI CN"),
+                kinds.stream().map(SelectOptionVO::getLabel).toList());
+        verifyNoInteractions(executorService);
+    }
+
+    @Test
+    void getExecutorLaunchOptionsAssemblesValuesServerSide() {
+        Date catalogAt = new Date();
+        when(providerModelCatalogService.read("qodercn")).thenReturn(new ProviderModelCatalogVO("qodercn",
+                List.of(new ProviderModelCatalogItemVO("qmodel_latest", "Qwen3.7-Max"),
+                        new ProviderModelCatalogItemVO("auto", "Auto"),
+                        new ProviderModelCatalogItemVO("lite", null)),
+                catalogAt));
+
+        ExecutorLaunchOptionsVO options = (ExecutorLaunchOptionsVO) call(principal,
+                "autowonder.get_executor_launch_options", Map.of("clientKind", "qoder_cn_cli"));
+
+        assertEquals("QODER_CN_CLI", options.getClientKind());
+        assertEquals("qodercn", options.getProvider());
+        assertEquals(List.of("qmodel_latest", "auto", "lite"),
+                options.getModels().stream().map(SelectOptionVO::getValue).toList());
+        assertEquals(List.of("Qwen3.7-Max", "Auto", "lite"),
+                options.getModels().stream().map(SelectOptionVO::getLabel).toList());
+        assertEquals("qmodel_latest", options.getDefaultModel());
+        assertEquals("auto", options.getDefaultCreateModel());
+        assertEquals("medium", options.getDefaultReasoningEffort());
+        assertEquals("260000", options.getDefaultContextWindow());
+        assertEquals("platform", options.getDefaultMemoryMode());
+        assertEquals(catalogAt, options.getModelCatalogLastSuccessfulAt());
+    }
+
+    @Test
+    void getExecutorLaunchOptionsRejectsClientKindsThePageHides() {
+        BizException exception = assertThrows(BizException.class, () -> call(principal,
+                "autowonder.get_executor_launch_options", Map.of("clientKind", "CLAUDE_CODE")));
+
+        assertEquals("27003", exception.getCode());
+        assertTrue(exception.getMessage().contains("clientKind 仅支持 QODER_CLI/QODER_CN_CLI"));
+        verifyNoInteractions(providerModelCatalogService);
+    }
+
+    @Test
+    void createExecutorReturnsTheOneTimeTokenAndThePageDefaults() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.create(eq(5L), any(CreateExecutorRequest.class), eq(WORKSPACE_ID), eq(USER_ID)))
+                .thenReturn(issued(9L, 5L, "dev-machine-01", "awexec_plain"));
+
+        CreatedExecutorVO created = (CreatedExecutorVO) call(admin, "autowonder.create_executor",
+                Map.of("agentId", 5L, "name", "dev-machine-01", "clientKind", "QODER_CLI"));
+
+        assertEquals(9L, created.getId());
+        assertEquals(5L, created.getAgentId());
+        assertEquals("awexec_plain", created.getToken());
+        assertEquals("QODER_CLI", created.getClientKind());
+        assertEquals("platform", created.getMemoryMode());
+        assertEquals("auto", created.getModel());
+        assertEquals("medium", created.getReasoningEffort());
+        assertEquals("260000", created.getContextWindow());
+
+        ArgumentCaptor<CreateExecutorRequest> captor = ArgumentCaptor.forClass(CreateExecutorRequest.class);
+        verify(executorService).create(eq(5L), captor.capture(), eq(WORKSPACE_ID), eq(USER_ID));
+        assertEquals("dev-machine-01", captor.getValue().getName());
+        assertEquals("QODER_CLI", captor.getValue().getClientKind());
+    }
+
+    @Test
+    void createExecutorKeepsExplicitLaunchValues() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.create(eq(5L), any(CreateExecutorRequest.class), eq(WORKSPACE_ID), eq(USER_ID)))
+                .thenReturn(issued(9L, 5L, "dev-machine-01", "awexec_plain"));
+
+        CreatedExecutorVO created = (CreatedExecutorVO) call(admin, "autowonder.create_executor",
+                Map.of("agentId", 5L, "name", "dev-machine-01", "clientKind", "qoder_cn_cli",
+                        "memoryMode", "none", "model", "ultimate", "reasoningEffort", "xhigh",
+                        "contextWindow", "1000000"));
+
+        assertEquals("QODER_CN_CLI", created.getClientKind());
+        assertEquals("none", created.getMemoryMode());
+        assertEquals("ultimate", created.getModel());
+        assertEquals("xhigh", created.getReasoningEffort());
+        assertEquals("1000000", created.getContextWindow());
+    }
+
+    @Test
+    void createExecutorRejectsNonQoderClientKindsAndUnknownOptionValues() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        List<Map<String, Object>> cases = List.of(
+                Map.of("agentId", 5L, "name", "n", "clientKind", "CLAUDE_CODE"),
+                Map.of("agentId", 5L, "name", "n", "clientKind", "CODEX_CLI"),
+                Map.of("agentId", 5L, "name", "n", "clientKind", "CURSOR_CLI"),
+                Map.of("agentId", 5L, "name", "n", "clientKind", "QODER_CLI", "memoryMode", "host"),
+                Map.of("agentId", 5L, "name", "n", "clientKind", "QODER_CLI", "reasoningEffort", "extreme"),
+                Map.of("agentId", 5L, "name", "n", "clientKind", "QODER_CLI", "contextWindow", "128000"));
+
+        for (Map<String, Object> args : cases) {
+            BizException exception = assertThrows(BizException.class,
+                    () -> call(admin, "autowonder.create_executor", args));
+            assertEquals("27003", exception.getCode(), String.valueOf(args));
+        }
+
+        verify(executorService, never()).create(anyLong(), any(), anyLong(), anyLong());
+    }
+
+    @Test
+    void createExecutorResolvesTheModelIdFromTheRedisCatalog() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(providerModelCatalogService.read("qoder")).thenReturn(new ProviderModelCatalogVO("qoder",
+                List.of(new ProviderModelCatalogItemVO("auto", "Auto (default)"),
+                        new ProviderModelCatalogItemVO("ultimate", "Ultimate")), new Date()));
+        when(executorService.create(eq(5L), any(CreateExecutorRequest.class), eq(WORKSPACE_ID), eq(USER_ID)))
+                .thenReturn(issued(9L, 5L, "dev-machine-01", "awexec_plain"));
+
+        // Redis rotated qmodel_latest out, so the stale id must be re-resolved, not rejected.
+        CreatedExecutorVO stale = (CreatedExecutorVO) call(admin, "autowonder.create_executor",
+                Map.of("agentId", 5L, "name", "dev-machine-01", "clientKind", "QODER_CLI",
+                        "model", "qmodel_latest"));
+        assertEquals("auto", stale.getModel());
+
+        CreatedExecutorVO offered = (CreatedExecutorVO) call(admin, "autowonder.create_executor",
+                Map.of("agentId", 5L, "name", "dev-machine-01", "clientKind", "QODER_CLI",
+                        "model", "ultimate"));
+        assertEquals("ultimate", offered.getModel());
+
+        CreatedExecutorVO omitted = (CreatedExecutorVO) call(admin, "autowonder.create_executor",
+                Map.of("agentId", 5L, "name", "dev-machine-01", "clientKind", "QODER_CLI"));
+        assertEquals("auto", omitted.getModel());
+    }
+
+    @Test
+    void createExecutorRejectsMissingRequiredArguments() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        List<Map<String, Object>> cases = List.of(
+                Map.of("name", "n", "clientKind", "QODER_CLI"),
+                Map.of("agentId", 5L, "clientKind", "QODER_CLI"),
+                Map.of("agentId", 5L, "name", "n"));
+
+        for (Map<String, Object> args : cases) {
+            BizException exception = assertThrows(BizException.class,
+                    () -> call(admin, "autowonder.create_executor", args));
+            assertEquals("27003", exception.getCode(), String.valueOf(args));
+        }
+
+        verify(executorService, never()).create(anyLong(), any(), anyLong(), anyLong());
+    }
+
+    @Test
+    void buildExecutorLaunchCommandMatchesTheExecutorPage() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.getDetail(9L, WORKSPACE_ID)).thenReturn(executor(9L, 5L, "QODER_CLI"));
+        when(executorService.getToken(9L, WORKSPACE_ID)).thenReturn("awexec_plain");
+
+        ExecutorLaunchCommandVO command = (ExecutorLaunchCommandVO) call(admin,
+                "autowonder.build_executor_launch_command", Map.of("id", 9L));
+
+        assertEquals("npx -y autowonder@0.2.152 connect "
+                + "--ws-url wss://auto-wonder.example.com/ws/executor "
+                + "--token awexec_plain --executor-id 9 --provider qoder --memory-mode platform "
+                + "--model qmodel_latest --reasoning-effort medium --context-window 260000 "
+                + "--token-aware-enable", command.getCommand());
+        assertEquals(9L, command.getExecutorId());
+        assertEquals("qoder", command.getProvider());
+        assertEquals("platform", command.getMemoryMode());
+        assertEquals("qmodel_latest", command.getModel());
+        assertEquals("medium", command.getReasoningEffort());
+        assertEquals("260000", command.getContextWindow());
+        assertEquals("wss://auto-wonder.example.com/ws/executor", command.getWsUrl());
+        assertEquals("0.2.152", command.getRuntimeVersion());
+        assertEquals("posix", command.getOs());
+        assertFalse(command.isDebug());
+        assertNull(command.getShell());
+        assertNull(command.getLogFileName());
+    }
+
+    @Test
+    void buildExecutorLaunchCommandResolvesTheModelIdFromTheRedisCatalog() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(providerModelCatalogService.read("qoder")).thenReturn(new ProviderModelCatalogVO("qoder",
+                List.of(new ProviderModelCatalogItemVO("auto", "Auto (default)"),
+                        new ProviderModelCatalogItemVO("ultimate", "Ultimate")), new Date()));
+        when(executorService.getDetail(9L, WORKSPACE_ID)).thenReturn(executor(9L, 5L, "QODER_CLI"));
+        when(executorService.getToken(9L, WORKSPACE_ID)).thenReturn("awexec_plain");
+
+        // qmodel_latest is only the page's pre-fill hint; Redis rotated it out, so the server re-resolves it.
+        ExecutorLaunchCommandVO stale = (ExecutorLaunchCommandVO) call(admin,
+                "autowonder.build_executor_launch_command", Map.of("id", 9L, "model", "qmodel_latest"));
+        assertEquals("auto", stale.getModel());
+        assertTrue(stale.getCommand().contains("--model auto --reasoning-effort medium"), stale.getCommand());
+
+        ExecutorLaunchCommandVO offered = (ExecutorLaunchCommandVO) call(admin,
+                "autowonder.build_executor_launch_command", Map.of("id", 9L, "model", "ultimate"));
+        assertEquals("ultimate", offered.getModel());
+        assertTrue(offered.getCommand().contains("--model ultimate --reasoning-effort high"),
+                offered.getCommand());
+
+        ExecutorLaunchCommandVO omitted = (ExecutorLaunchCommandVO) call(admin,
+                "autowonder.build_executor_launch_command", Map.of("id", 9L));
+        assertEquals("auto", omitted.getModel());
+    }
+
+    @Test
+    void buildExecutorLaunchCommandSupportsWindowsDebugLikeThePage() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.getDetail(9L, WORKSPACE_ID)).thenReturn(executor(9L, 5L, "QODER_CLI"));
+        when(executorService.getToken(9L, WORKSPACE_ID)).thenReturn("awexec_plain");
+
+        ExecutorLaunchCommandVO command = (ExecutorLaunchCommandVO) call(admin,
+                "autowonder.build_executor_launch_command",
+                Map.of("id", 9L, "os", "windows", "debug", true));
+
+        assertEquals("windows", command.getOs());
+        assertTrue(command.isDebug());
+        assertEquals("powershell", command.getShell());
+        assertTrue(command.getCommand().startsWith("powershell -NoProfile -EncodedCommand "));
+        assertTrue(command.getLogFileName().matches("aw-qoder-9-\\d{6}-\\d{2}-\\d{2}-\\d{2}\\.log"),
+                command.getLogFileName());
+    }
+
+    @Test
+    void buildExecutorLaunchCommandOmitsQoderFlagsForLegacyExecutors() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.getDetail(9L, WORKSPACE_ID)).thenReturn(executor(9L, 5L, "CLAUDE_CODE"));
+        when(executorService.getToken(9L, WORKSPACE_ID)).thenReturn("awexec_plain");
+
+        ExecutorLaunchCommandVO command = (ExecutorLaunchCommandVO) call(admin,
+                "autowonder.build_executor_launch_command", Map.of("id", 9L));
+
+        assertEquals("claude", command.getProvider());
+        assertNull(command.getModel());
+        assertNull(command.getReasoningEffort());
+        assertNull(command.getContextWindow());
+        assertFalse(command.getCommand().contains("--token-aware-enable"));
+        assertFalse(command.getCommand().contains("--model"));
+        verify(providerModelCatalogService, never()).read(anyString());
+    }
+
+    @Test
+    void dispatchCredentialCannotManageExecutorsEvenWithAdminWorkspaceAccess() {
+        when(dispatchDao.findById(321L)).thenReturn(dispatch(321L, WORKSPACE_ID, 99L, 40014L));
+        McpAccessTokenService.Principal dispatchAdmin = new McpAccessTokenService.Principal(
+                WORKSPACE_ID, USER_ID, -321L, WorkspaceAccessLevel.ADMIN,
+                McpAccessTokenService.CredentialType.DISPATCH);
+        Map<String, Object> args =
+                Map.of("id", 9L, "agentId", 5L, "name", "n", "clientKind", "QODER_CLI");
+
+        for (String tool : List.of("autowonder.create_executor", "autowonder.get_executor_token",
+                "autowonder.delete_executor", "autowonder.build_executor_launch_command")) {
+            BizException exception = assertThrows(BizException.class, () -> call(dispatchAdmin, tool, args));
+            assertEquals("10403", exception.getCode(), tool);
+        }
+
+        verifyNoInteractions(executorService);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void dispatchCredentialKeepsReadOnlyExecutorVisibility() {
+        when(executorService.listAll(WORKSPACE_ID)).thenReturn(List.of(executor(9L, 5L, "QODER_CLI")));
+
+        List<ExecutorVO> executors =
+                (List<ExecutorVO>) call(dispatchPrincipal(), "autowonder.list_executors", Map.of());
+
+        assertEquals(1, executors.size());
+        assertEquals(9L, executors.get(0).getId());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void executorToolsFailClosedWhenDependenciesAreUnavailable() {
+        ReflectionTestUtils.setField(service, "executorService", null);
+        ReflectionTestUtils.setField(service, "executorLaunchOptionsService", null);
+        ReflectionTestUtils.setField(service, "executorLaunchCommandService", null);
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        Map<String, Object> args =
+                Map.of("id", 9L, "agentId", 5L, "name", "n", "clientKind", "QODER_CLI");
+
+        for (String tool : List.of("autowonder.list_executors", "autowonder.get_executor",
+                "autowonder.get_executor_launch_options", "autowonder.create_executor",
+                "autowonder.get_executor_token", "autowonder.delete_executor",
+                "autowonder.build_executor_launch_command")) {
+            BizException exception = assertThrows(BizException.class, () -> call(admin, tool, args));
+            assertEquals("10000", exception.getCode(), tool);
+        }
+
+        List<SelectOptionVO> kinds =
+                (List<SelectOptionVO>) call(admin, "autowonder.list_executor_client_kinds", Map.of());
+        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI"),
+                kinds.stream().map(SelectOptionVO::getValue).toList());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> enumValues(String tool, String propertyName) {
+        return (List<String>) property(schemaFor(tool), propertyName).get("enum");
+    }
+
+    private ExecutorVO executor(long id, long agentId, String clientKind) {
+        ExecutorVO vo = new ExecutorVO();
+        vo.setId(id);
+        vo.setAgentId(agentId);
+        vo.setAgentName("Alpha");
+        vo.setName("executor-" + id);
+        vo.setClientKind(clientKind);
+        vo.setStatus("ONLINE");
+        return vo;
+    }
+
+    private IssuedExecutorVO issued(long id, long agentId, String name, String token) {
+        IssuedExecutorVO vo = new IssuedExecutorVO();
+        vo.setId(id);
+        vo.setAgentId(agentId);
+        vo.setName(name);
+        vo.setToken(token);
+        return vo;
+    }
+
     private McpToolVO toolByName(String name) {
         return service.listTools().stream()
                 .filter(tool -> name.equals(tool.getName()))
@@ -3085,5 +3846,31 @@ class McpToolServiceTest {
                 mock(PlatformBrandingDao.class), new InMemoryObjectStorage(), new OssProperties(),
                 baseUrl, runtimeVersion, "x.x.x", false);
         return new WorkitemCliUploadTokenService(new JwtService(props), workitemDao, memberDao, branding);
+    }
+
+    private WorkitemCliDownloadTokenService realDownloadTokenService(String baseUrl, String runtimeVersion) {
+        WorkitemDao workitemDao = mock(WorkitemDao.class);
+        WorkspaceMemberDao memberDao = mock(WorkspaceMemberDao.class);
+        WorkitemDO workitem = new WorkitemDO();
+        workitem.setId(50063L);
+        workitem.setTenantId(WORKSPACE_ID);
+        when(workitemDao.findById(50063L)).thenReturn(workitem);
+        WorkspaceMemberDO member = new WorkspaceMemberDO();
+        member.setTenantId(WORKSPACE_ID);
+        member.setUserId(USER_ID);
+        member.setAccessLevel("READ_ONLY");
+        member.setStatus(0);
+        member.setIsDeleted(0);
+        when(memberDao.findByWorkspaceAndUser(WORKSPACE_ID, USER_ID)).thenReturn(member);
+        Environment env = mock(Environment.class);
+        when(env.getActiveProfiles()).thenReturn(new String[]{"daily"});
+        JwtProperties props = new JwtProperties(env);
+        props.setSecret("test-secret-key-that-is-long-enough-32bytes!");
+        props.setAccessTtlSeconds(3600);
+        props.setRefreshTtlSeconds(7200);
+        PlatformBrandingService branding = new PlatformBrandingService(
+                mock(PlatformBrandingDao.class), new InMemoryObjectStorage(), new OssProperties(),
+                baseUrl, runtimeVersion, "x.x.x", false);
+        return new WorkitemCliDownloadTokenService(new JwtService(props), workitemDao, memberDao, branding);
     }
 }

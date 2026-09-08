@@ -13,14 +13,14 @@ import java.util.List;
 public class ConversationTurnEventService {
 
     private static final Logger log = LoggerFactory.getLogger(ConversationTurnEventService.class);
-    // 服务端直推事件使用基于时间的序号，避免与 Runtime 每轮次从 1 递增的 eventSeq 冲突。
-    private static final java.util.concurrent.atomic.AtomicLong SERVER_PUSHED_EVENT_SEQ =
-            new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
+    /** 按轮次取事件的硬上限。一轮 token 级 chunk 可达数千行，不能裸查。 */
+    static final int MAX_TURN_EVENTS = 5000;
 
     private final AgentConversationTurnEventDao eventDao;
     private final AgentConversationDao convDao;
     private final AgentConversationTurnDao turnDao;
-    private ConversationRealtimePublisher conversationRealtimePublisher;
+    private ConversationBrowserEventPublisher browserEventPublisher;
+    private ConversationElicitationService conversationElicitationService;
 
     public ConversationTurnEventService(AgentConversationTurnEventDao eventDao,
             AgentConversationDao convDao, AgentConversationTurnDao turnDao) {
@@ -30,8 +30,14 @@ public class ConversationTurnEventService {
     }
 
     @Autowired(required = false)
-    public void setConversationRealtimePublisher(ConversationRealtimePublisher conversationRealtimePublisher) {
-        this.conversationRealtimePublisher = conversationRealtimePublisher;
+    public void setBrowserEventPublisher(ConversationBrowserEventPublisher browserEventPublisher) {
+        this.browserEventPublisher = browserEventPublisher;
+    }
+
+    @Autowired(required = false)
+    public void setConversationElicitationService(
+            ConversationElicitationService conversationElicitationService) {
+        this.conversationElicitationService = conversationElicitationService;
     }
 
     public void persistEvent(long tenantId, long executorId, long conversationId,
@@ -71,7 +77,29 @@ public class ConversationTurnEventService {
             if ("status".equals(eventType) && assembled != null) {
                 updateCliSessionRefIfPresent(tenantId, conversationId, assembled);
             }
+            dispatchElicitationEvent(tenantId, conversationId, turnId, eventType, assembled);
             publishToBrowser(tenantId, conversationId, turnId, eventSeq, eventType, assembled);
+        }
+    }
+
+    /**
+     * 只拦 {@code acp_elicitation*} 前缀：卡片需要可变状态与幂等约束，必须落挂起表；
+     * 而 plan 与 commands 是纯展示数据，事件表本身就是它们的持久化载体。
+     *
+     * <p>分派失败只记 warn —— 卡片落库出问题不该让整条事件流断掉，浏览器仍要收到这条事件。
+     */
+    private void dispatchElicitationEvent(long tenantId, long conversationId, long turnId,
+            String eventType, String assembled) {
+        if (conversationElicitationService == null || assembled == null || eventType == null
+                || !eventType.startsWith(ConversationElicitationService.EVENT_TYPE_PREFIX)) {
+            return;
+        }
+        try {
+            conversationElicitationService.onEvent(tenantId, conversationId, turnId, eventType,
+                    assembled);
+        } catch (RuntimeException e) {
+            log.warn("acp elicitation event handling failed conversationId={} turnId={} type={}: {}",
+                    conversationId, turnId, eventType, e.getMessage());
         }
     }
 
@@ -81,13 +109,15 @@ public class ConversationTurnEventService {
     }
 
     /**
-     * 服务端直接向浏览器推送轮次状态事件（不落库），用于取消等需要前端
-     * 立即感知终结态的场景。
+     * 取某一轮次的全部事件，供历史轮次「查看执行详情」按需加载。
+     *
+     * <p>现有 {@link #listEventsAfter} 只支持 afterId 且被调用方限到 200 条，无法
+     * 按轮次取全。这里的上限刻意设得高但有限：执行器逐条转发、一个 token 级
+     * chunk 就是一行记录，一轮数百至数千行是常态。
      */
-    public void publishStatusEvent(long tenantId, long conversationId, long turnId, String status) {
-        String payload = "{\"type\":\"status\",\"status\":\"" + status + "\"}";
-        publishToBrowser(tenantId, conversationId, turnId,
-                SERVER_PUSHED_EVENT_SEQ.incrementAndGet(), "status", payload);
+    public List<AgentConversationTurnEventDO> listEventsByTurn(long tenantId, long conversationId,
+            long turnId) {
+        return eventDao.listByTurn(tenantId, conversationId, turnId, MAX_TURN_EVENTS);
     }
 
     private boolean allChunksPresent(long tenantId, long turnId, int dispatchAttempt,
@@ -130,23 +160,10 @@ public class ConversationTurnEventService {
 
     private void publishToBrowser(long tenantId, long conversationId, long turnId,
             long eventSeq, String eventType, String payloadJson) {
-        if (conversationRealtimePublisher == null) {
+        if (browserEventPublisher == null) {
             return;
         }
-        try {
-            java.util.Map<String, Object> event = new java.util.LinkedHashMap<>();
-            event.put("conversationId", conversationId);
-            event.put("turnId", turnId);
-            event.put("eventSeq", eventSeq);
-            event.put("eventType", eventType);
-            if (payloadJson != null) {
-                event.put("payload", JSON.parse(payloadJson));
-            }
-            conversationRealtimePublisher.publish(
-                    "conversation:" + conversationId, "CONVERSATION_TURN_EVENT", event);
-        } catch (Exception e) {
-            log.warn("conversation event browser publish failed conversationId={} turnId={} eventSeq={}: {}",
-                    conversationId, turnId, eventSeq, e.getMessage());
-        }
+        browserEventPublisher.publish(tenantId, conversationId, turnId, eventSeq,
+                eventType, payloadJson);
     }
 }

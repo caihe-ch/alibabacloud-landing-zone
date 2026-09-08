@@ -1,0 +1,65 @@
+# End-to-end layer for the community harness.
+#
+# This file is an *additional* compose file, layered on top of
+# docs/community/docker-compose.dependencies.yml:
+#
+#   docker compose -p <project> \
+#     -f docs/community/docker-compose.dependencies.yml \
+#     -f e2e-tests/compose.e2e.yml up -d --wait
+#
+# It does two things, and neither edits the community file.
+#
+# 1. Adds MinIO. The community compose file intentionally provides only MySQL
+#    and Redis, because a real deployment uses a real OSS-compatible bucket. A
+#    verification machine usually has no OSS credentials, and the application
+#    has no in-memory fallback: ObjectStorageConfig declares
+#    taskPackager(ObjectStorage, ...) unconditionally, so with both oss.enabled
+#    and s3.enabled false there is no ObjectStorage bean and the context cannot
+#    start. MinIO is an explicitly supported S3 backend (see the comment on the
+#    s3 block in application.yml), so it stands in for OSS here.
+#
+# 2. Makes the pull policy configurable. The community file pins
+#    platform: linux/amd64, and a local image whose tag resolves to the host
+#    architecture is not accepted as satisfying that pin: compose then consults
+#    the registry even though a runnable amd64 image is already present. On a
+#    machine whose primary registry is unreachable that fails the whole stack.
+#    e2e-tests/up.sh pre-provisions every image (falling back to a public
+#    mirror) and then sets AW_E2E_PULL_POLICY=never so compose uses what is
+#    already local. The default stays "missing", compose's own default.
+#
+# The network name is overridden so concurrent runs on one host, and runs that
+# reuse the documented default network name, cannot collide.
+
+networks:
+  community:
+    name: ${AW_E2E_NETWORK:-aw-e2e-net}
+
+services:
+  mysql:
+    pull_policy: ${AW_E2E_PULL_POLICY:-missing}
+
+  redis:
+    pull_policy: ${AW_E2E_PULL_POLICY:-missing}
+
+  minio:
+    image: ${AW_E2E_MINIO_IMAGE:-quay.io/minio/minio:latest}
+    pull_policy: ${AW_E2E_PULL_POLICY:-missing}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${AW_E2E_MINIO_ROOT_USER:-aw-e2e-minio}
+      MINIO_ROOT_PASSWORD: ${AW_E2E_MINIO_ROOT_PASSWORD:?set by e2e-tests/up.sh}
+      TZ: Asia/Shanghai
+    ports:
+      - "${AW_E2E_MINIO_PORT:-9000}:9000"
+      - "${AW_E2E_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [community]
+
+volumes:
+  minio-data:

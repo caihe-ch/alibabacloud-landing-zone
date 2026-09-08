@@ -1,7 +1,8 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, within, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { message } from 'antd';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { http, HttpResponse } from 'msw';
 import { server } from '@/test/mocks/server';
@@ -49,15 +50,54 @@ function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <BrandingConfigPage />
+      <MemoryRouter initialEntries={['/workspaces/branding']}>
+        <BrandingConfigPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <span data-testid="location-path">{location.pathname}</span>;
+}
+
+function renderPageWithLocation() {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/workspaces/branding']}>
+        <BrandingConfigPage />
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+/** antd Tabs mounts a pane only once its tab has been activated. */
+async function openNotificationTab() {
+  await userEvent.click(await screen.findByRole('tab', { name: '协作通知' }));
+}
+
+async function openPlatformAdminTab() {
+  await userEvent.click(await screen.findByRole('tab', { name: '平台管理员' }));
 }
 
 describe('BrandingConfigPage', () => {
   beforeEach(() => {
     document.body.innerHTML = '';
     vi.restoreAllMocks();
+    // antd's static message() portals its notices into document.body and auto-closes them after 3s.
+    // A notice opened by an earlier test is therefore removed by React *after* the body wipe above
+    // has already detached it, which throws "The node to be removed is not a child of this node".
+    // Nothing here asserts on a rendered toast, so keeping the real holder out of the DOM removes
+    // the race instead of papering over it with timing.
+    vi.spyOn(message, 'success').mockImplementation(
+      () => undefined as unknown as ReturnType<typeof message.success>,
+    );
+    vi.spyOn(message, 'error').mockImplementation(
+      () => undefined as unknown as ReturnType<typeof message.error>,
+    );
     useAuthStore.getState().clear();
     useAuthStore.getState().setCurrentWorkspace({ id: 1, name: 'O', description: '' }, 'ADMIN');
     server.use(
@@ -111,8 +151,10 @@ describe('BrandingConfigPage', () => {
   it('loads dingtalk collaboration robot status', async () => {
     renderPage();
 
-    expect(await screen.findByText('协作通知')).toBeInTheDocument();
-    expect(screen.getByText('钉钉机器人')).toBeInTheDocument();
+    expect(await screen.findByRole('tab', { name: '协作通知' })).toBeInTheDocument();
+    await openNotificationTab();
+
+    expect(await screen.findByText('钉钉机器人')).toBeInTheDocument();
     expect(await screen.findByText('AppSecret 已配置')).toBeInTheDocument();
     expect(screen.getByText('配置完整')).toBeInTheDocument();
   });
@@ -135,6 +177,7 @@ describe('BrandingConfigPage', () => {
     );
 
     renderPage();
+    await openNotificationTab();
 
     expect(await screen.findByText('AppSecret 已配置')).toBeInTheDocument();
     expect(screen.getByText('配置未完整')).toBeInTheDocument();
@@ -151,6 +194,7 @@ describe('BrandingConfigPage', () => {
     );
 
     renderPage();
+    await openNotificationTab();
 
     const appKeyInput = await screen.findByLabelText('AppKey');
     await waitFor(() => expect(appKeyInput).not.toBeDisabled());
@@ -181,6 +225,7 @@ describe('BrandingConfigPage', () => {
     );
 
     renderPage();
+    await openNotificationTab();
 
     const enabledSwitch = await screen.findByRole('switch', { name: '启用钉钉机器人' });
     await userEvent.click(enabledSwitch);
@@ -284,5 +329,133 @@ describe('BrandingConfigPage', () => {
     fireEvent.error(logoImg);
 
     expect(logoImg.getAttribute('src')).toBe('/logo.png');
+  });
+
+  it('shows an enabled back-to-home entry beside the page title', async () => {
+    renderPage();
+
+    const backButton = await screen.findByRole('button', { name: /返回首页/ });
+    await waitFor(() => expect(backButton).toBeEnabled());
+    expect(screen.getByText('品牌和一致性配置')).toBeInTheDocument();
+  });
+
+  it('navigates back to the platform home when the back entry is clicked', async () => {
+    renderPageWithLocation();
+
+    expect(await screen.findByTestId('location-path')).toHaveTextContent('/workspaces/branding');
+
+    await userEvent.click(screen.getByRole('button', { name: /返回首页/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location-path')).toHaveTextContent(/^\/$/);
+    });
+  });
+
+  it('keeps the back entry above the collaboration notice section', async () => {
+    renderPage();
+
+    const backButton = await screen.findByRole('button', { name: /返回首页/ });
+    const noticeSection = await screen.findByText('协作通知');
+
+    expect(
+      backButton.compareDocumentPosition(noticeSection) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('leaves directly with unsaved branding edits instead of prompting', async () => {
+    renderPageWithLocation();
+
+    const nameInput = await screen.findByPlaceholderText('AutoWonder');
+    await waitFor(() => expect(nameInput).not.toBeDisabled());
+    await userEvent.clear(nameInput);
+    await userEvent.type(nameInput, 'WonderHub');
+
+    await userEvent.click(screen.getByRole('button', { name: /返回首页/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location-path')).toHaveTextContent(/^\/$/);
+    });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('groups branding, collaboration notice and platform admins into tabs', async () => {
+    renderPage();
+
+    expect(await screen.findByRole('tab', { name: '品牌与主题' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '协作通知' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '平台管理员' })).toBeInTheDocument();
+
+    // Branding stays the landing pane so an operator who only came to rename the platform does not
+    // have to hunt for the form.
+    const saveButton = await screen.findByRole('button', { name: /保存配置/ });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+  });
+
+  it('does not fetch the platform admin roster until its tab is opened', async () => {
+    let adminRequests = 0;
+    server.use(http.get('/api/platform/admins', () => {
+      adminRequests += 1;
+      return HttpResponse.json({
+        success: true,
+        code: '0',
+        message: '',
+        traceId: null,
+        data: { admins: [], canManage: false },
+      });
+    }));
+
+    renderPage();
+
+    await screen.findByRole('tab', { name: '平台管理员' });
+    expect(adminRequests).toBe(0);
+
+    await openPlatformAdminTab();
+
+    await waitFor(() => expect(adminRequests).toBe(1));
+  });
+
+  it('manages platform admins from the third tab', async () => {
+    server.use(http.get('/api/platform/admins', () => HttpResponse.json({
+      success: true,
+      code: '0',
+      message: '',
+      traceId: null,
+      data: {
+        admins: [
+          {
+            userId: 10000,
+            username: 'alice',
+            nickname: '爱丽丝',
+            email: 'alice@example.com',
+            active: true,
+            self: true,
+            removable: false,
+            removeDisabledReason: '平台管理员不可移除自己',
+          },
+          {
+            userId: 10001,
+            username: 'bob',
+            nickname: '鲍勃',
+            email: 'bob@example.com',
+            active: true,
+            self: false,
+            removable: true,
+            removeDisabledReason: null,
+          },
+        ],
+        canManage: true,
+      },
+    })));
+
+    renderPage();
+    await openPlatformAdminTab();
+
+    const selfRow = (await screen.findByText('爱丽丝')).closest('tr');
+    const otherRow = (await screen.findByText('鲍勃')).closest('tr');
+    expect(selfRow).not.toBeNull();
+    expect(otherRow).not.toBeNull();
+    expect(within(selfRow!).getByRole('button', { name: '移除' })).toBeDisabled();
+    expect(within(otherRow!).getByRole('button', { name: '移除' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '添加管理员' })).toBeDisabled();
   });
 });

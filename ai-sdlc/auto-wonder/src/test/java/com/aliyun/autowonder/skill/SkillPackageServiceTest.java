@@ -11,6 +11,7 @@ import com.aliyun.autowonder.user.UserDao;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.mock.web.MockMultipartFile;
 
 import java.io.ByteArrayOutputStream;
@@ -337,6 +338,74 @@ class SkillPackageServiceTest {
 
         assertEquals(ErrorCode.SKILL_DUPLICATE_NAME.getCode(), ex.getCode());
         verify(storage, never()).put(anyString(), anyString(), any());
+        verify(skillDao, never()).releaseSoftDeletedName(anyLong(), anyString(), anyString());
+    }
+
+    @Test
+    void createUploadedSkillReleasesSoftDeletedNameBeforeInsert() throws Exception {
+        MockMultipartFile file = skillZip("revived-skill", "Revived after delete");
+        when(skillDao.findByTypeAndName(1L, "SKILL", "revived-skill")).thenReturn(null);
+        doAnswer(invocation -> { invocation.<SkillDO>getArgument(0).setId(10003L); return null; })
+                .when(skillDao).insert(any(SkillDO.class));
+        when(storage.put(eq("artifact-bucket"), eq("t/1/skills/10003/skill.zip"), any()))
+                .thenReturn(new StoredObject("artifact-bucket/t/1/skills/10003/skill.zip", "md5", file.getSize()));
+        when(skillDao.updatePackage(eq(10003L), eq(1L), eq("SKILL"), anyString(), eq("revived-skill"),
+                eq("Revived after delete"), eq("OSS_ZIP"), anyString(), eq("revived-skill.zip"),
+                eq(file.getSize()), eq("md5"), eq(0), eq(2L))).thenReturn(1);
+        SkillDO stored = new SkillDO();
+        stored.setId(10003L);
+        stored.setTenantId(1L);
+        stored.setType("SKILL");
+        stored.setName("revived-skill");
+        stored.setSourceType("OSS_ZIP");
+        when(skillDao.findById(10003L)).thenReturn(stored);
+
+        SkillVO vo = service.createFromPackage(file, 1L, 2L);
+
+        assertEquals("revived-skill", vo.getName());
+        InOrder inOrder = inOrder(skillDao);
+        inOrder.verify(skillDao).releaseSoftDeletedName(1L, "SKILL", "revived-skill");
+        inOrder.verify(skillDao).insert(any(SkillDO.class));
+    }
+
+    @Test
+    void createUploadedSkillDoesNotReleasePlaceholderWhenActiveDuplicateExists() throws Exception {
+        MockMultipartFile file = skillZip("duplicate-skill", "Updated description");
+        SkillDO duplicate = new SkillDO();
+        duplicate.setId(10001L);
+        duplicate.setPackageMd5("other-md5");
+        when(skillDao.findByTypeAndName(1L, "SKILL", "duplicate-skill")).thenReturn(duplicate);
+
+        BizException ex = assertThrows(BizException.class, () -> service.createFromPackage(file, 1L, 2L));
+
+        assertEquals(ErrorCode.SKILL_DUPLICATE_NAME.getCode(), ex.getCode());
+        verify(skillDao, never()).releaseSoftDeletedName(anyLong(), anyString(), anyString());
+        verify(skillDao, never()).insert(any());
+        verify(storage, never()).put(anyString(), anyString(), any());
+    }
+
+    @Test
+    void updateUploadedSkillReleasesSoftDeletedNameBeforeUploadingBytes() throws Exception {
+        MockMultipartFile file = skillZip("revived-skill", "Revived after delete");
+        SkillDO existing = new SkillDO();
+        existing.setId(10000L);
+        existing.setTenantId(1L);
+        existing.setType("SKILL");
+        existing.setName("custom-skill");
+        existing.setVersion(3);
+        when(skillDao.findById(10000L)).thenReturn(existing);
+        when(skillDao.findByTypeAndName(1L, "SKILL", "revived-skill")).thenReturn(null);
+        when(storage.put(eq("artifact-bucket"), eq("t/1/skills/10000/skill.zip"), any()))
+                .thenReturn(new StoredObject("artifact-bucket/t/1/skills/10000/skill.zip", "md5", file.getSize()));
+        when(skillDao.updatePackage(eq(10000L), eq(1L), eq("SKILL"), anyString(), eq("revived-skill"),
+                eq("Revived after delete"), eq("OSS_ZIP"), anyString(), eq("revived-skill.zip"),
+                eq(file.getSize()), eq("md5"), eq(3), eq(2L))).thenReturn(1);
+
+        service.updatePackage(10000L, file, 1L, 2L);
+
+        InOrder inOrder = inOrder(skillDao, storage);
+        inOrder.verify(skillDao).releaseSoftDeletedName(1L, "SKILL", "revived-skill");
+        inOrder.verify(storage).put(eq("artifact-bucket"), eq("t/1/skills/10000/skill.zip"), any());
     }
 
     private static MockMultipartFile skillZip(String name, String description) throws Exception {

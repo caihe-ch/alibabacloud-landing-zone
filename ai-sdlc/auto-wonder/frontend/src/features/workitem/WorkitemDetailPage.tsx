@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Empty, List, Modal, Spin, Result, Button, Space, Tag, Typography } from 'antd';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTemplateDetail } from '@/features/statemachine/hooks';
 import {
@@ -24,7 +24,10 @@ import { ScrollToEdgeButton } from './components/ScrollToEdgeButton';
 import { RightPanel } from './components/RightPanel';
 import { ResizeHandle } from '@/shared/ui/ResizeHandle';
 import { AI_CLARIFICATION_ENABLED } from './featureFlags';
+import { isSameClarifyView, readClarifyView, writeClarifyView } from './clarifyView';
+import type { ClarifyContext, ClarifyView } from './clarifyView';
 import { useAccessCommand } from '@/shared/auth/useAccessCommand';
+import { CLARIFICATION_THEME } from './clarification/theme';
 
 const CLARIFY_MIN_WIDTH = 320;
 
@@ -39,13 +42,28 @@ export function WorkitemDetailPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const leftScrollRef = useRef<HTMLDivElement>(null);
-  const [panelMode, setPanelMode] = useState<'progress' | 'clarify'>('progress');
+  const [searchParams, setSearchParams] = useSearchParams();
+  // 澄清视图状态挂在 URL 上：刷新后仍停在原工单的原澄清会话并恢复全屏态（工单 53035）
+  const clarifyView = readClarifyView(searchParams);
+  const panelMode = clarifyView.mode;
   const [clarifyWidth, setClarifyWidth] = useState<number | null>(null);
   const rightPanelRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    setPanelMode('progress');
     setClarifyWidth(null);
   }, [id]);
+
+  // 依赖 react-router 按 location.search 记忆化的 searchParams：交付进度在轮询，
+  // 但轮询不改 search，回调标识因此稳定，澄清面板的上下文上报 effect 不会被无谓地反复触发。
+  const updateClarifyView = useCallback((patch: Partial<ClarifyView>) => {
+    const next = writeClarifyView(searchParams, patch);
+    if (isSameClarifyView(readClarifyView(next), readClarifyView(searchParams))) return;
+    // replace：刷新能恢复即可，不该让每次进出澄清都往浏览历史里塞一条
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+  const handleClarifyContextChange = useCallback(
+    (context: Partial<ClarifyContext>) => updateClarifyView(context),
+    [updateClarifyView],
+  );
 
   const { data: workitem, isLoading, isError, error } = useWorkitem(id || '');
   const templateId = workitem?.templateId != null ? Number(workitem.templateId) : null;
@@ -121,6 +139,7 @@ export function WorkitemDetailPage() {
             scheduledStartAt={workitem.scheduledStartAt}
             scheduledStartTriggeredAt={workitem.scheduledStartTriggeredAt}
             gmtCreate={workitem.gmtCreate}
+            usage={progress?.totalUsage ?? null}
           />
           <HumanInterventionAlert item={workitem} />
           <WorkitemMeta
@@ -200,8 +219,8 @@ export function WorkitemDetailPage() {
           width: clarifyWidth != null ? `${clarifyWidth}px` : 'clamp(340px, 28vw, 420px)',
           flexShrink: 0,
           padding: 12,
-          background: '#fafafa',
-          borderLeft: '1px solid #e5e7eb',
+          background: CLARIFICATION_THEME.surface,
+          borderLeft: `1px solid ${CLARIFICATION_THEME.hairline}`,
           overflowY: 'auto',
           position: 'relative',
           display: panelMode === 'clarify' ? 'flex' : 'block',
@@ -232,10 +251,15 @@ export function WorkitemDetailPage() {
           artifacts={artifacts}
           artifactsLoading={artifactsLoading}
           onClarifyConfirm={handleClarifyConfirm}
+          initialMode={panelMode}
+          initialFullscreen={clarifyView.fullscreen}
+          clarifyContext={clarifyView}
           onModeChange={(next) => {
-            setPanelMode(next);
             if (next === 'progress') setClarifyWidth(null);
+            updateClarifyView({ mode: next });
           }}
+          onFullscreenChange={(fullscreen) => updateClarifyView({ fullscreen })}
+          onClarifyContextChange={handleClarifyContextChange}
         />
       </div>
 

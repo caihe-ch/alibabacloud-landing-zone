@@ -43,6 +43,19 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+      按 event_seq / chunk_index 保序：前端要按真实时序渲染时间线，并自行重组分片。
+      LIMIT 是硬性的 —— 一轮 token 级 chunk 可达数千行，裸查会把内存打满。
+    -->
+    <select id="listByTurn" resultMap="BaseResultMap">
+        SELECT * FROM agent_conversation_turn_event
+        WHERE tenant_id = #{tenantId}
+          AND conversation_id = #{conversationId}
+          AND turn_id = #{turnId}
+        ORDER BY event_seq ASC, chunk_index ASC
+        LIMIT #{limit}
+    </select>
+
     <delete id="deleteExpiredBatch">
         DELETE FROM agent_conversation_turn_event
         WHERE gmt_create &lt; #{cutoff}

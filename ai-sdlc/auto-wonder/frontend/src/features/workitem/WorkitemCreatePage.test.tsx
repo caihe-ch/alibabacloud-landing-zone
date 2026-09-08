@@ -1,11 +1,11 @@
 import { beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import dayjs from 'dayjs';
 import { message } from 'antd';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { http, HttpResponse } from 'msw';
+import dayjs from 'dayjs';
 import { server } from '@/test/mocks/server';
 import { WorkitemCreatePage } from './WorkitemCreatePage';
 import { useAuthStore } from '@/shared/auth/store';
@@ -152,10 +152,9 @@ describe('WorkitemCreatePage', () => {
     await userEvent.click(await screen.findByLabelText('执行 Agent'));
     await userEvent.click(await screen.findByText('Agent-77 (AW_FS_DEV)'));
 
-    // The picker disables past instants, so derive the input from the current
-    // clock instead of a literal date that silently expires.
-    const scheduledAt = dayjs().add(1, 'day').hour(10).minute(0).second(0).millisecond(0);
-    await userEvent.type(screen.getByPlaceholderText('留空则立即执行'), scheduledAt.format('YYYY-MM-DD HH:mm:ss'));
+    // 实现的 disabledDate 会拦掉早于当前时刻的定时执行时间，基准必须相对「现在」取未来时间
+    const scheduledStart = dayjs().add(1, 'day').startOf('hour');
+    await userEvent.type(screen.getByPlaceholderText('留空则立即执行'), scheduledStart.format('YYYY-MM-DD HH:mm:ss'));
     await userEvent.tab();
 
     await userEvent.click(screen.getByRole('button', { name: /创\s*建/ }));
@@ -172,6 +171,6 @@ describe('WorkitemCreatePage', () => {
       });
     });
     expect(new Date(requestedBody!.scheduledStartAt as string).toISOString())
-      .toBe(scheduledAt.toISOString());
+      .toBe(scheduledStart.toISOString());
   });
 });

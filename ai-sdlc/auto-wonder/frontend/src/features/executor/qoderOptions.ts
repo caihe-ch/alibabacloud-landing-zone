@@ -1,3 +1,5 @@
+import type { ExecutorModelCatalogModel, ExecutorModelCatalogProvider } from './api';
+
 export type QoderSelectOption = { value: string; label: string };
 
 export type QoderModelOptions = {
@@ -25,6 +27,23 @@ export const QODER_MODELS: QoderSelectOption[] = [
   { value: 'dfmodel', label: 'DeepSeek-V4-Flash' },
   { value: 'mmodel', label: 'MiniMax-M3' },
 ];
+
+export function qoderProviderForClientKind(kind?: string): ExecutorModelCatalogProvider | undefined {
+  if (kind === 'QODER_CLI') return 'qoder';
+  if (kind === 'QODER_CN_CLI') return 'qodercn';
+  return undefined;
+}
+
+export function resolveQoderModelOptions(models?: ExecutorModelCatalogModel[] | null): QoderSelectOption[] {
+  return models?.length
+    ? models.map(({ id, name }) => ({ value: id, label: name }))
+    : QODER_MODELS;
+}
+
+export function chooseQoderModel(options: QoderSelectOption[], saved?: string): string {
+  if (saved && options.some((option) => option.value === saved)) return saved;
+  return options.find((option) => option.value === 'auto')?.value ?? options[0]?.value ?? '';
+}
 
 const CONTEXT_WINDOWS: QoderSelectOption[] = [
   { value: '1000000', label: '1M' },

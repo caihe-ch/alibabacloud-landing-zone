@@ -6,9 +6,9 @@
     <insert id="insert" parameterType="com.aliyun.autowonder.user.UserDO"
             useGeneratedKeys="true" keyProperty="id">
         INSERT INTO `user`
-            (username, email, password_hash, nickname, status, is_deleted)
+            (username, email, password_hash, nickname, status, is_admin, is_deleted)
         VALUES
-            (#{username}, #{email}, #{passwordHash}, #{nickname}, #{status}, 0)
+            (#{username}, #{email}, #{passwordHash}, #{nickname}, #{status}, 0, 0)
     </insert>
 
     <select id="findByUsername" resultType="com.aliyun.autowonder.user.UserDO">
@@ -44,6 +44,52 @@
           AND status = 0
         ORDER BY id ASC
         LIMIT 1
+    </select>
+
+    <select id="countSystemAdmins" resultType="long">
+        SELECT COUNT(*)
+        FROM `user`
+        WHERE is_deleted = 0
+          AND is_admin = 1
+    </select>
+
+    <update id="markSystemAdmin">
+        UPDATE `user`
+        SET is_admin = 1, gmt_modified = NOW()
+        WHERE id = #{id} AND is_deleted = 0 AND is_admin = 0
+    </update>
+
+    <update id="revokeSystemAdmin">
+        UPDATE `user`
+        SET is_admin = 0, gmt_modified = NOW()
+        WHERE id = #{id} AND is_deleted = 0 AND is_admin = 1
+    </update>
+
+    <!-- Deliberately the same predicate as countSystemAdmins: the roster the panel renders must
+         have the same length as the count the "keep at least one admin" guard reads. -->
+    <select id="listSystemAdmins" resultType="com.aliyun.autowonder.user.UserDO">
+        SELECT *
+        FROM `user`
+        WHERE is_deleted = 0
+          AND is_admin = 1
+        ORDER BY id ASC
+    </select>
+
+    <select id="searchSystemAdminCandidates" resultType="com.aliyun.autowonder.user.UserDO">
+        SELECT *
+        FROM `user`
+        WHERE is_deleted = 0
+          AND status = 0
+          AND is_admin = 0
+          <if test="keyword != null and keyword != ''">
+              AND (
+                  username LIKE CONCAT('%', #{keyword}, '%')
+                  OR email LIKE CONCAT('%', #{keyword}, '%')
+                  OR nickname LIKE CONCAT('%', #{keyword}, '%')
+              )
+          </if>
+        ORDER BY gmt_create DESC, id DESC
+        LIMIT #{limit}
     </select>
 
     <select id="searchWorkspaceCandidates" resultType="com.aliyun.autowonder.user.UserDO">

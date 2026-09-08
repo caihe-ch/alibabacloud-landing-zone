@@ -47,6 +47,20 @@ public class RedisManager extends AbstractRedisManager {
         }
     }
 
+    /** Atomically returns and deletes a value encoded by this manager's existing serializer. */
+    @SuppressWarnings("unchecked")
+    public <T> T getAndDelete(Serializable key) {
+        String strKey = stringifyKey(key);
+        byte[] script = ("local value = redis.call('get', KEYS[1]); "
+                + "if value then redis.call('del', KEYS[1]); end; return value").getBytes(UTF8);
+        List<byte[]> keys = List.of(strKey.getBytes(UTF8));
+        List<byte[]> args = List.<byte[]>of();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Object value = jedis.eval(script, keys, args);
+            return value instanceof byte[] serialized ? (T) deserialize(serialized) : null;
+        }
+    }
+
     public boolean set(Serializable key, Serializable value, int expireSec) {
         String strKey = stringifyKey(key);
         int maxRetries = 3;
@@ -282,6 +296,12 @@ public class RedisManager extends AbstractRedisManager {
     public String getString(String key) {
         try (Jedis jedis = jedisPool.getResource()) {
             return jedis.get(key);
+        }
+    }
+
+    public void setString(String key, String value) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.set(key, value);
         }
     }
 

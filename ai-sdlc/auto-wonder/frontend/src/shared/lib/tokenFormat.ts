@@ -15,6 +15,12 @@ export function formatCredits(credits: number | null | undefined): string {
   return credits.toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
 }
 
+/** 固定两位小数，用于工单顶部的 credits 总计（`xx.xx Credits`）。 */
+export function formatCreditsFixed(credits: number | null | undefined): string {
+  if (credits == null || !Number.isFinite(credits) || credits <= 0) return '0.00';
+  return credits.toFixed(2);
+}
+
 export function formatWithCommas(n: number): string {
   return n.toLocaleString('en-US');
 }

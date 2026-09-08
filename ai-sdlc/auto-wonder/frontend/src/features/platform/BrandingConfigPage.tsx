@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
-import { Alert, Button, Card, Form, Input, Radio, Space, Switch, Tag, Typography, Upload, message } from 'antd';
-import { SaveOutlined, UploadOutlined } from '@ant-design/icons';
+import { Alert, Button, Card, Form, Input, Radio, Space, Switch, Tabs, Tag, Typography, Upload, message } from 'antd';
+import { ArrowLeftOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
+import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UploadRequestOption } from 'rc-upload/lib/interface';
 import {
@@ -18,12 +19,17 @@ import {
   type UpdateDingTalkImChannelParams,
   type UpdatePlatformBrandingParams,
 } from './brandingApi';
+import { PlatformAdminPanel } from './PlatformAdminPanel';
 import { PageError } from '@/shared/ui/PageError';
 import { ApiError } from '@/shared/types/common';
 
 const { Title, Text } = Typography;
 
 type DingTalkRobotFormValues = UpdateDingTalkImChannelParams;
+
+const BRANDING_TAB_KEY = 'branding';
+const NOTIFICATION_TAB_KEY = 'notification';
+const PLATFORM_ADMIN_TAB_KEY = 'platform-admin';
 
 const EMPTY_DINGTALK_CHANNEL: PlatformImChannel = {
   provider: 'DINGTALK',
@@ -38,6 +44,7 @@ export function BrandingConfigPage() {
   const [form] = Form.useForm<UpdatePlatformBrandingParams>();
   const [dingTalkForm] = Form.useForm<DingTalkRobotFormValues>();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { data, error, isLoading } = useQuery({
     queryKey: BRANDING_ADMIN_QUERY_KEY,
     queryFn: getAdminBranding,
@@ -169,15 +176,8 @@ export function BrandingConfigPage() {
     );
   }
 
-  return (
-    <div style={{ maxWidth: 1040, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, marginBottom: 18, flexWrap: 'wrap' }}>
-        <div>
-          <Title level={3} style={{ margin: 0, letterSpacing: 0 }}>品牌和一致性配置</Title>
-          <Text type="secondary">私有化部署的平台名称、Logo、主题色和访问域名</Text>
-        </div>
-      </div>
-
+  const brandingPane = (
+    <>
       <Alert
         type="info"
         showIcon
@@ -285,76 +285,114 @@ export function BrandingConfigPage() {
           </Button>
         </div>
       </Form>
+    </>
+  );
 
-      <Card title="协作通知" styles={{ body: { padding: 18 } }} style={{ marginTop: 16 }}>
-        {imChannelsError ? (
-          <Alert
-            type="error"
-            showIcon
-            message="协作通知配置加载失败"
-            description={imChannelsError instanceof Error ? imChannelsError.message : '请稍后重试'}
-          />
-        ) : (
-          <Form
-            form={dingTalkForm}
-            layout="vertical"
-            disabled={isImChannelsLoading || dingTalkMutation.isPending}
-            initialValues={{
-              enabled: false,
-              appKey: '',
-              appSecret: '',
-              robotCode: '',
-            }}
-          >
-            <div style={{ display: 'grid', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+  const notificationPane = (
+    <Card styles={{ body: { padding: 18 } }}>
+      {imChannelsError ? (
+        <Alert
+          type="error"
+          showIcon
+          message="协作通知配置加载失败"
+          description={imChannelsError instanceof Error ? imChannelsError.message : '请稍后重试'}
+        />
+      ) : (
+        <Form
+          form={dingTalkForm}
+          layout="vertical"
+          disabled={isImChannelsLoading || dingTalkMutation.isPending}
+          initialValues={{
+            enabled: false,
+            appKey: '',
+            appSecret: '',
+            robotCode: '',
+          }}
+        >
+          <div style={{ display: 'grid', gap: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+              <div>
+                <Text strong>钉钉机器人</Text>
                 <div>
-                  <Text strong>钉钉机器人</Text>
-                  <div>
-                    <Text type="secondary" style={{ fontSize: 12 }}>系统统一 IM 机器人，当前仅支持钉钉。</Text>
-                  </div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>系统统一 IM 机器人，当前仅支持钉钉。</Text>
                 </div>
-                <Space size={[8, 8]} wrap>
-                  <Tag color={dingTalkEnabled ? 'green' : 'default'}>{dingTalkEnabled ? '已启用' : '未启用'}</Tag>
-                  <Tag color={hasDingTalkSecret ? 'green' : 'default'}>{hasDingTalkSecret ? 'AppSecret 已配置' : 'AppSecret 未配置'}</Tag>
-                  <Tag color={dingTalkReady ? 'green' : 'orange'}>{dingTalkReady ? '配置完整' : '配置未完整'}</Tag>
-                </Space>
               </div>
-
-              <Form.Item label="启用开关" name="enabled" valuePropName="checked" style={{ marginBottom: 0 }}>
-                <Switch aria-label="启用钉钉机器人" />
-              </Form.Item>
-
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
-                <Form.Item label="AppKey" name="appKey">
-                  <Input placeholder="dingxxxxxx" />
-                </Form.Item>
-                <Form.Item label="RobotCode" name="robotCode">
-                  <Input placeholder="robot_xxxxxx" />
-                </Form.Item>
-                <Form.Item
-                  label="AppSecret"
-                  name="appSecret"
-                  extra={dingTalkChannel.secretConfigured ? '留空保存将保留已配置的 AppSecret' : undefined}
-                >
-                  <Input.Password placeholder={dingTalkChannel.secretConfigured ? '留空表示不修改' : '应用密钥'} />
-                </Form.Item>
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                <Button
-                  type="primary"
-                  icon={<SaveOutlined />}
-                  loading={dingTalkMutation.isPending}
-                  onClick={handleDingTalkSubmit}
-                >
-                  保存协作通知
-                </Button>
-              </div>
+              <Space size={[8, 8]} wrap>
+                <Tag color={dingTalkEnabled ? 'green' : 'default'}>{dingTalkEnabled ? '已启用' : '未启用'}</Tag>
+                <Tag color={hasDingTalkSecret ? 'green' : 'default'}>{hasDingTalkSecret ? 'AppSecret 已配置' : 'AppSecret 未配置'}</Tag>
+                <Tag color={dingTalkReady ? 'green' : 'orange'}>{dingTalkReady ? '配置完整' : '配置未完整'}</Tag>
+              </Space>
             </div>
-          </Form>
-        )}
-      </Card>
+
+            <Form.Item label="启用开关" name="enabled" valuePropName="checked" style={{ marginBottom: 0 }}>
+              <Switch aria-label="启用钉钉机器人" />
+            </Form.Item>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
+              <Form.Item label="AppKey" name="appKey">
+                <Input placeholder="dingxxxxxx" />
+              </Form.Item>
+              <Form.Item label="RobotCode" name="robotCode">
+                <Input placeholder="robot_xxxxxx" />
+              </Form.Item>
+              <Form.Item
+                label="AppSecret"
+                name="appSecret"
+                extra={dingTalkChannel.secretConfigured ? '留空保存将保留已配置的 AppSecret' : undefined}
+              >
+                <Input.Password placeholder={dingTalkChannel.secretConfigured ? '留空表示不修改' : '应用密钥'} />
+              </Form.Item>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <Button
+                type="primary"
+                icon={<SaveOutlined />}
+                loading={dingTalkMutation.isPending}
+                onClick={handleDingTalkSubmit}
+              >
+                保存协作通知
+              </Button>
+            </div>
+          </div>
+        </Form>
+      )}
+    </Card>
+  );
+
+  return (
+    <div style={{ maxWidth: 1040, margin: '0 auto' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, marginBottom: 18, flexWrap: 'wrap' }}>
+        <div>
+          <Button
+            type="link"
+            icon={<ArrowLeftOutlined />}
+            onClick={() => navigate('/')}
+            style={{ marginBottom: 8, padding: 0 }}
+          >
+            返回首页
+          </Button>
+          <Title level={3} style={{ margin: 0, letterSpacing: 0 }}>品牌和一致性配置</Title>
+          <Text type="secondary">私有化部署的平台名称、Logo、主题色、访问域名、协作通知和平台管理员</Text>
+        </div>
+      </div>
+
+      <Tabs
+        defaultActiveKey={BRANDING_TAB_KEY}
+        items={[
+          { key: BRANDING_TAB_KEY, label: '品牌与主题', children: brandingPane },
+          {
+            key: NOTIFICATION_TAB_KEY,
+            label: '协作通知',
+            // dingTalkForm is seeded by an effect in this component and read through useWatch here,
+            // so the pane must stay mounted; a lazily mounted pane would leave the form instance
+            // disconnected from any rendered Form element.
+            forceRender: true,
+            children: notificationPane,
+          },
+          { key: PLATFORM_ADMIN_TAB_KEY, label: '平台管理员', children: <PlatformAdminPanel /> },
+        ]}
+      />
     </div>
   );
 }

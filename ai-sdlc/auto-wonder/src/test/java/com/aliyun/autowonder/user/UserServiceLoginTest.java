@@ -1,5 +1,6 @@
 package com.aliyun.autowonder.user;
 
+import com.aliyun.autowonder.access.SystemAdminService;
 import com.aliyun.autowonder.auth.jwt.JwtProperties;
 import com.aliyun.autowonder.auth.jwt.JwtService;
 import com.aliyun.autowonder.auth.jwt.TokenPayload;
@@ -9,6 +10,7 @@ import com.aliyun.autowonder.common.error.BizException;
 
 import com.aliyun.autowonder.user.dto.LoginRequest;
 import com.aliyun.autowonder.user.dto.LoginResponse;
+import com.aliyun.autowonder.workspace.WorkspaceMemberDao;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.env.Environment;
@@ -32,7 +34,8 @@ class UserServiceLoginTest {
         JwtProperties props = new JwtProperties(env);
         props.setSecret("test-secret-key-that-is-long-enough-32bytes!");
         jwtService = new JwtService(props);
-        service = new UserService(userDao, jwtService, sessionService, props);
+        service = new UserService(userDao, jwtService, sessionService, props,
+                mock(WorkspaceMemberDao.class), mock(SystemAdminService.class));
     }
 
     @Test

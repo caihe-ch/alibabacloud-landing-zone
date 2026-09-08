@@ -18,4 +18,5 @@ public interface ExecutorDao {
     int updateLastConnectIp(@Param("id") Long id, @Param("tenantId") Long tenantId,
                             @Param("lastConnectIp") String lastConnectIp, @Param("modifierId") Long modifierId);
     int updateLastHeartbeat(@Param("id") Long id, @Param("tenantId") Long tenantId);
+    List<ExecutorDO> listByClientKind(@Param("clientKind") String clientKind);
 }

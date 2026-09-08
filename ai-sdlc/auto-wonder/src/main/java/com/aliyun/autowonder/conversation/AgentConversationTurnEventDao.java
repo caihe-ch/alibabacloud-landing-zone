@@ -21,5 +21,15 @@ public interface AgentConversationTurnEventDao {
             @Param("afterId") long afterId,
             @Param("limit") int limit);
 
+    /**
+     * 取某一轮次的全部事件，按 event_seq / chunk_index 保序，供前端按需回放。
+     * 必须带 limit：执行器无合并节流，一个 token 级 chunk 就是一行记录。
+     */
+    List<AgentConversationTurnEventDO> listByTurn(
+            @Param("tenantId") Long tenantId,
+            @Param("conversationId") Long conversationId,
+            @Param("turnId") Long turnId,
+            @Param("limit") int limit);
+
     int deleteExpiredBatch(@Param("cutoff") Date cutoff, @Param("limit") int limit);
 }

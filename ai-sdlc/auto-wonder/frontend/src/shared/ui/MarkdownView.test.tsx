@@ -43,6 +43,99 @@ describe('MarkdownView', () => {
     });
   });
 
+  it('contains a long fenced code line in a horizontally scrollable pre', () => {
+    const longLine = `MCP error -32602: Structured content does not match the tool's output schema: ${'data/assigneeName must be string, '.repeat(8)}`;
+    const { container } = render(
+      <MarkdownView content={['```', longLine, '```'].join('\n')} />,
+    );
+
+    const pre = container.querySelector('pre');
+    expect(pre).not.toBeNull();
+    // jsdom 的 computed style 会省略默认值，直接断言内联声明
+    expect(pre).toHaveStyle({ overflowX: 'auto', maxWidth: '100%' });
+    expect(pre).toHaveTextContent('MCP error -32602');
+  });
+
+  it('keeps the reported workitem body code block contained without losing text', () => {
+    const { container } = render(
+      <MarkdownView
+        content={[
+          '工单详情页面中，工单正文部分情况会超出正文区域到右侧',
+          '',
+          '```',
+          'autowonder_get_workitem (autowonder MCP Server)',
+          'failed',
+          '输出',
+          "MCP error -32602: Structured content does not match the tool's output schema: data/assigneeName must be string, data/assigneeDisplayName must be string",
+          '```',
+        ].join('\n')}
+      />,
+    );
+
+    expect(container).toHaveTextContent('工单详情页面中，工单正文部分情况会超出正文区域到右侧');
+    const pre = container.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).toHaveStyle({ overflowX: 'auto', maxWidth: '100%' });
+    expect(pre).toHaveTextContent('data/assigneeDisplayName must be string');
+  });
+
+  it('contains every pre when the content has several code blocks', () => {
+    const { container } = render(
+      <MarkdownView
+        content={[
+          '```',
+          'a'.repeat(200),
+          '```',
+          '',
+          '中间正文段落',
+          '',
+          '```json',
+          `{"key":"${'v'.repeat(200)}"}`,
+          '```',
+        ].join('\n')}
+      />,
+    );
+
+    const pres = container.querySelectorAll('pre');
+    expect(pres).toHaveLength(2);
+    pres.forEach((pre) => expect(pre).toHaveStyle({ overflowX: 'auto', maxWidth: '100%' }));
+    expect(container).toHaveTextContent('中间正文段落');
+  });
+
+  it('does not pull inline code into the pre containment', () => {
+    const { container } = render(
+      <MarkdownView content={'正文里的 `inline-code` 不该被当成代码块'} />,
+    );
+
+    expect(container.querySelector('pre')).toBeNull();
+    const code = container.querySelector('code');
+    expect(code).not.toBeNull();
+    expect(code).toHaveTextContent('inline-code');
+  });
+
+  it('keeps artifact paths inside fenced code blocks as contained code, not links', () => {
+    const { container } = render(
+      <MarkdownView
+        content={'```text\nartifacts/output/deliverables/report.md\n```'}
+        artifacts={[{
+          id: 7,
+          workitemId: 1,
+          dispatchId: 2,
+          name: 'artifacts/output/deliverables/report.md',
+          type: 'DELIVERABLE',
+          size: 100,
+          gmtCreate: '2026-07-28T10:00:00Z',
+        }]}
+      />,
+    );
+
+    const pre = container.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).toHaveStyle({ overflowX: 'auto', maxWidth: '100%' });
+    expect(pre).toHaveTextContent('artifacts/output/deliverables/report.md');
+    expect(screen.queryByRole('button', { name: /打开产物/ })).not.toBeInTheDocument();
+  });
+
   it('forces normal white-space so an inherited pre-wrap parent cannot create blank line gaps', () => {
     const { container } = render(
       <div style={{ whiteSpace: 'pre-wrap' }}>

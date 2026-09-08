@@ -91,7 +91,8 @@ class V037CoreMapperContractTest {
     void scheduledMappersRegisterEveryStatementOnlyWhenSourceAware() throws Exception {
         assertOnlySourceAware("ScheduledTaskDao.xml", Set.of(
                 "cols", "insert", "findById", "findByIdForUpdate", "findAnyById", "listByWorkspace",
-                "countByWorkspace", "summarizeRuns", "findDue", "claimNextFire", "update", "updateStatus"));
+                "countByWorkspace", "summarizeRuns", "findDue", "claimNextFire", "update", "updateStatus",
+                "pauseActiveByWorkspace", "softDelete"));
         assertOnlySourceAware("ScheduledTaskRunDao.xml", Set.of(
                 "cols", "insert", "findByTriggerKey", "findById", "listByTask",
                 "findActiveByTask", "findActiveByTaskForUpdate", "countActive",
