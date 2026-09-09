@@ -37,6 +37,8 @@ Use two clean local checkouts: one for the internal AutoWonder repository and
 one for this GitHub repository.
 
 ```bash
+set -euo pipefail
+
 INTERNAL_REPO=/path/to/internal/auto-wonder
 GITHUB_REPO=/path/to/alibabacloud-landing-zone
 
@@ -55,6 +57,12 @@ difference before continuing:
 ```bash
 git -C "$GITHUB_REPO" rev-parse origin/master upstream/master
 ```
+
+Before creating the worktree, require `git`, `tar`, and `rsync`. On macOS,
+install missing commands with Homebrew. On CentOS, install them with the host's
+package manager (`dnf install git tar rsync` or `yum install git tar rsync`).
+Stop if a prerequisite cannot be installed; never substitute a working-directory
+copy for `git archive` plus `rsync --delete`.
 
 ## 2. Create an isolated GitHub worktree
 
