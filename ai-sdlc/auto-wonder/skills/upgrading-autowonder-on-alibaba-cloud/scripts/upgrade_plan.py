@@ -15,7 +15,6 @@ import time
 import zipfile
 
 TRUSTED_REPOSITORIES = {
-    'https://gitlab.alibaba-inc.com/sdlc-autopilot/auto-wonder',
     'https://github.com/aliyun/alibabacloud-landing-zone',
 }
 MIGRATION = re.compile(r'^V(0*[1-9][0-9]*)__([a-z0-9]+(?:_[a-z0-9]+)*)\.sql$')

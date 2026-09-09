@@ -13,9 +13,9 @@ spec.loader.exec_module(policy)
 
 class RepositoryTrustTest(unittest.TestCase):
     def test_empty_url_accepts_only_known_official_repositories(self):
-        for origin in ('git@gitlab.alibaba-inc.com:sdlc-autopilot/auto-wonder.git',
-                       'https://gitlab.alibaba-inc.com/sdlc-autopilot/auto-wonder.git',
-                       'git@github.com:aliyun/alibabacloud-landing-zone.git',
+        self.assertEqual({'https://github.com/aliyun/alibabacloud-landing-zone'},
+                         policy.TRUSTED_REPOSITORIES)
+        for origin in ('git@github.com:aliyun/alibabacloud-landing-zone.git',
                        'https://github.com/aliyun/alibabacloud-landing-zone/'):
             with self.subTest(origin=origin):
                 policy.check_repository(origin, '')
