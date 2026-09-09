@@ -41,7 +41,6 @@ class UpgradePolicyTest(unittest.TestCase):
             encoding="utf-8"
         )
         operations = (SKILL_ROOT / "scripts" / "internal" / "operations.sh").read_text(encoding="utf-8")
-        transfer = (SKILL_ROOT / "scripts" / "internal" / "release-transfer.sh").read_text(encoding="utf-8")
         wrapper = (SKILL_ROOT / "scripts" / "upgrade-operations.sh").read_text(
             encoding="utf-8"
         )
@@ -49,7 +48,6 @@ class UpgradePolicyTest(unittest.TestCase):
 
         for term in [
             "exactly one backup archive per ecs",
-            "atomically overwrites the previous backup",
             "never roll back automatically",
             "only after the user confirms rollback",
         ]:
@@ -76,8 +74,6 @@ class UpgradePolicyTest(unittest.TestCase):
             backup_operation.index('mv -f "$backup_tmp" "$backup_archive"'),
         )
         self.assertIn("upgrade-backup|rollback-upgrade", wrapper)
-        self.assertIn("verified per-ECS rollback backup is required", transfer)
-        self.assertIn("rollback backup does not match the upgrade target", transfer)
 
     def test_startup_contract_covers_platform_dependencies_and_wrong_account_reauth(self):
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")

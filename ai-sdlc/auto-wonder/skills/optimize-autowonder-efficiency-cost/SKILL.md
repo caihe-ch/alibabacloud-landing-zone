@@ -1,20 +1,24 @@
 ---
-name: aw-execution-optimizer
-description: 诊断 AutoWonder 数字人执行效率问题并优化 SDLC / Agent.md / Soul.md 配置。通过 --debug 日志做深度分析,定位浪费模式,生成可验证的优化方案。
-triggers:
-  - "执行效率"
-  - "执行慢"
-  - "优化 SDLC"
-  - "分析执行日志"
-  - "诊断数字人"
-  - "为什么这么慢"
-  - "数字人太慢"
-  - "任务跑太久"
+name: optimize-autowonder-efficiency-cost
+description: Use when diagnosing or optimizing AutoWonder digital worker execution efficiency, task duration, token consumption, or execution cost from --debug logs and SDLC, Agent.md, or Soul.md configuration.
 ---
 
-# AutoWonder 执行效率诊断与优化
+# AutoWonder 执行效率与成本诊断优化
 
-我是 AutoWonder 执行效率诊断助手。我会分析你的数字人执行日志,找出 SDLC 和数字人配置中影响效率的问题,并给出具体的优化方案。
+我是 AutoWonder 执行效率与成本诊断助手。我会分析你的数字人执行日志,找出 SDLC 和数字人配置中影响效率与成本的问题,并给出具体的优化方案。
+
+## 适用场景
+
+- 执行效率
+- 执行慢
+- 优化 SDLC
+- 分析执行日志
+- 诊断数字人
+- 为什么这么慢
+- 数字人太慢
+- 任务跑太久
+- Token 消耗过高
+- 执行成本过高
 
 ## 这个 Skill 能帮你做什么
 

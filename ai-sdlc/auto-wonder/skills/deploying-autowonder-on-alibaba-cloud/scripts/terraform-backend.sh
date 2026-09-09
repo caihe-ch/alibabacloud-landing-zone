@@ -30,6 +30,7 @@ require_file "$manifest"; require_command jq; require_command sha256sum
 json_validate "$manifest"; reject_secret_keys "$manifest"
 [[ -d "$project_root" ]] || die "project root is unavailable"
 project_root=$(cd -- "$project_root" && pwd -P)
+configure_cloud_profile "$manifest"
 
 region=$(json_string "$manifest" '.region')
 deployment_id=$(json_string "$manifest" '.deploymentId')
@@ -66,9 +67,9 @@ case "$command" in
     ;;
   prepare)
     require_command aliyun; require_command ossutil
-    configure_cloud_profile "$manifest"
     ossutil_preflight "$region"
-    actual_uid=$(aliyun_cli sts GetCallerIdentity --region "$region" | jq -er '.AccountId')
+    ensure_alicloud_profile_identity "$region"
+    actual_uid=$(jq -er '.AccountId' <<<"$AUTOWONDER_IDENTITY_JSON")
     [[ "$actual_uid" == "$account_uid" ]] || die "Alibaba Cloud account identity mismatch"
     record_metadata
     mkdir -p -- "$backend_dir"; chmod 700 "$deployment_root" "$backend_dir"
@@ -96,7 +97,8 @@ case "$command" in
   destroy)
     [[ $(jq -r '.terraform.mainDestroyVerified // false' "$manifest") == true ]] || die "main Terraform destroy is not verified"
     [[ $(jq -r '.terraform.stateBucket // empty' "$manifest") == "$bucket" ]] || die "state bucket metadata mismatch"
-    require_command ossutil
+    require_command aliyun; require_command ossutil
+    ensure_alicloud_profile_identity "$region"
     ossutil_preflight "$region"
     ossutil_cli rm "oss://$bucket" --all-versions -r -f --region "$region" --endpoint "$endpoint"
     ossutil_cli rm "oss://$bucket" -m -r -f --region "$region" --endpoint "$endpoint"

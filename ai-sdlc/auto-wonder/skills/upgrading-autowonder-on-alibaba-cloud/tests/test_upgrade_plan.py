@@ -5,6 +5,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+import io
+import tarfile
+import zipfile
 import unittest
 
 
@@ -25,7 +28,12 @@ class UpgradePlanTest(unittest.TestCase):
         self.git("config", "core.hooksPath", "/dev/null")
         self.git("config", "user.email", "upgrade-test@example.invalid")
         self.git("config", "user.name", "Upgrade Test")
-        self.write("src/main/resources/application.yml", "service:\n  value: ${OLD_ENV:old}\n")
+        self.write(
+            "src/main/resources/application.yml",
+            "service:\n  value: ${OLD_ENV:old}\n"
+            "autowonder:\n  runtime:\n"
+            "    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}\n",
+        )
         self.write("docs/community/application.env.example", "OLD_ENV=\n")
         self.write("docs/migration/README.md", "migration contract\n")
         self.git("add", ".")
@@ -115,6 +123,7 @@ class UpgradePlanTest(unittest.TestCase):
     def run_plan(self, manifest, *extra):
         return subprocess.run(
             [
+                "bash",
                 str(SCRIPT),
                 "--manifest",
                 str(manifest),
@@ -131,7 +140,9 @@ class UpgradePlanTest(unittest.TestCase):
     def publish_target(self, migration_name="V1__add_upgrade_state.sql"):
         self.write(
             "src/main/resources/application.yml",
-            "service:\n  value: ${OLD_ENV:changed}\n  required: ${NEW_REQUIRED:}\n",
+            "service:\n  value: ${OLD_ENV:changed}\n  required: ${NEW_REQUIRED:}\n"
+            "autowonder:\n  runtime:\n"
+            "    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}\n",
         )
         self.write("docs/community/application.env.example", "OLD_ENV=\nNEW_REQUIRED=\n")
         migration = "ALTER TABLE workitem ADD COLUMN upgrade_state VARCHAR(32);\n"
@@ -142,6 +153,179 @@ class UpgradePlanTest(unittest.TestCase):
         self.git("push", "origin", "master")
         self.git("reset", "--hard", self.old_commit)
         return target, migration
+
+    def workspace_manifest(self):
+        manifest = self.manifest()
+        directory = self.root / "sealed"
+        directory.mkdir()
+        with zipfile.ZipFile(directory / "auto-wonder.jar", "w") as jar:
+            jar.writestr("BOOT-INF/classes/application.yml", (self.source / "src/main/resources/application.yml").read_bytes())
+        with tarfile.open(directory / "autowonder-migrations.tar.gz", "w:gz") as archive:
+            for path in (self.source / "docs/migration").glob("*.sql"):
+                archive.add(path, arcname="./" + path.name)
+        artifacts = {"releaseDirectory": str(directory)}
+        for key, name in (("jar", "auto-wonder.jar"), ("migrations", "autowonder-migrations.tar.gz")):
+            artifacts[key] = {"name": name, "sha256": hashlib.sha256((directory / name).read_bytes()).hexdigest()}
+        identity = artifacts["jar"]["sha256"][:40]
+        data = json.loads(manifest.read_text())
+        data["repositoryCommit"] = identity
+        data["deployment"]["activeCommit"] = identity
+        data["upgradeInventory"]["activeCommit"] = identity
+        data["upgradeInventory"]["nodes"][0]["activeCommitPrefix"] = identity[:12]
+        data["source"] = {"kind": "workspace", "releaseId": identity, "gitValidation": "disabled"}
+        data["artifacts"] = artifacts
+        data["releaseVersion"] = "0.5.0"
+        data["upgradeInventory"]["nodes"][0].update(jarSha256=artifacts["jar"]["sha256"], migrationsSha256=artifacts["migrations"]["sha256"])
+        manifest.write_text(json.dumps(data))
+        return manifest, identity
+
+    def test_workspace_release_recovers_verified_artifact_baseline_and_migrations(self):
+        manifest, identity = self.workspace_manifest()
+        target, migration = self.publish_target()
+        result = self.run_plan(manifest)
+        self.assertEqual(0, result.returncode, result.stderr)
+        plan = json.loads(manifest.read_text())["upgrade"]
+        self.assertEqual(identity, plan["fromCommit"])
+        self.assertEqual(identity, plan["sourceBaseline"]["releaseId"])
+        self.assertEqual(target, plan["toCommit"])
+        self.assertEqual(hashlib.sha256(migration.encode()).hexdigest(), plan["pendingMigrations"][0]["sha256"])
+        self.assertTrue(plan["confirmationRequired"])
+        self.assertEqual(plan["environmentSha256"], plan["environmentPlanSha256"])
+        self.assertEqual(0, self.run_plan(manifest).returncode)
+
+    def test_workspace_release_refuses_corrupted_evidence(self):
+        manifest, _ = self.workspace_manifest()
+        self.publish_target()
+        (self.root / "sealed/auto-wonder.jar").write_bytes(b"different jar")
+        result = self.run_plan(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("baseline artifact checksum mismatch", result.stderr)
+        self.assertNotIn("planFingerprint", json.loads(manifest.read_text())["upgrade"])
+
+    def test_workspace_release_refuses_missing_evidence(self):
+        manifest, _ = self.workspace_manifest()
+        self.publish_target()
+        (self.root / "sealed/autowonder-migrations.tar.gz").unlink()
+        result = self.run_plan(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("baseline artifact is unavailable", result.stderr)
+
+    def test_empty_repository_url_does_not_trust_arbitrary_origin(self):
+        manifest, _ = self.workspace_manifest()
+        data = json.loads(manifest.read_text())
+        data["repositoryUrl"] = ""
+        manifest.write_text(json.dumps(data))
+        result = self.run_plan(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("trusted AutoWonder repository", result.stderr)
+
+    def test_workspace_release_blocks_modified_published_migration(self):
+        self.write("docs/migration/V1__initial.sql", "CREATE TABLE old_table(id INT);\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial migration")
+        self.git("push", "origin", "master")
+        manifest, _ = self.workspace_manifest()
+        self.write("docs/migration/V1__initial.sql", "DROP TABLE old_table;\n")
+        self.git("commit", "-am", "changed migration")
+        self.git("push", "origin", "master")
+        result = self.run_plan(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("published migration changed", " ".join(json.loads(manifest.read_text())["upgrade"].get("blockedReasons", [])))
+
+    def test_workspace_baseline_requires_matching_live_artifact_inventory(self):
+        manifest, _ = self.workspace_manifest()
+        self.publish_target()
+        data = json.loads(manifest.read_text())
+        data["upgradeInventory"]["nodes"][0]["migrationsSha256"] = "0" * 64
+        manifest.write_text(json.dumps(data))
+        result = self.run_plan(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("live artifact inventory", result.stderr)
+
+    def test_workspace_same_version_redeployment_cannot_skip_new_migrations(self):
+        manifest, _ = self.workspace_manifest()
+        self.write("VERSION", "0.5.0\n")
+        self.write("docs/migration/V1__changed.sql", "CREATE TABLE added(id INT);\n")
+        result = self.run_plan(manifest, "--workspace-current-content", "--force-redeploy")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("same-version redeployment", result.stderr)
+
+    def test_sealing_persists_source_contract_bound_to_release_identity(self):
+        manifest, identity = self.workspace_manifest()
+        helper = ROOT / "scripts/upgrade_plan.py"
+        result = subprocess.run(["python3", "-B", str(helper), "seal", "--manifest", str(manifest),
+                                 "--source-dir", str(self.source)], text=True, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        baseline = json.loads(manifest.read_text())["source"]["baseline"]
+        self.assertEqual(identity, baseline["releaseId"])
+        self.assertIn("OLD_ENV", baseline["environment"])
+        self.assertEqual({}, baseline["migrations"])
+        self.assertEqual("0.5.0", baseline["releaseVersion"])
+        self.publish_target()
+        self.assertEqual(0, self.run_plan(manifest).returncode)
+
+    def test_replanning_preserves_active_evidence_after_failed_target_build(self):
+        manifest, identity = self.workspace_manifest()
+        self.publish_target()
+        first = self.run_plan(manifest)
+        self.assertEqual(0, first.returncode, first.stderr)
+        data = json.loads(manifest.read_text())
+        data["source"] = {"kind": "git", "releaseId": data["upgrade"]["toCommit"]}
+        data["artifacts"] = {"releaseDirectory": "unavailable-new-build"}
+        manifest.write_text(json.dumps(data))
+        second = self.run_plan(manifest)
+        self.assertEqual(0, second.returncode, second.stderr)
+        self.assertEqual(identity, json.loads(manifest.read_text())["upgrade"]["fromCommit"])
+
+    def test_baseline_identity_change_invalidates_plan_fingerprint(self):
+        manifest, _ = self.workspace_manifest()
+        self.publish_target()
+        first = self.run_plan(manifest)
+        self.assertEqual(0, first.returncode, first.stderr)
+        data = json.loads(manifest.read_text())
+        fingerprint = data["upgrade"]["planFingerprint"]
+        data["upgrade"]["sourceBaseline"]["releaseId"] = "0" * 40
+        manifest.write_text(json.dumps(data))
+        approved = subprocess.run(["bash", str(APPROVE), "--manifest", str(manifest),
+                                   "--fingerprint", fingerprint], text=True, capture_output=True)
+        self.assertNotEqual(0, approved.returncode)
+        self.assertIn("fingerprint", approved.stderr)
+
+    def test_replanning_cannot_erase_unfinished_database_mutation(self):
+        self.publish_target()
+        manifest = self.manifest()
+        first = self.run_plan(manifest)
+        self.assertEqual(0, first.returncode, first.stderr)
+        data = json.loads(manifest.read_text())
+        data["upgrade"]["databaseMutationStarted"] = True
+        data["upgrade"]["databaseMigration"] = {"status": "failed"}
+        manifest.write_text(json.dumps(data))
+        before = manifest.read_bytes()
+        second = self.run_plan(manifest)
+        self.assertNotEqual(0, second.returncode)
+        self.assertIn("unfinished database mutation", second.stderr)
+        self.assertEqual(before, manifest.read_bytes())
+
+    def test_sealing_rejects_source_configuration_changed_after_build(self):
+        manifest, _ = self.workspace_manifest()
+        self.write("src/main/resources/application.yml", "changed: ${UNBUILT_ENV:}\n")
+        result = subprocess.run(["python3", "-B", str(ROOT / "scripts/upgrade_plan.py"), "seal", "--manifest", str(manifest),
+                                 "--source-dir", str(self.source)], text=True, capture_output=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("sealed application configuration", result.stderr)
+
+    def test_workspace_same_version_identity_matches_build_without_git(self):
+        manifest, _ = self.workspace_manifest()
+        self.write("VERSION", "0.5.0\n")
+        result = self.run_plan(manifest, "--workspace-current-content", "--force-redeploy")
+        self.assertEqual(0, result.returncode, result.stderr)
+        plan = json.loads(manifest.read_text())["upgrade"]
+        self.assertEqual("workspace-current-content", plan["sourceMode"])
+        self.assertEqual([], plan["pendingMigrations"])
+        identity = subprocess.run(["bash", "-c", 'source "$1"; workspace_content_identity "$2"', "bash",
+                                   str(UPGRADE_LIB), str(self.source)], text=True, capture_output=True)
+        self.assertEqual(0, identity.returncode, identity.stderr)
+        self.assertEqual(identity.stdout.strip(), plan["toCommit"])
 
     def test_plans_linear_upgrade_with_env_and_migration_metadata(self):
         target, migration = self.publish_target()
@@ -171,6 +355,43 @@ class UpgradePlanTest(unittest.TestCase):
         self.assertFalse(plan["upgrade"]["databaseCompatibility"]["rollingAllowed"])
         self.assertTrue(plan["upgrade"]["confirmationRequired"])
         self.assertEqual([], plan["upgrade"]["blockedReasons"])
+
+    def test_plan_updates_runtime_recommended_version_from_target_source(self):
+        self.write(
+            "src/main/resources/application.yml",
+            "autowonder:\n  runtime:\n    recommended-version: 0.3.7\n",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "feat: update recommended runtime")
+        target = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("push", "origin", "master")
+        self.git("reset", "--hard", self.old_commit)
+        manifest = self.manifest()
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["recommendedRuntimeVersion"] = "0.2.138"
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        env_file = Path(data["localContext"]["protectedEnvFile"])
+        env_file.write_text(
+            "OLD_ENV=old\nNEW_REQUIRED=configured\n"
+            "AUTOWONDER_RUNTIME_RECOMMENDED_VERSION=0.2.138\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_plan(manifest)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        planned = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(target, planned["upgrade"]["toCommit"])
+        self.assertEqual("0.3.7", planned["upgrade"]["targetRecommendedRuntimeVersion"])
+        self.assertEqual("0.3.7", planned["recommendedRuntimeVersion"])
+        self.assertIn(
+            "AUTOWONDER_RUNTIME_RECOMMENDED_VERSION=0.3.7\n",
+            env_file.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            hashlib.sha256(env_file.read_bytes()).hexdigest(),
+            planned["upgrade"]["environmentPlanSha256"],
+        )
 
     def test_same_active_and_target_commit_returns_already_latest_without_plan(self):
         manifest = self.manifest()
@@ -203,7 +424,7 @@ class UpgradePlanTest(unittest.TestCase):
 
         approved = subprocess.run(
             [
-                str(APPROVE),
+                "bash", str(APPROVE),
                 "--manifest",
                 str(manifest),
                 "--fingerprint",
@@ -228,7 +449,7 @@ class UpgradePlanTest(unittest.TestCase):
 
         approved = subprocess.run(
             [
-                str(APPROVE),
+                "bash", str(APPROVE),
                 "--manifest",
                 str(manifest),
                 "--fingerprint",
@@ -245,7 +466,9 @@ class UpgradePlanTest(unittest.TestCase):
     def test_ordinary_application_upgrade_is_approved_automatically(self):
         self.write(
             "src/main/resources/application.yml",
-            "service:\n  value: ${OLD_ENV:new-default}\n",
+            "service:\n  value: ${OLD_ENV:new-default}\n"
+            "autowonder:\n  runtime:\n"
+            "    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}\n",
         )
         self.git("add", ".")
         self.git("commit", "-m", "fix: change application behavior")
@@ -260,7 +483,7 @@ class UpgradePlanTest(unittest.TestCase):
         self.assertFalse(plan["upgrade"]["confirmationRequired"])
         approved = subprocess.run(
             [
-                str(APPROVE),
+                "bash", str(APPROVE),
                 "--manifest",
                 str(manifest),
                 "--fingerprint",
@@ -343,7 +566,7 @@ esac
 """)
         aliyun.chmod(0o755)
         verified = subprocess.run([
-            str(ROOT / "scripts" / "verify-deployment-targets.sh"),
+            "bash", str(ROOT / "scripts" / "verify-deployment-targets.sh"),
             "--manifest", str(manifest),
         ], text=True, capture_output=True, env={
             **os.environ, "PATH": f"{self.root}{os.pathsep}{os.environ['PATH']}"
@@ -357,7 +580,7 @@ esac
         fingerprint = data["upgrade"]["planFingerprint"]
 
         approved = subprocess.run([
-            str(APPROVE), "--manifest", str(manifest), "--fingerprint", fingerprint,
+            "bash", str(APPROVE), "--manifest", str(manifest), "--fingerprint", fingerprint,
         ], text=True, capture_output=True)
         self.assertEqual(0, approved.returncode, approved.stderr)
 
@@ -365,7 +588,7 @@ esac
         data["resources"]["ecs_instance_ids"]["zone_b_1"] = "i-b"
         manifest.write_text(json.dumps(data))
         stale = subprocess.run([
-            str(APPROVE), "--manifest", str(manifest), "--fingerprint", fingerprint,
+            "bash", str(APPROVE), "--manifest", str(manifest), "--fingerprint", fingerprint,
         ], text=True, capture_output=True)
         self.assertNotEqual(0, stale.returncode)
         self.assertIn("target verification", stale.stderr)
@@ -387,7 +610,7 @@ esac
         manifest.write_text(json.dumps(data))
 
         stale = subprocess.run([
-            str(APPROVE), "--manifest", str(manifest), "--fingerprint", fingerprint,
+            "bash", str(APPROVE), "--manifest", str(manifest), "--fingerprint", fingerprint,
         ], text=True, capture_output=True)
 
         self.assertNotEqual(0, stale.returncode)
@@ -429,7 +652,9 @@ esac
     def test_runtime_managed_environment_does_not_block_upgrade_plan(self):
         self.write(
             "src/main/resources/application.yml",
-            "service:\n  value: ${OLD_ENV:old}\n  version: ${AUTOWONDER_VERSION:x.x.x}\n",
+            "service:\n  value: ${OLD_ENV:old}\n  version: ${AUTOWONDER_VERSION:x.x.x}\n"
+            "autowonder:\n  runtime:\n"
+            "    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}\n",
         )
         self.write(
             "docs/community/application.env.example",
@@ -574,6 +799,9 @@ s3:
   access-key-id: ${S3_ACCESS_KEY_ID:}
   access-key-secret: ${S3_ACCESS_KEY_SECRET:}
   force-path-style: true
+autowonder:
+  runtime:
+    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}
 """,
         )
         self.git("add", ".")
@@ -652,7 +880,12 @@ s3:
     def test_plans_when_active_commit_is_not_master_ancestor(self):
         self.git("checkout", "--orphan", "deployed")
         self.git("rm", "-rf", ".")
-        self.write("src/main/resources/application.yml", "service:\n  value: ${OLD_ENV:old}\n")
+        self.write(
+            "src/main/resources/application.yml",
+            "service:\n  value: ${OLD_ENV:old}\n"
+            "autowonder:\n  runtime:\n"
+            "    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}\n",
+        )
         self.write("docs/community/application.env.example", "OLD_ENV=\n")
         self.write("docs/migration/README.md", "migration contract\n")
         self.git("add", ".")
@@ -688,7 +921,9 @@ s3:
 
         application = product / "src/main/resources/application.yml"
         application.write_text(
-            "service:\n  value: ${OLD_ENV:changed}\n  required: ${NEW_REQUIRED:}\n",
+            "service:\n  value: ${OLD_ENV:changed}\n  required: ${NEW_REQUIRED:}\n"
+            "autowonder:\n  runtime:\n"
+            "    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:0.2.138}\n",
             encoding="utf-8",
         )
         env_example = product / "docs/community/application.env.example"
@@ -707,6 +942,7 @@ s3:
         manifest = self.manifest()
         result = subprocess.run(
             [
+                "bash",
                 str(SCRIPT),
                 "--manifest",
                 str(manifest),

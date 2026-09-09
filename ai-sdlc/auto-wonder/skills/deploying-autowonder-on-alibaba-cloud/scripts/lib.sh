@@ -29,6 +29,45 @@ sha256_file() {
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 json_validate() { jq -e . "$1" >/dev/null 2>&1 || die "invalid JSON file: $1"; }
+recommended_runtime_version_from_source() {
+  local source_dir=$1 application_yml="$1/src/main/resources/application.yml"
+  require_file "$application_yml"
+  require_command python3
+  python3 - "$application_yml" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+parents = {}
+value = None
+with open(path, encoding="utf-8") as stream:
+    for raw in stream:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        match = re.match(r"^( *)([A-Za-z0-9-]+)\s*:\s*(.*?)\s*$", raw.rstrip("\r\n"))
+        if not match:
+            continue
+        indent, key, scalar = len(match.group(1)), match.group(2), match.group(3)
+        parents = {level: name for level, name in parents.items() if level < indent}
+        current = tuple(parents[level] for level in sorted(parents)) + (key,)
+        if current == ("autowonder", "runtime", "recommended-version"):
+            value = scalar.strip().strip('"\'')
+            break
+        if not scalar:
+            parents[indent] = key
+
+if value is None:
+    raise SystemExit("autowonder.runtime.recommended-version is missing from application.yml")
+placeholder = re.fullmatch(
+    r"\$\{AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:([^}]+)\}", value
+)
+if placeholder:
+    value = placeholder.group(1)
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", value):
+    raise SystemExit("autowonder.runtime.recommended-version must have a semantic-version default")
+print(value)
+PY
+}
 atomic_jq() {
   local file=$1; shift
   local tmp
@@ -79,58 +118,98 @@ validate_env_file_syntax() {
     die "environment file contains duplicate keys"
 }
 json_string() { jq -er "$2 // empty" "$1"; }
-configure_cloud_profile() {
-  local file=$1 cli_config_path profile_json
-  CLOUD_PROFILE=$(jq -r '.cloudProfile // empty' "$file")
-  if [[ -n "$CLOUD_PROFILE" ]]; then
-    export ALICLOUD_PROFILE="$CLOUD_PROFILE"
-    cli_config_path=${ALIBABA_CLOUD_CLI_CONFIG_FILE:-${HOME}/.aliyun/config.json}
-    if [[ -f "$cli_config_path" ]]; then
-      profile_json=$(jq -cer --arg profile "$CLOUD_PROFILE" '
-        (.profiles // []) | map(select(.name == $profile)) | first |
-        select(.access_key_id != null and .access_key_id != "" and
-               .access_key_secret != null and .access_key_secret != "")
-      ' "$cli_config_path" 2>/dev/null || true)
-      if [[ -n "$profile_json" ]]; then
-        export ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY ALICLOUD_SECURITY_TOKEN
-        ALICLOUD_ACCESS_KEY=$(jq -r '.access_key_id' <<<"$profile_json")
-        ALICLOUD_SECRET_KEY=$(jq -r '.access_key_secret' <<<"$profile_json")
-        ALICLOUD_SECURITY_TOKEN=$(jq -r '.sts_token // empty' <<<"$profile_json")
-      fi
-      unset profile_json
+AUTOWONDER_CLOUD_PROFILE=auto-wonder
+
+clear_alicloud_credentials() {
+  unset ALICLOUD_PROFILE ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY ALICLOUD_SECURITY_TOKEN
+  unset ALICLOUD_ACCESS_KEY_ID ALICLOUD_ACCESS_KEY_SECRET
+  unset ALIBABA_CLOUD_PROFILE ALIBABA_CLOUD_ACCESS_KEY_ID
+  unset ALIBABA_CLOUD_ACCESS_KEY_SECRET ALIBABA_CLOUD_SECURITY_TOKEN
+}
+
+bind_auto_wonder_cloud_profile() {
+  local cli_config_path profile_json
+  CLOUD_PROFILE=$AUTOWONDER_CLOUD_PROFILE
+  clear_alicloud_credentials
+  export CLOUD_PROFILE ALICLOUD_PROFILE="$CLOUD_PROFILE"
+  cli_config_path=${ALIBABA_CLOUD_CLI_CONFIG_FILE:-${HOME}/.aliyun/config.json}
+  if [[ -f "$cli_config_path" ]]; then
+    profile_json=$(jq -cer --arg profile "$CLOUD_PROFILE" '
+      (.profiles // []) | map(select(.name == $profile)) | first |
+      select(.access_key_id != null and .access_key_id != "" and
+             .access_key_secret != null and .access_key_secret != "")
+    ' "$cli_config_path" 2>/dev/null || true)
+    if [[ -n "$profile_json" ]]; then
+      export ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY ALICLOUD_SECURITY_TOKEN
+      ALICLOUD_ACCESS_KEY=$(jq -r '.access_key_id' <<<"$profile_json")
+      ALICLOUD_SECRET_KEY=$(jq -r '.access_key_secret' <<<"$profile_json")
+      ALICLOUD_SECURITY_TOKEN=$(jq -r '.sts_token // empty' <<<"$profile_json")
     fi
+    unset profile_json
   fi
 }
-load_alicloud_profile_credentials() {
-  local region=${1:-} cli_config_path profile_json
-  [[ -n ${CLOUD_PROFILE:-} ]] || return 0
-  aliyun sts GetCallerIdentity --profile "$CLOUD_PROFILE" ${region:+--region "$region"} >/dev/null ||
-    die "Alibaba Cloud profile identity is unavailable"
+read_auto_wonder_cloud_profile() {
+  local cli_config_path profile_json
   cli_config_path=${ALIBABA_CLOUD_CLI_CONFIG_FILE:-${HOME}/.aliyun/config.json}
-  require_file "$cli_config_path"
-  profile_json=$(jq -cer --arg profile "$CLOUD_PROFILE" '
-    (.profiles // []) | map(select(.name == $profile)) | first |
-    select(.access_key_id != null and .access_key_id != "" and
-           .access_key_secret != null and .access_key_secret != "")
-  ' "$cli_config_path" 2>/dev/null || true)
-  [[ -n "$profile_json" ]] || die "Alibaba Cloud profile did not provide temporary credentials"
+  if [[ -f "$cli_config_path" ]]; then
+    profile_json=$(jq -cer --arg profile "$AUTOWONDER_CLOUD_PROFILE" '
+      (.profiles // []) | map(select(.name == $profile)) | first |
+      select(.access_key_id != null and .access_key_id != "" and
+             .access_key_secret != null and .access_key_secret != "")
+    ' "$cli_config_path" 2>/dev/null || true)
+  fi
+  if [[ -z ${profile_json:-} ]]; then
+    profile_json=$(aliyun configure get --profile "$AUTOWONDER_CLOUD_PROFILE" 2>/dev/null || true)
+    profile_json=$(jq -cer '
+      select(.access_key_id != null and .access_key_id != "" and
+             .access_key_secret != null and .access_key_secret != "")
+    ' <<<"$profile_json" 2>/dev/null || true)
+  fi
+  [[ -n ${profile_json:-} ]] || return 1
+  printf '%s\n' "$profile_json"
+}
+configure_cloud_profile() {
+  local file=$1
+  if [[ $(jq -r '.cloudProfile // empty' "$file") != "$AUTOWONDER_CLOUD_PROFILE" ]]; then
+    atomic_jq "$file" --arg profile "$AUTOWONDER_CLOUD_PROFILE" '.cloudProfile=$profile'
+  fi
+  bind_auto_wonder_cloud_profile
+}
+load_alicloud_profile_credentials() {
+  local region=${1:-} profile_json
+  [[ ${CLOUD_PROFILE:-} == "$AUTOWONDER_CLOUD_PROFILE" ]] || die "AutoWonder cloud profile is not configured"
+  profile_json=$(read_auto_wonder_cloud_profile) ||
+    die "Alibaba Cloud profile did not provide temporary credentials"
   export ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY ALICLOUD_SECURITY_TOKEN
   ALICLOUD_ACCESS_KEY=$(jq -r '.access_key_id' <<<"$profile_json")
   ALICLOUD_SECRET_KEY=$(jq -r '.access_key_secret' <<<"$profile_json")
   ALICLOUD_SECURITY_TOKEN=$(jq -r '.sts_token // empty' <<<"$profile_json")
   unset profile_json
 }
+ensure_alicloud_profile_identity() {
+  local region=${1:-}
+  [[ ${CLOUD_PROFILE:-} == "$AUTOWONDER_CLOUD_PROFILE" ]] || die "AutoWonder cloud profile is not configured"
+  require_command aliyun
+  if ! AUTOWONDER_IDENTITY_JSON=$(aliyun sts GetCallerIdentity ${region:+--region "$region"} --profile "$AUTOWONDER_CLOUD_PROFILE"); then
+    aliyun configure --profile "$AUTOWONDER_CLOUD_PROFILE" --mode OAuth ||
+      die "Alibaba Cloud OAuth login failed"
+    AUTOWONDER_IDENTITY_JSON=$(aliyun sts GetCallerIdentity ${region:+--region "$region"} --profile "$AUTOWONDER_CLOUD_PROFILE") ||
+      die "Alibaba Cloud profile identity is unavailable after OAuth login"
+  fi
+  clear_alicloud_credentials
+  export CLOUD_PROFILE="$AUTOWONDER_CLOUD_PROFILE" ALICLOUD_PROFILE="$AUTOWONDER_CLOUD_PROFILE"
+  load_alicloud_profile_credentials "$region"
+}
 aliyun_cli() {
-  if [[ -n ${CLOUD_PROFILE:-} ]]; then aliyun "$@" --profile "$CLOUD_PROFILE"; else aliyun "$@"; fi
+  aliyun "$@" --profile "$AUTOWONDER_CLOUD_PROFILE"
 }
 ossutil_cli() {
   local cli_config_path profile_json access_key_id access_key_secret sts_token temp_config command_status
   cli_config_path=${ALIBABA_CLOUD_CLI_CONFIG_FILE:-${HOME}/.aliyun/config.json}
   require_file "$cli_config_path"
-  profile_json=$(jq -cer --arg profile "${CLOUD_PROFILE:-}" '
-    (.current // "default") as $current |
+  profile_json=$(jq -cer --arg profile "$AUTOWONDER_CLOUD_PROFILE" '
     (.profiles // []) |
-    map(select(.name == (if $profile == "" then $current else $profile end))) | first |
+    map(select(.name == $profile)) | first |
     select(.access_key_id != null and .access_key_id != "" and .access_key_secret != null and .access_key_secret != "")
   ' "$cli_config_path") || die "Alibaba Cloud CLI profile has no ossutil-compatible temporary credentials"
   access_key_id=$(jq -r '.access_key_id' <<<"$profile_json")

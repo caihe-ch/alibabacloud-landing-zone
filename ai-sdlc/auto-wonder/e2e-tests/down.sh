@@ -72,9 +72,8 @@ remove_network "$AW_E2E_NETWORK"
 remove_network aw-e2e-net
 
 # --- 3. any app process this harness started --------------------------------
-# Match the artefact, not the product name: a process search for "autowonder"
-# also matches this platform's own executor CLI, whose command line carries live
-# credentials and internal endpoints that must never be captured.
+# Legacy host-JVM runs are stopped only by their recorded PID. Never search for
+# every auto-wonder.jar process: another worktree may be under test concurrently.
 if [[ -f "$AW_E2E_STATE_DIR/app.pid" ]]; then
   app_pid="$(cat "$AW_E2E_STATE_DIR/app.pid")"
   if [[ -n "$app_pid" ]] && kill -0 "$app_pid" 2>/dev/null; then
@@ -84,12 +83,6 @@ if [[ -f "$AW_E2E_STATE_DIR/app.pid" ]]; then
     kill -9 "$app_pid" 2>/dev/null || true
   fi
   rm -f "$AW_E2E_STATE_DIR/app.pid"
-fi
-app_jar_pids="$(pgrep -f 'auto-wonder\.jar' || true)"
-if [[ -n "$app_jar_pids" ]]; then
-  log "stopping stray auto-wonder.jar process(es): $(printf '%s' "$app_jar_pids" | tr '\n' ' ')"
-  # shellcheck disable=SC2086
-  kill $app_jar_pids 2>/dev/null || true
 fi
 
 # --- 4. assertions, written before the credentials are deleted ---------------
@@ -102,7 +95,7 @@ fi
   echo "VOLUMES_LEFT=$("$DOCKER" volume ls --format '{{.Name}}' | grep -c "^${AW_E2E_PROJECT}_" || true)"
   echo "NETWORK_PRESENT=$("$DOCKER" network inspect "$AW_E2E_NETWORK" >/dev/null 2>&1 && echo yes || echo no)"
   echo "DEFAULT_NETWORK_PRESENT=$("$DOCKER" network inspect aw-e2e-net >/dev/null 2>&1 && echo yes || echo no)"
-  echo "APP_JAR_PROCESSES_LEFT=$(pgrep -f 'auto-wonder\.jar' | wc -l | tr -d ' ')"
+  echo "RECORDED_APP_PID_PRESENT=$([[ -f "$AW_E2E_STATE_DIR/app.pid" ]] && echo yes || echo no)"
   for p in "$RESOLVED_MYSQL_PORT" "$RESOLVED_REDIS_PORT" "$AW_E2E_MINIO_PORT" "$AW_E2E_MINIO_CONSOLE_PORT" "$AW_E2E_APP_PORT"; do
     echo "PORT_${p}_LISTENERS=$(aw_e2e_port_listeners "$p")"
   done

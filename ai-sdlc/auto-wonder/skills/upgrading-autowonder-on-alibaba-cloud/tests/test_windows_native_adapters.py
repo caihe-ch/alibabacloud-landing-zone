@@ -107,6 +107,7 @@ class WindowsNativeAdapterTests(unittest.TestCase):
                     "Import-AliyunCredential",
                     "Invoke-AliyunFlat",
                     "Assert-AliyunIdentity",
+                    "Ensure-AutoWonderAliyunProfile",
                     "Get-FileSha256",
                     "New-PrivateTemporaryDirectory",
                     "Assert-ApprovedUpgradePlan",
@@ -138,7 +139,7 @@ class WindowsNativeAdapterTests(unittest.TestCase):
             "mvn",
         ):
             self.assertIn(term, script)
-        self.assertIn("Assert-AliyunIdentity", script)
+        self.assertIn("Ensure-AutoWonderAliyunProfile", script)
 
     def test_native_upgrade_entrypoints_exist_and_never_invoke_bash(self):
         names = (
@@ -161,11 +162,28 @@ class WindowsNativeAdapterTests(unittest.TestCase):
 
     def test_windows_rolling_upgrade_is_sequential_and_local_only(self):
         text = (UPGRADE / "upgrade-operations.ps1").read_text(encoding="utf-8")
+        remote = (UPGRADE / "remote" / "upgrade_remote.py").read_text(encoding="utf-8")
         self.assertIn("foreach ($instanceId in $instanceIds)", text)
-        self.assertIn("127.0.0.1:7001/checkpreload.htm", text)
+        self.assertIn("Invoke-UpgradePayload", text)
+        self.assertIn("127.0.0.1:7001/checkpreload.htm", remote)
         self.assertNotIn("Resolve-DnsName", text)
         self.assertNotIn("PublicIPv4Address", text)
         self.assertIn("ConfirmRollback", text)
+
+    def test_windows_runtime_version_is_bound_before_stage_and_rolling_restart(self):
+        planner = (UPGRADE / "plan-upgrade.ps1").read_text(encoding="utf-8")
+        policy = (UPGRADE / "upgrade_plan.py").read_text(encoding="utf-8")
+        operations = (UPGRADE / "upgrade-operations.ps1").read_text(encoding="utf-8")
+        stage = (UPGRADE / "stage-upgrade.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("upgrade_plan.py", planner)
+        self.assertIn("src/main/resources/application.yml", policy)
+        self.assertIn("targetRecommendedRuntimeVersion", policy)
+        self.assertIn("AUTOWONDER_RUNTIME_RECOMMENDED_VERSION", policy)
+        self.assertIn("targetRecommendedRuntimeVersion", operations)
+        self.assertIn("targetRecommendedRuntimeVersion", stage)
+        self.assertIn("runtimeConfig", stage)
+        self.assertIn("runtimeConfig", operations.split("'rolling-upgrade'", 1)[1])
 
 
 if __name__ == "__main__":

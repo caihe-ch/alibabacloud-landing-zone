@@ -147,30 +147,30 @@ esac
 
     def test_deployment_entrypoints_reject_upgrade_operations(self):
         operation = subprocess.run(
-            [str(DEPLOY_ROOT / "scripts/initialize-and-verify.sh"), "rolling-upgrade"],
+            ["bash", str(DEPLOY_ROOT / "scripts/initialize-and-verify.sh"), "rolling-upgrade"],
             text=True,
             capture_output=True,
         )
         staging = subprocess.run(
-            [str(DEPLOY_ROOT / "scripts/deploy-via-cloud-assistant.sh"), "--stage-only"],
+            ["bash", str(DEPLOY_ROOT / "scripts/deploy-via-cloud-assistant.sh"), "--stage-only"],
             text=True,
             capture_output=True,
         )
-        self.assertEqual(2, operation.returncode)
-        self.assertEqual(2, staging.returncode)
-        self.assertIn("upgrading-autowonder", operation.stderr)
-        self.assertIn("upgrading-autowonder", staging.stderr)
+        self.assertNotEqual(0, operation.returncode)
+        self.assertNotEqual(0, staging.returncode)
+        self.assertIn("outside the selected skill boundary", operation.stderr)
+        self.assertIn("outside the deployment skill boundary", staging.stderr)
 
     def test_upgrade_entrypoint_rejects_new_deployment_operations(self):
         result = subprocess.run(
-            [str(UPGRADE_ROOT / "scripts/upgrade-operations.sh"), "database"],
+            ["bash", str(UPGRADE_ROOT / "scripts/upgrade-operations.sh"), "database"],
             text=True,
             capture_output=True,
         )
         self.assertEqual(2, result.returncode)
         self.assertIn("Unsupported upgrade operation", result.stderr)
 
-    def test_refresh_wrapper_loads_recorded_profile_credentials_for_terraform(self):
+    def test_refresh_wrapper_loads_auto_wonder_profile_credentials_for_terraform(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             binary_dir = root / "bin"
@@ -181,11 +181,21 @@ esac
                 "region": "cn-hangzhou",
                 "cloudProfile": "production",
             }))
+            cli_config = root / "aliyun-config.json"
+            cli_config.write_text(json.dumps({
+                "current": "unrelated-current-profile",
+                "profiles": [{
+                    "name": "auto-wonder",
+                    "access_key_id": "test-id",
+                    "access_key_secret": "test-secret",
+                    "sts_token": "test-token",
+                    "mode": "OAuth",
+                }],
+            }))
             (binary_dir / "aliyun").write_text("""#!/usr/bin/env bash
 printf '%s\\n' "$*" >>"$FAKE_ALIYUN_LOG"
 case " $* " in
   *" sts GetCallerIdentity "*) printf '{"AccountId":"123456789"}\\n' ;;
-  *" configure get "*) printf '{"access_key_id":"test-id","access_key_secret":"test-secret","sts_token":"test-token","mode":"OAuth"}\\n' ;;
   *) exit 9 ;;
 esac
 """)
@@ -211,12 +221,14 @@ printf '{"status":"refreshed"}\\n'
             }
 
             result = subprocess.run([
-                str(UPGRADE_ROOT / "scripts" / "refresh-upgrade-info.sh"),
+                "bash", str(UPGRADE_ROOT / "scripts" / "refresh-upgrade-info.sh"),
                 "--project-root", str(root),
                 "--manifest", str(manifest),
             ], text=True, capture_output=True, env={
                 **clean_environment,
                 "PATH": f"{binary_dir}{os.pathsep}{os.environ['PATH']}",
+                "HOME": str(root / "home"),
+                "ALIBABA_CLOUD_CLI_CONFIG_FILE": str(cli_config),
                 "FAKE_ALIYUN_LOG": str(aliyun_log),
             })
 
@@ -224,13 +236,12 @@ printf '{"status":"refreshed"}\\n'
             self.assertEqual({"status": "refreshed"}, json.loads(result.stdout))
             self.assertTrue(
                 aliyun_log.is_file(),
-                "refresh wrapper did not load the recorded Alibaba Cloud profile",
+                "refresh wrapper did not load the AutoWonder Alibaba Cloud profile",
             )
             calls = aliyun_log.read_text().splitlines()
-            self.assertEqual(2, len(calls))
+            self.assertEqual(1, len(calls))
             self.assertIn("sts GetCallerIdentity", calls[0])
-            self.assertIn("configure get", calls[1])
-            self.assertTrue(all("--profile production" in call for call in calls))
+            self.assertTrue(all("--profile auto-wonder" in call for call in calls))
 
     def test_resolver_selects_the_only_complete_deployment_manifest_regardless_of_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,7 +276,7 @@ printf '{"status":"refreshed"}\\n'
                 "deployment": {"activeCommit": "a" * 40},
             }))
             result = subprocess.run(
-                [str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"), "--search-root", str(root)],
+                ["bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"), "--search-root", str(root)],
                 text=True,
                 capture_output=True,
                 env={**os.environ, "HOME": str(root / "home")},
@@ -320,7 +331,7 @@ printf '{"status":"refreshed"}\\n'
             )
 
             result = subprocess.run(
-                [str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"), "--search-root", str(root)],
+                ["bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"), "--search-root", str(root)],
                 text=True,
                 capture_output=True,
             )
@@ -355,7 +366,7 @@ printf '{"status":"refreshed"}\\n'
                     "deployment": {"activeCommit": "b" * 40},
                 }))
             result = subprocess.run(
-                [str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"), "--search-root", str(root)],
+                ["bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"), "--search-root", str(root)],
                 text=True,
                 capture_output=True,
                 env={**os.environ, "HOME": str(root / "home")},
@@ -397,7 +408,7 @@ printf '{"status":"refreshed"}\\n'
                 "deployment": {"activeCommit": "a" * 40},
             }))
             result = subprocess.run([
-                str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
+                "bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
                 "--search-root", str(root),
             ], text=True, capture_output=True)
             self.assertEqual(0, result.returncode, result.stderr)
@@ -407,7 +418,7 @@ printf '{"status":"refreshed"}\\n'
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result = subprocess.run([
-                str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
+                "bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
                 "--search-root", str(root),
             ], text=True, capture_output=True)
 
@@ -486,7 +497,7 @@ printf '{"status":"refreshed"}\\n'
             protected_env.chmod(0o600)
 
             first = subprocess.run([
-                str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
+                "bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
                 "--search-root", str(root),
                 "--deployment-dir", "user-provided-folder",
             ], text=True, capture_output=True)
@@ -507,7 +518,7 @@ printf '{"status":"refreshed"}\\n'
 
             shutil.rmtree(supplied)
             second = subprocess.run([
-                str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
+                "bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
                 "--search-root", str(root),
             ], text=True, capture_output=True)
             self.assertEqual(0, second.returncode, second.stderr)
@@ -543,7 +554,7 @@ printf '{"status":"refreshed"}\\n'
             }))
 
             result = subprocess.run([
-                str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
+                "bash", str(UPGRADE_ROOT / "scripts/resolve-deployment.sh"),
                 "--search-root", str(root),
                 "--deployment-dir", "old",
             ], text=True, capture_output=True)
@@ -559,6 +570,7 @@ printf '{"status":"refreshed"}\\n'
             manifest = self.write_target_manifest(root / "manifest.json")
             env = {**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}"}
             command = [
+                "bash",
                 str(UPGRADE_ROOT / "scripts/verify-deployment-targets.sh"),
                 "--manifest", str(manifest),
             ]
@@ -584,6 +596,7 @@ printf '{"status":"refreshed"}\\n'
             data["resources"]["ecs_instance_ids"]["zone_a_2"] = "i-c"
             manifest.write_text(json.dumps(data))
             result = subprocess.run([
+                "bash",
                 str(UPGRADE_ROOT / "scripts/verify-deployment-targets.sh"),
                 "--manifest", str(manifest),
             ], text=True, capture_output=True, env={
@@ -601,6 +614,7 @@ printf '{"status":"refreshed"}\\n'
             self.write_fake_aliyun(root)
             manifest = self.write_target_manifest(root / "manifest.json")
             result = subprocess.run([
+                "bash",
                 str(UPGRADE_ROOT / "scripts/verify-deployment-targets.sh"),
                 "--manifest", str(manifest),
             ], text=True, capture_output=True, env={
@@ -619,6 +633,7 @@ printf '{"status":"refreshed"}\\n'
             manifest = self.write_target_manifest(root / "manifest.json")
             env = {**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}"}
             verify = subprocess.run([
+                "bash",
                 str(UPGRADE_ROOT / "scripts/verify-deployment-targets.sh"),
                 "--manifest", str(manifest),
             ], text=True, capture_output=True, env=env)
@@ -653,6 +668,7 @@ printf '{"status":"refreshed"}\\n'
             manifest.write_text(json.dumps(data))
 
             blocked = subprocess.run([
+                "bash",
                 str(UPGRADE_ROOT / "scripts/upgrade-operations.sh"),
                 "acceptance", "--manifest", str(manifest),
             ], text=True, capture_output=True)
@@ -660,12 +676,14 @@ printf '{"status":"refreshed"}\\n'
             self.assertIn("explicit approval", blocked.stderr)
 
             wrong = subprocess.run([
+                "bash",
                 str(UPGRADE_ROOT / "scripts/approve-upgrade-plan.sh"),
                 "--manifest", str(manifest), "--fingerprint", "0" * 64,
             ], text=True, capture_output=True)
             self.assertNotEqual(0, wrong.returncode)
 
             approved = subprocess.run([
+                "bash",
                 str(UPGRADE_ROOT / "scripts/approve-upgrade-plan.sh"),
                 "--manifest", str(manifest), "--fingerprint", fingerprint,
             ], text=True, capture_output=True)

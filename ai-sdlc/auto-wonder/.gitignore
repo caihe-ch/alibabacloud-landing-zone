@@ -61,6 +61,11 @@ src/main/resources/static/
 
 # superpowers brainstorm scratch
 .superpowers/
+/docs/superpowers/
+
+# Local autonomous SDLC validation skill and discovery link
+/skills/autowonder-fullchain-validation/
+/.agents/skills/autowonder-fullchain-validation
 
 # Python bytecode from Skill test runs
 __pycache__/

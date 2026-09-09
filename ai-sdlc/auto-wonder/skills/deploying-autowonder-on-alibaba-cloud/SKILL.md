@@ -21,6 +21,11 @@ If a manifest exists, ask whether to resume it or create a distinct deployment.
 Never apply merely because configuration files exist. QA and diagnosis must not
 invoke mutation scripts.
 
+At the start of every workflow, including resume paths that do not repeat
+preflight, run `bash scripts/bootstrap-control-host.sh --manifest <file>`. It
+must validate the dedicated `auto-wonder` profile through STS and complete the
+same-profile OAuth recovery before any later cloud or Terraform operation.
+
 ## Build And Runtime Environment
 
 Invoke every POSIX entrypoint explicitly through `bash`, for example
@@ -148,6 +153,13 @@ Stop and report sanitized evidence when:
 
 Use the local Alibaba Cloud credential chain. Keep secrets out of command lines,
 Git, manifest, Cloud Assistant output, proxy/application logs, and reports.
+Use only the dedicated Alibaba Cloud CLI profile `auto-wonder`; never use the
+CLI current profile or `default`. At the start of every deployment workflow,
+probe STS with `auto-wonder`. If the profile is missing or its identity has
+expired, run OAuth login for that same profile, overwrite its identity data,
+and repeat the STS probe before continuing. Clear ambient `ALICLOUD_*` and
+`ALIBABA_CLOUD_*` credentials before loading the refreshed `auto-wonder`
+temporary credentials.
 For standalone ossutil, reuse the selected Alibaba Cloud CLI profile through
 `ossutil_cli` in `scripts/lib.sh`. For ossutil v2 it passes the profile's
 temporary credentials only as child-process environment variables; for legacy
@@ -162,7 +174,7 @@ Run phases in order and record terminal results in the manifest. Read
 
 | Phase | Deterministic route | Completion candidate |
 | --- | --- | --- |
-| 1. Preflight | `bash scripts/preflight.sh` (`--profile` locks a verified CLI profile) | validated tools including ossutil v2/legacy contract, identity, inputs/inventory |
+| 1. Preflight | `bash scripts/preflight.sh` (`--profile`, when supplied, accepts only `auto-wonder`) | validated tools including ossutil v2/legacy contract, dedicated profile identity, inputs/inventory |
 | 2. Backend/Plan | `scripts/terraform-backend.sh prepare`; `scripts/terraform-stage.sh plan` | private state backend and reviewed plan fingerprint |
 | 3. Apply | `scripts/terraform-stage.sh apply`, then `inventory` | Infrastructure ready |
 | 4. Build | `scripts/build-release.sh` | sealed local JAR containing the frontend, schema, and template seed |
@@ -216,6 +228,11 @@ For a new deployment it builds the current workspace contents and accepts
 uncommitted or untracked changes; it must not gate apply or build on Git status,
 HEAD, branch, or commit equality. Artifact SHA-256 values are the release
 integrity evidence. Upgrade mode retains its separate exact-commit controls.
+The builder also seals `source.baseline`, binding the release identity to the
+JAR and migration archive hashes, source environment contract, and published
+migration checksums. Preserve this baseline and its sealed artifact directory
+in the deployment handoff so a later upgrade can compare a workspace release
+without pretending its content hash is a Git commit.
 Cloud Assistant invocation IDs are checkpointed immediately. After an env-only
 correction, use `deploy-via-cloud-assistant.sh --config-only`; do not upload the
 JAR, schema, systemd unit, or Java archive again. Acceptance reruns preserve

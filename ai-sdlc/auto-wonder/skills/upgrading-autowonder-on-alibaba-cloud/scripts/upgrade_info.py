@@ -22,6 +22,7 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 REQUIRED_TAGS = ("Project", "DeploymentId", "Environment", "ManagedBy", "Topology")
 IGNORED_DIRECTORIES = {".git", ".terraform", "upgrade-info", ".worktrees"}
+AUTO_WONDER_CLOUD_PROFILE = "auto-wonder"
 
 
 class UpgradeInfoError(RuntimeError):
@@ -262,9 +263,7 @@ def extract_context(project_root: Path, deployment_dir: Path) -> Dict[str, Any]:
     )
     if commit is not None and (not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit)):
         raise UpgradeInfoError("Deployment active commit is invalid")
-    profile = unique_value(
-        "cloud profile", [item.get("cloudProfile") for item in candidates], required=False
-    ) or "default"
+    profile = AUTO_WONDER_CLOUD_PROFILE
     recommended_runtime_version = unique_value(
         "recommended runtime version",
         [item.get("recommendedRuntimeVersion") for item in candidates],
@@ -282,6 +281,8 @@ def extract_context(project_root: Path, deployment_dir: Path) -> Dict[str, Any]:
         "region": region,
         "cloudProfile": profile,
         "repositoryUrl": repository_url,
+        "releaseSource": unique_value("release source", [item.get("source") for item in candidates], required=False),
+        "releaseArtifacts": unique_value("release artifacts", [item.get("artifacts") for item in candidates], required=False),
         "activeCommit": commit,
         "recommendedRuntimeVersion": recommended_runtime_version,
         "tags": {key: tags[key] for key in REQUIRED_TAGS},
@@ -629,6 +630,8 @@ def build_manifest(context: Dict[str, Any], inventory: Dict[str, Any]) -> Dict[s
         "deploymentId": context["deploymentId"],
         "topology": context["tags"]["Topology"],
         "repositoryUrl": context["repositoryUrl"],
+        **({"source": context["releaseSource"]} if context.get("releaseSource") else {}),
+        **({"artifacts": context["releaseArtifacts"]} if context.get("releaseArtifacts") else {}),
         "repositoryRef": "master",
         "repositoryCommit": commit or "",
         **(
@@ -642,7 +645,8 @@ def build_manifest(context: Dict[str, Any], inventory: Dict[str, Any]) -> Dict[s
             "stateReference": context["stateFile"],
         },
         "resources": resources,
-        "deployment": {"activeCommit": commit or "", "acceptedCommit": commit or ""},
+        "deployment": {"activeCommit": commit or "", "acceptedCommit": commit or "",
+            **({"activeReleaseBaseline": context["activeReleaseBaseline"]} if context.get("activeReleaseBaseline") else {})},
         "scaling": {"pendingInstanceIds": []},
         "upgradeInfo": {
             "resourceSetFingerprint": inventory["resourceSetFingerprint"],
@@ -763,8 +767,11 @@ def context_from_manifest(project_root: Path, manifest_path: Path) -> Dict[str, 
         "deploymentId": deployment_id,
         "environment": source.get("environment"),
         "region": source.get("region"),
-        "cloudProfile": source.get("cloudProfile") or "default",
+        "cloudProfile": AUTO_WONDER_CLOUD_PROFILE,
         "repositoryUrl": source.get("repositoryUrl") or "",
+        "releaseSource": source.get("source"),
+        "releaseArtifacts": source.get("artifacts"),
+        "activeReleaseBaseline": nested(source, "deployment", "activeReleaseBaseline"),
         "activeCommit": commit,
         "recommendedRuntimeVersion": source.get("recommendedRuntimeVersion"),
         "tags": {key: tags[key] for key in REQUIRED_TAGS},
@@ -799,12 +806,16 @@ def cached_registration(project_root: Path) -> Optional[Dict[str, Any]]:
     manifest = directory / "manifest.json"
     if not manifest.is_file() or manifest.is_symlink():
         raise UpgradeInfoError("upgrade-info working manifest is unavailable")
+    manifest_data = load_json(manifest)
+    if manifest_data.get("cloudProfile") != AUTO_WONDER_CLOUD_PROFILE:
+        manifest_data["cloudProfile"] = AUTO_WONDER_CLOUD_PROFILE
+        atomic_write_json(manifest, manifest_data)
     return {
         "status": "resolved",
         "manifest": str(manifest.resolve()),
         "source": "cache",
         "refreshRequired": True,
-        "cloudProfile": load_json(manifest).get("cloudProfile") or "default",
+        "cloudProfile": AUTO_WONDER_CLOUD_PROFILE,
     }
 
 
@@ -847,10 +858,16 @@ def register_manifest(project_root: Path, manifest_path: Path, source: str) -> D
             raise UpgradeInfoError("Registered upgrade information has a conflicting identity")
         previous = load_json(info_dir / "inventory.json")
         manifest = load_json(working_manifest)
+        manifest["cloudProfile"] = AUTO_WONDER_CLOUD_PROFILE
         inventory = build_inventory(previous, context, context["resources"])
         prior_fingerprint = nested(manifest, "upgradeInfo", "resourceSetFingerprint")
         manifest["resources"] = context["resources"]
         manifest["repositoryCommit"] = context["activeCommit"] or ""
+        for source_key, target_key in (("releaseSource", "source"), ("releaseArtifacts", "artifacts")):
+            if context.get(source_key):
+                manifest[target_key] = context[source_key]
+        if context.get("activeReleaseBaseline"):
+            manifest.setdefault("deployment", {})["activeReleaseBaseline"] = context["activeReleaseBaseline"]
         manifest.setdefault("deployment", {})["activeCommit"] = context["activeCommit"] or ""
         manifest.setdefault("upgradeInfo", {}).update({
             "resourceSetFingerprint": inventory["resourceSetFingerprint"],
@@ -961,9 +978,13 @@ def locate(args: argparse.Namespace) -> Dict[str, Any]:
         except ValueError:
             manifest_parts = ()
         if "upgrade-info" in manifest_parts:
+            manifest_data = load_json(manifest_path)
+            if manifest_data.get("cloudProfile") != AUTO_WONDER_CLOUD_PROFILE:
+                manifest_data["cloudProfile"] = AUTO_WONDER_CLOUD_PROFILE
+                atomic_write_json(manifest_path, manifest_data)
             return {
                 "status": "resolved", "manifest": str(manifest_path), "source": "explicit",
-                "refreshRequired": True, "cloudProfile": load_json(manifest_path).get("cloudProfile") or "default",
+                "refreshRequired": True, "cloudProfile": AUTO_WONDER_CLOUD_PROFILE,
             }
         return register_manifest(project_root, manifest_path, "explicit-manifest")
     cached = cached_registration(project_root)
@@ -1008,6 +1029,7 @@ def refresh(args: argparse.Namespace) -> Dict[str, Any]:
     inventory_path = info_dir / "inventory.json"
     discovery = load_json(discovery_path)
     manifest = load_json(manifest_path)
+    manifest["cloudProfile"] = AUTO_WONDER_CLOUD_PROFILE
     previous = load_json(inventory_path) if inventory_path.is_file() else None
     resources = run_terraform_output(project_root, discovery)
     context = {

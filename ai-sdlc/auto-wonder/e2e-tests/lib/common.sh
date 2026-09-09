@@ -10,6 +10,8 @@ set -euo pipefail
 
 E2E_DIR="${E2E_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REPO_ROOT="${REPO_ROOT:-$(cd "$E2E_DIR/.." && pwd)}"
+# shellcheck source=lifecycle.sh
+source "$E2E_DIR/lib/lifecycle.sh"
 
 # ---------------------------------------------------------------------------
 # Knobs. Defaults are the values the community compose file already uses, so
@@ -240,19 +242,37 @@ aw_e2e_official_mirror() {
 aw_e2e_port_listeners() {
   local port="$1"
   if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | wc -l | tr -d ' '
+    { lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true; } \
+      | tail -n +2 | wc -l | tr -d ' '
   else
     (ss -ltn "sport = :$port" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ') \
       || printf '0'
   fi
 }
 
+aw_e2e_port_reserved() {
+  local candidate="$1" reserved
+  shift
+  for reserved in "$@"; do
+    [[ "$candidate" == "$reserved" ]] && return 0
+  done
+  return 1
+}
+
 aw_e2e_first_free_port() {
   local start="${1:-39000}" p
+  shift || true
   for ((p = start; p < start + 400; p++)); do
-    [[ "$(aw_e2e_port_listeners "$p")" == "0" ]] && { printf '%s' "$p"; return; }
+    if [[ "$(aw_e2e_port_listeners "$p")" == "0" ]] && ! aw_e2e_port_reserved "$p" "$@"; then
+      printf '%s' "$p"
+      return
+    fi
   done
   die "no free port found from $start"
+}
+
+aw_e2e_minio_internal_port() {
+  printf '9000'
 }
 
 aw_e2e_prepare_state_dir() {
@@ -301,6 +321,8 @@ aw_e2e_resolve_compose() {
   [[ "${#AW_E2E_COMPOSE_ARGS[@]}" -gt 0 ]] && return 0
   local base="$AW_E2E_BASE_COMPOSE" derived="$AW_E2E_STATE_DIR/dependencies.derived.yml"
   local need_derive=0 mysql_port="$AW_E2E_MYSQL_PORT" redis_port="$AW_E2E_REDIS_PORT"
+  local minio_port="$AW_E2E_MINIO_PORT" minio_console_port="$AW_E2E_MINIO_CONSOLE_PORT"
+  local app_port="$AW_E2E_APP_PORT"
 
   grep -q "\"$mysql_port:3306\"" "$base" || need_derive=1
   grep -q "\"$redis_port:6379\"" "$base" || need_derive=1
@@ -308,14 +330,27 @@ aw_e2e_resolve_compose() {
     mysql_port="$(aw_e2e_first_free_port 39060)"; need_derive=1
     log "host port $AW_E2E_MYSQL_PORT busy; remapping mysql to $mysql_port"
   fi
-  if [[ "$(aw_e2e_port_listeners "$redis_port")" != "0" ]]; then
-    redis_port="$(aw_e2e_first_free_port 39160)"; need_derive=1
+  if [[ "$(aw_e2e_port_listeners "$redis_port")" != "0" ]] || aw_e2e_port_reserved "$redis_port" "$mysql_port"; then
+    redis_port="$(aw_e2e_first_free_port 39160 "$mysql_port")"; need_derive=1
     log "host port $AW_E2E_REDIS_PORT busy; remapping redis to $redis_port"
+  fi
+  if [[ "$(aw_e2e_port_listeners "$minio_port")" != "0" ]] || aw_e2e_port_reserved "$minio_port" "$mysql_port" "$redis_port"; then
+    minio_port="$(aw_e2e_first_free_port 39260 "$mysql_port" "$redis_port")"
+    log "host port $AW_E2E_MINIO_PORT busy; remapping minio API to $minio_port"
+  fi
+  if [[ "$(aw_e2e_port_listeners "$minio_console_port")" != "0" ]] || aw_e2e_port_reserved "$minio_console_port" "$mysql_port" "$redis_port" "$minio_port"; then
+    minio_console_port="$(aw_e2e_first_free_port 39360 "$mysql_port" "$redis_port" "$minio_port")"
+    log "host port $AW_E2E_MINIO_CONSOLE_PORT busy; remapping minio console to $minio_console_port"
+  fi
+  if [[ "$(aw_e2e_port_listeners "$app_port")" != "0" ]] || aw_e2e_port_reserved "$app_port" "$mysql_port" "$redis_port" "$minio_port" "$minio_console_port"; then
+    app_port="$(aw_e2e_first_free_port 39460 "$mysql_port" "$redis_port" "$minio_port" "$minio_console_port")"
+    log "host port $AW_E2E_APP_PORT busy; remapping application to $app_port"
   fi
 
   if [[ "$need_derive" == "1" ]]; then
     sed -e "s|\"[0-9]*:3306\"|\"$mysql_port:3306\"|" \
         -e "s|\"[0-9]*:6379\"|\"$redis_port:6379\"|" \
+        -e "s|../autowonder-schema.sql|$REPO_ROOT/docs/autowonder-schema.sql|" \
         "$base" >"$derived"
     AW_E2E_COMPOSE_ARGS=(-f "$derived" -f "$AW_E2E_LAYER_COMPOSE")
     COMPOSE_BASE_MODE="derived (host ports substituted; community file unchanged on disk)"
@@ -325,13 +360,27 @@ aw_e2e_resolve_compose() {
   fi
   RESOLVED_MYSQL_PORT="$mysql_port"
   RESOLVED_REDIS_PORT="$redis_port"
-  export RESOLVED_MYSQL_PORT RESOLVED_REDIS_PORT COMPOSE_BASE_MODE
+  RESOLVED_MINIO_PORT="$minio_port"
+  RESOLVED_MINIO_CONSOLE_PORT="$minio_console_port"
+  RESOLVED_APP_PORT="$app_port"
+  AW_E2E_MINIO_PORT="$minio_port"
+  AW_E2E_MINIO_CONSOLE_PORT="$minio_console_port"
+  AW_E2E_APP_PORT="$app_port"
+  export RESOLVED_MYSQL_PORT RESOLVED_REDIS_PORT
+  export RESOLVED_MINIO_PORT RESOLVED_MINIO_CONSOLE_PORT RESOLVED_APP_PORT
+  export AW_E2E_MINIO_PORT AW_E2E_MINIO_CONSOLE_PORT AW_E2E_APP_PORT COMPOSE_BASE_MODE
 
   # Persist the resolution so smoke.sh and down.sh replay exactly what up.sh
   # used instead of re-deriving it and possibly landing on different ports.
   {
     printf 'RESOLVED_MYSQL_PORT=%s\n' "$RESOLVED_MYSQL_PORT"
     printf 'RESOLVED_REDIS_PORT=%s\n' "$RESOLVED_REDIS_PORT"
+    printf 'RESOLVED_MINIO_PORT=%s\n' "$RESOLVED_MINIO_PORT"
+    printf 'RESOLVED_MINIO_CONSOLE_PORT=%s\n' "$RESOLVED_MINIO_CONSOLE_PORT"
+    printf 'RESOLVED_APP_PORT=%s\n' "$RESOLVED_APP_PORT"
+    printf 'AW_E2E_MINIO_PORT=%s\n' "$AW_E2E_MINIO_PORT"
+    printf 'AW_E2E_MINIO_CONSOLE_PORT=%s\n' "$AW_E2E_MINIO_CONSOLE_PORT"
+    printf 'AW_E2E_APP_PORT=%s\n' "$AW_E2E_APP_PORT"
     printf 'AW_E2E_COMPOSE_ARGS=(%s)\n' "$(printf '%q ' "${AW_E2E_COMPOSE_ARGS[@]}")"
   } >"$AW_E2E_STATE_DIR/resolved.env"
 }

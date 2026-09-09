@@ -59,7 +59,7 @@ aw_e2e_generate_secrets
 mc_env="$AW_E2E_STATE_DIR/mc.env"
 umask 077
 printf 'MC_HOST_m=http://%s:%s@minio:%s\n' \
-  "$AW_E2E_MINIO_ROOT_USER" "$(aw_e2e_secret AW_E2E_MINIO_ROOT_PASSWORD)" "$AW_E2E_MINIO_PORT" \
+  "$AW_E2E_MINIO_ROOT_USER" "$(aw_e2e_secret AW_E2E_MINIO_ROOT_PASSWORD)" "$(aw_e2e_minio_internal_port)" \
   >"$mc_env"
 chmod 600 "$mc_env"
 umask 022
@@ -72,7 +72,10 @@ printf '  %s\n' "${AW_E2E_COMPOSE_ARGS[@]}"
 log "resolved host ports: mysql=$RESOLVED_MYSQL_PORT redis=$RESOLVED_REDIS_PORT minio=$AW_E2E_MINIO_PORT app=$AW_E2E_APP_PORT"
 
 set +e
-aw_e2e_compose up -d --wait >"$AW_E2E_STATE_DIR/compose-up.log" 2>&1
+# Start dependencies only. The application is deliberately started by
+# smoke.sh after the schema and MinIO bucket have been verified and runtime.env
+# has been written.
+aw_e2e_compose up -d --wait mysql redis minio >"$AW_E2E_STATE_DIR/compose-up.log" 2>&1
 COMPOSE_UP_EXIT=$?
 set -e
 tail -20 "$AW_E2E_STATE_DIR/compose-up.log"
@@ -104,6 +107,7 @@ mysql_q() {
     2>>"$AW_E2E_STATE_DIR/mysql-q.err"
 }
 
+schema_report="$AW_E2E_STATE_DIR/schema-verification.txt"
 {
   echo "# schema verification on a brand-new volume"
   echo "PROJECT=$AW_E2E_PROJECT"
@@ -125,6 +129,22 @@ mysql_q() {
   echo "INDEX_ROWS=$(mysql_q "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema='autowonder'")"
   echo "ROW_COUNT_user=$(mysql_q 'SELECT COUNT(*) FROM autowonder.user')"
   echo "ROW_COUNT_org=$(mysql_q 'SELECT COUNT(*) FROM autowonder.org')"
-} | tee "$AW_E2E_STATE_DIR/schema-verification.txt"
+} | tee "$schema_report"
+
+aw_require_int_ge schema.table_count 65 "$(aw_report_value "$schema_report" TABLE_COUNT)"
+aw_require_equal schema.new_tables \
+  "agent_conversation_elicitation workspace_access_request " \
+  "$(aw_report_value "$schema_report" NEW_TABLES_FOUND)"
+aw_require_int_ge schema.stored_generated_columns 2 "$(aw_report_value "$schema_report" STORED_GENERATED_COLUMNS)"
+aw_require_equal schema.uk_active_name 1 "$(aw_report_value "$schema_report" UNIQUE_KEY_uk_active_name)"
+aw_require_equal schema.uk_conv_request 3 "$(aw_report_value "$schema_report" UNIQUE_KEY_uk_conv_request)"
+aw_require_equal schema.uk_dispatch_normalized_idempotency 2 "$(aw_report_value "$schema_report" UNIQUE_KEY_uk_dispatch_normalized_idempotency)"
+aw_require_equal schema.uk_workspace_access_request_pending 3 "$(aw_report_value "$schema_report" UNIQUE_KEY_uk_workspace_access_request_pending)"
+aw_require_equal schema.legacy_org_uk_name 0 "$(aw_report_value "$schema_report" LEGACY_uk_name_ON_org)"
+aw_require_equal schema.idx_org_recycle_bin 3 "$(aw_report_value "$schema_report" IDX_org_recycle_bin)"
+for required_column in user_is_admin org_active_name_key org_deleted_at org_deleted_by; do
+  aw_require_equal "schema.column_$required_column" 1 \
+    "$(aw_report_value "$schema_report" "COLUMN_$required_column")"
+done
 
 log "up.sh done"

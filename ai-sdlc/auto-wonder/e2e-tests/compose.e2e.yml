@@ -61,5 +61,35 @@ services:
       retries: 30
     networks: [community]
 
+  app:
+    image: ${AW_E2E_APP_IMAGE:?built by verify.sh}
+    platform: linux/amd64
+    pull_policy: never
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    env_file:
+      - ${AW_E2E_RUNTIME_ENV:?created by verify.sh}
+    environment:
+      SERVER_PORT: 7001
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/autowonder?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OSS_ENABLED: "false"
+      S3_ENABLED: "true"
+      S3_ENDPOINT: http://minio:9000
+    ports:
+      - "127.0.0.1:${RESOLVED_APP_PORT:-7001}:7001"
+    volumes:
+      - ${AW_E2E_LOG_DIR:?created by verify.sh}:/app/logs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - exec java $${JAVA_OPTS:-} -jar /app/auto-wonder.jar >>/app/logs/spring-boot-console.log 2>&1
+    networks: [community]
+
 volumes:
   minio-data:

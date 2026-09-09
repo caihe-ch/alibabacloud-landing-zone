@@ -1,13 +1,17 @@
 import json
+import hashlib
+import sys
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 import shlex
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+UPGRADE_ROOT = ROOT.parent / "upgrading-autowonder-on-alibaba-cloud"
 SCRIPTS = [
     "preflight.sh",
     "plan-upgrade.sh",
@@ -26,6 +30,8 @@ class ScriptContracts(unittest.TestCase):
         "SPRING_DATASOURCE_USERNAME": "autowonder",
         "SPRING_DATASOURCE_PASSWORD": "DbPassword1!",
         "REDIS_HOST": "redis.internal",
+        "REDIS_PORT": "6379",
+        "REDIS_PASSWORD": "RedisPassword1!",
         "OSS_ENDPOINT": "https://oss-cn-hangzhou-internal.aliyuncs.com",
         "OSS_PUBLIC_ENDPOINT": "https://oss-cn-hangzhou.aliyuncs.com",
         "OSS_BUCKET": "artifact-example",
@@ -100,8 +106,8 @@ class ScriptContracts(unittest.TestCase):
             cli_dir = root / ".aliyun"
             cli_dir.mkdir()
             (cli_dir / "config.json").write_text(json.dumps({
-                "current": "default",
-                "profiles": [{"name": "default", "access_key_id": "test-id",
+                "current": "auto-wonder",
+                "profiles": [{"name": "auto-wonder", "access_key_id": "test-id",
                               "access_key_secret": "test-secret", "sts_token": "test-token"}],
             }))
 
@@ -143,8 +149,8 @@ esac
             root = Path(td)
             cli_config = root / "config.json"
             cli_config.write_text(json.dumps({
-                "current": "deploy",
-                "profiles": [{"name": "deploy", "access_key_id": "test-id",
+                "current": "auto-wonder",
+                "profiles": [{"name": "auto-wonder", "access_key_id": "test-id",
                               "access_key_secret": "TEST_SECRET", "sts_token": "TEST_TOKEN"}],
             }))
             fake = root / "ossutil"
@@ -223,7 +229,7 @@ PY
         ):
             self.assertIn(required, text)
         self.assertNotIn("User=root", text)
-        deploy = (ROOT / "scripts/deploy-via-cloud-assistant.sh").read_text()
+        deploy = (ROOT / "scripts/internal/release-transfer.sh").read_text()
         self.assertIn(
             "mv /etc/autowonder/autowonder.env.tmp /etc/autowonder/autowonder.env",
             deploy,
@@ -247,20 +253,33 @@ PY
 
     def test_preflight_dry_run_accepts_valid_manifest_and_rejects_secret(self):
         with tempfile.TemporaryDirectory() as td:
-            manifest = self.valid_manifest(Path(td) / "manifest.json")
+            root = Path(td)
+            manifest = self.valid_manifest(root / "manifest.json")
+            manifest_data = json.loads(manifest.read_text())
+            manifest_data["mode"] = "resume"
+            manifest.write_text(json.dumps(manifest_data))
+            source = root / "source"
+            (source / "src/main/resources").mkdir(parents=True)
+            (source / "src/main/resources/application.yml").write_text(
+                "autowonder:\n  runtime:\n    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:9.8.7}\n"
+            )
             result = subprocess.run([
-                str(ROOT / "scripts/preflight.sh"), "--manifest", str(manifest),
-                "--source-dir", str(ROOT.parents[1]), "--dry-run",
+                "bash", str(ROOT / "scripts/preflight.sh"), "--manifest", str(manifest),
+                "--source-dir", str(source), "--dry-run",
             ], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
             self.assertEqual(data["status"], "passed")
+            self.assertEqual(
+                "9.8.7",
+                json.loads(manifest.read_text())["recommendedRuntimeVersion"],
+            )
             raw = json.loads(manifest.read_text())
             raw["password"] = "TEST_SECRET_DO_NOT_PRINT"
             manifest.write_text(json.dumps(raw))
             result = subprocess.run([
-                str(ROOT / "scripts/preflight.sh"), "--manifest", str(manifest),
-                "--source-dir", str(ROOT.parents[1]), "--dry-run",
+                "bash", str(ROOT / "scripts/preflight.sh"), "--manifest", str(manifest),
+                "--source-dir", str(source), "--dry-run",
             ], text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("TEST_SECRET_DO_NOT_PRINT", result.stdout + result.stderr)
@@ -326,6 +345,7 @@ esac
 
             env = os.environ.copy()
             env["PATH"] = f"{binary_dir}:{env['PATH']}"
+            env["ALIBABA_CLOUD_CLI_CONFIG_FILE"] = str(self.write_cloud_profile(root))
             result = subprocess.run([
                 "bash", str(ROOT / "scripts/preflight.sh"),
                 "--manifest", str(manifest), "--source-dir", str(ROOT.parents[1]),
@@ -446,7 +466,7 @@ JSON
                 "--manifest", str(manifest), "--work-dir", str(work),
             ], text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("remote state backend reference", result.stderr)
+            self.assertIn("automatic remote state backend is not ready", result.stderr)
 
     def test_manifest_guard_allows_security_status_metadata(self):
         with tempfile.TemporaryDirectory() as td:
@@ -474,10 +494,7 @@ JSON
             root = Path(td)
             manifest = self.valid_manifest(root / "manifest.json")
             env_file = self.write_env(root / "autowonder.env", {"SPRING_DATASOURCE_PASSWORD": ""})
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("empty", result.stderr)
 
@@ -486,10 +503,7 @@ JSON
             root = Path(td)
             manifest = self.valid_manifest(root / "manifest.json")
             env_file = self.write_env(root / "autowonder.env")
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
             self.assertEqual(result.returncode, 0, result.stderr)
             values = {}
             for line in env_file.read_text().splitlines():
@@ -509,10 +523,7 @@ JSON
             manifest.write_text(json.dumps(data))
             env_file = self.write_env(root / "autowonder.env")
 
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             values = {}
@@ -528,10 +539,7 @@ JSON
                 root / "domain.env",
                 {"AUTOWONDER_PUBLIC_BASE_URL": "https://autowonder.example.com"},
             )
-            explicit = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(explicit_env),
-            ], text=True, capture_output=True)
+            explicit = self.run_runtime_config(manifest, explicit_env)
             self.assertEqual(explicit.returncode, 0, explicit.stderr)
             self.assertIn(
                 "AUTOWONDER_PUBLIC_BASE_URL=https://autowonder.example.com\n",
@@ -547,10 +555,7 @@ JSON
                 {"AUTOWONDER_RUNTIME_RECOMMENDED_VERSION": "0.2.110"},
             )
 
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             version_lines = [
@@ -574,10 +579,7 @@ JSON
                 {"AUTOWONDER_VERSION": "0.3.5"},
             )
 
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             version_lines = [
@@ -595,10 +597,7 @@ JSON
                 {"OSS_ENDPOINT": "https://oss-cn-hangzhou.aliyuncs.com"},
             )
 
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("regional intranet endpoint", result.stderr)
@@ -612,18 +611,17 @@ JSON
                 {"OSS_PUBLIC_ENDPOINT": "https://oss-cn-hangzhou-internal.aliyuncs.com"},
             )
 
-            result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
-                "--manifest", str(manifest), "--env-file", str(env_file),
-            ], text=True, capture_output=True)
+            result = self.run_runtime_config(manifest, env_file)
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("regional public HTTPS endpoint", result.stderr)
 
     def test_cloud_assistant_uses_current_cli_contract_without_double_encoding(self):
-        for name in ("deploy-via-cloud-assistant.sh", "initialize-and-verify.sh"):
+        for name in ("internal/release-transfer.sh", "internal/operations.sh"):
             text = (ROOT / "scripts" / name).read_text()
-            self.assertIn("--CommandContent \"$script\"", text, name)
+            self.assertIn('--CommandContent "$command_content"', text, name)
+            self.assertIn("| base64 -d | /usr/bin/env bash", text, name)
+            self.assertNotIn('--ContentEncoding', text, name)
             self.assertIn("cloud_assistant_invocation_id", text, name)
             self.assertIn("--InvokeId \"$invocation\"", text, name)
             self.assertIn("cloud_assistant_status", text, name)
@@ -655,7 +653,7 @@ printf '%s|%s|%s\n' "$(cloud_assistant_invocation_id <<<"$legacy")" "$(cloud_ass
         )
 
     def test_readiness_uses_only_public_probes_and_host_postconditions(self):
-        text = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        text = (ROOT / "scripts/internal/operations.sh").read_text()
         self.assertNotIn("/api/health", text)
         self.assertIn("/checkpreload.htm", text)
         self.assertIn("/api/platform/branding/public", text)
@@ -663,7 +661,7 @@ printf '%s|%s|%s\n' "$(cloud_assistant_invocation_id <<<"$legacy")" "$(cloud_ass
         self.assertRegex(text, r"(?:ss|/proc/net/tcp).*7001")
 
     def test_transfer_separates_control_and_runtime_oss_endpoints(self):
-        text = (ROOT / "scripts/deploy-via-cloud-assistant.sh").read_text()
+        text = (ROOT / "scripts/internal/release-transfer.sh").read_text()
         self.assertIn('control_endpoint=', text)
         self.assertIn('runtime_endpoint=', text)
         self.assertIn('ossutil_upload ', text)
@@ -698,6 +696,7 @@ esac
             fake.chmod(0o755)
             env = os.environ.copy()
             env["PATH"] = f"{root}:{env['PATH']}"
+            env["ALIBABA_CLOUD_CLI_CONFIG_FILE"] = str(self.write_cloud_profile(root))
             for mode, expected in (("v2", "v2"), ("legacy", "legacy")):
                 env["OSSUTIL_FAKE_MODE"] = mode
                 log = root / f"{mode}.log"
@@ -764,22 +763,45 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
             ):
                 (release / name).write_bytes(b"sealed")
 
+            unit = release / "autowonder.service"
+            unit.write_bytes((ROOT / "assets/systemd/autowonder.service").read_bytes())
+            data = json.loads(manifest.read_text())
+            data["upgrade"] = {
+                "blockedReasons": [], "environmentContractChecked": True,
+                "environmentValidated": True, "targetRecommendedRuntimeVersion": "0.2.152",
+                "environmentCandidateSha256": hashlib.sha256(env_file.read_bytes()).hexdigest(),
+            }
+            data["runtimeConfig"] = {"prepared": True, "recommendedRuntimeVersion": "0.2.152"}
+            data["artifacts"]["systemdUnit"] = {
+                "sha256": hashlib.sha256(unit.read_bytes()).hexdigest(), "source": "target-source",
+            }
+            manifest.write_text(json.dumps(data))
+            env = self.prepare_upgrade(manifest)
+            data = json.loads(manifest.read_text())
+            data["upgrade"]["rollbackBackup"] = {
+                "status": "passed", "planFingerprint": data["upgrade"]["planFingerprint"],
+                "fromCommit": data["upgrade"]["fromCommit"], "targetCommit": data["upgrade"]["toCommit"],
+                "nodes": [{"instanceId": instance, "status": "passed", "sha256": "d" * 64}
+                          for instance in data["resources"]["ecs_instance_ids"].values()],
+            }
+            manifest.write_text(json.dumps(data))
             result = subprocess.run([
-                str(ROOT / "scripts/deploy-via-cloud-assistant.sh"),
+                str(UPGRADE_ROOT / "scripts/stage-upgrade.sh"),
                 "--manifest", str(manifest), "--env-file", str(env_file),
                 "--release-dir", str(release), "--stage-only", "--dry-run",
-            ], text=True, capture_output=True)
+            ], text=True, capture_output=True, env=env)
 
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual("stage-only", json.loads(result.stdout)["mode"])
 
     def test_upgrade_release_seals_migrations_and_preserves_active_symlink(self):
         build = (ROOT / "scripts/build-release.sh").read_text()
-        deploy = (ROOT / "scripts/deploy-via-cloud-assistant.sh").read_text()
+        deploy = (UPGRADE_ROOT / "scripts/internal/release-transfer.sh").read_text()
         normalized_deploy = deploy.replace('\\"', '"').replace('\\$', '$')
 
         self.assertIn("autowonder-migrations.tar.gz", build)
-        self.assertIn('LC_ALL=C tar -czf "$output_dir/autowonder-migrations.tar.gz"', build)
+        self.assertIn('LC_ALL=C tar -czf "$migrations_tmp"', build)
+        self.assertIn('mv -f -- "$migrations_tmp" "$output_dir/autowonder-migrations.tar.gz"', build)
         self.assertIn('migrations:{name:"autowonder-migrations.tar.gz"', build)
         self.assertIn("autowonder-migrations.tar.gz", deploy)
         self.assertIn("migrations_hash", deploy)
@@ -810,7 +832,14 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
             )
 
             (product / "target").mkdir()
-            (product / "target/auto-wonder.jar").write_bytes(b"test-jar")
+            (product / "src/main/resources").mkdir(parents=True)
+            (product / "src/main/resources/application.yml").write_text(
+                "autowonder:\n  runtime:\n    recommended-version: ${AUTOWONDER_RUNTIME_RECOMMENDED_VERSION:9.8.7}\n"
+            )
+            with zipfile.ZipFile(product / "target/auto-wonder.jar", "w") as jar:
+                jar.write(product / "src/main/resources/application.yml", "BOOT-INF/classes/application.yml")
+                jar.writestr("BOOT-INF/classes/static/index.html", "<html></html>")
+                jar.writestr("BOOT-INF/classes/static/assets/index.js", "console.log('test');")
             (product / "VERSION").write_text("0.4.0\n")
             (product / "docs/migration").mkdir(parents=True)
             (product / "docs/autowonder-schema.sql").write_text("SELECT 1;\n")
@@ -853,6 +882,7 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
 
             result = subprocess.run(
                 [
+                    "bash",
                     str(ROOT / "scripts/build-release.sh"),
                     "--manifest",
                     str(manifest),
@@ -870,26 +900,32 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
             self.assertEqual(product.resolve(), Path(mvn_pwd.read_text().strip()).resolve())
             self.assertTrue((output / "autowonder-migrations.tar.gz").is_file())
             self.assertEqual("0.4.0", json.loads(manifest.read_text())["releaseVersion"])
+            self.assertEqual(
+                "9.8.7",
+                json.loads(manifest.read_text())["recommendedRuntimeVersion"],
+            )
 
-    def test_preflight_supports_explicit_credential_profile(self):
+    def test_preflight_allows_only_auto_wonder_credential_profile(self):
         text = (ROOT / "scripts/preflight.sh").read_text()
         self.assertIn("--profile PROFILE", text)
-        self.assertIn('--profile "$profile"', text)
+        self.assertIn('[[ -z "$profile" || "$profile" == auto-wonder ]]', text)
+        self.assertIn("profile=auto-wonder", text)
 
     def test_verified_profile_is_reused_by_all_cloud_execution_scripts(self):
         for name in (
             "terraform-stage.sh",
-            "deploy-via-cloud-assistant.sh",
-            "initialize-and-verify.sh",
+            "internal/release-transfer.sh",
+            "internal/operations.sh",
+            "terraform-backend.sh",
         ):
             text = (ROOT / "scripts" / name).read_text()
             self.assertIn('configure_cloud_profile "$manifest"', text, name)
-        for name in ("deploy-via-cloud-assistant.sh", "initialize-and-verify.sh"):
+        for name in ("internal/release-transfer.sh", "internal/operations.sh"):
             text = (ROOT / "scripts" / name).read_text()
             self.assertIn("aliyun_cli ecs RunCommand", text, name)
 
     def test_cloud_assistant_polling_covers_remote_timeout(self):
-        for name in ("deploy-via-cloud-assistant.sh", "initialize-and-verify.sh"):
+        for name in ("internal/release-transfer.sh", "internal/operations.sh"):
             text = (ROOT / "scripts" / name).read_text()
             self.assertIn("--Timeout 1800", text, name)
             self.assertIn("deadline=$((SECONDS + 1860))", text, name)
@@ -898,7 +934,7 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
             self.assertNotIn("attempts++ < 180", text, name)
 
     def test_database_parser_strips_jdbc_prefix_before_database_split(self):
-        text = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        text = (ROOT / "scripts/internal/operations.sh").read_text()
         self.assertIn('connection=${SPRING_DATASOURCE_URL#jdbc:mysql://}', text)
         self.assertIn('authority=${connection%%/*}', text)
         self.assertIn('database=${connection#*/}', text)
@@ -921,37 +957,38 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
                 }],
             }
             manifest.write_text(json.dumps(data))
+            env = self.prepare_upgrade(manifest)
             command = [
-                str(ROOT / "scripts/initialize-and-verify.sh"),
+                str(UPGRADE_ROOT / "scripts/upgrade-operations.sh"),
                 "database-migrate", "--manifest", str(manifest),
             ]
 
-            missing_confirmation = subprocess.run(command, text=True, capture_output=True)
+            missing_confirmation = subprocess.run(command, text=True, capture_output=True, env=env)
             self.assertNotEqual(0, missing_confirmation.returncode)
             self.assertIn("explicit migration confirmation", missing_confirmation.stderr)
 
             missing_backup = subprocess.run(
-                [*command, "--confirm-migrations"], text=True, capture_output=True
+                [*command, "--confirm-migrations"], text=True, capture_output=True, env=env
             )
             self.assertNotEqual(0, missing_backup.returncode)
-            self.assertIn("verified database backup", missing_backup.stderr)
+            self.assertIn("recent live-verified database backup evidence for this RDS instance", missing_backup.stderr)
 
     def test_database_migration_requires_rolling_compatibility_decision(self):
-        initialize = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        initialize = (UPGRADE_ROOT / "scripts/internal/operations.sh").read_text()
         self.assertIn("--confirm-rolling-compatible", initialize)
         self.assertIn("maintenance workflow is required", initialize)
         self.assertIn("databaseCompatibility.rollingAllowed", initialize)
 
     def test_database_migration_accepts_zero_padded_versions(self):
-        initialize = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        initialize = (UPGRADE_ROOT / "scripts/internal/operations.sh").read_text()
         self.assertIn("V0*[1-9][0-9]*__", initialize)
 
     def test_upgrade_candidate_environment_is_hash_bound_before_staging(self):
-        initialize = (ROOT / "scripts/initialize-and-verify.sh").read_text()
-        deploy = (ROOT / "scripts/deploy-via-cloud-assistant.sh").read_text()
+        initialize = (UPGRADE_ROOT / "scripts/internal/operations.sh").read_text()
+        deploy = (UPGRADE_ROOT / "scripts/internal/release-transfer.sh").read_text()
         self.assertIn(".upgrade.environmentCandidateSha256=$envHash", initialize)
         self.assertIn(".upgrade.environmentValidated=true", initialize)
-        self.assertIn(".upgrade.environment.added[]", initialize)
+        self.assertIn(".upgrade.environment.required[]", initialize)
         self.assertIn('require_nonempty_env "$env_file" "$key"', initialize)
         self.assertIn(".upgrade.environmentContractChecked", deploy)
         self.assertIn(".upgrade.environmentCandidateSha256", deploy)
@@ -970,18 +1007,19 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
                 "pendingMigrations": [],
             }
             manifest.write_text(json.dumps(data))
+            env = self.prepare_upgrade(manifest)
 
             result = subprocess.run([
-                str(ROOT / "scripts/initialize-and-verify.sh"),
+                str(UPGRADE_ROOT / "scripts/upgrade-operations.sh"),
                 "database-migrate", "--manifest", str(manifest),
-            ], text=True, capture_output=True)
+            ], text=True, capture_output=True, env=env)
 
             self.assertEqual(0, result.returncode, result.stderr)
             migration = json.loads(manifest.read_text())["upgrade"]["databaseMigration"]
             self.assertEqual("not-required", migration["status"])
 
     def test_database_migration_has_lock_ledger_checksum_and_failure_fences(self):
-        initialize = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        initialize = (UPGRADE_ROOT / "scripts/internal/operations.sh").read_text()
         migration = initialize.split("  database-migrate)", 1)[1].split(
             "  rolling-start)", 1
         )[0]
@@ -1018,23 +1056,28 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
             data["repositoryCommit"] = "a" * 40
             data["upgrade"] = {"blockedReasons": [], "databaseMigration": {}}
             manifest.write_text(json.dumps(data))
+            env = self.prepare_upgrade(manifest)
             command = [
-                str(ROOT / "scripts/initialize-and-verify.sh"),
+                str(UPGRADE_ROOT / "scripts/upgrade-operations.sh"),
                 "rolling-upgrade", "--manifest", str(manifest),
             ]
 
-            not_staged = subprocess.run(command, text=True, capture_output=True)
+            not_staged = subprocess.run(command, text=True, capture_output=True, env=env)
             self.assertNotEqual(0, not_staged.returncode)
             self.assertIn("stage-only release", not_staged.stderr)
 
-            data["deployment"] = {"lastRun": {"mode": "stage-only"}}
+            data = json.loads(manifest.read_text())
+            data["deployment"] = {"lastRun": {"mode": "stage-only", "envSha256": "c" * 64}}
+            data["runtimeConfig"] = {"prepared": True, "recommendedRuntimeVersion": "0.2.152", "envSha256": "c" * 64}
+            data["upgrade"]["targetRecommendedRuntimeVersion"] = "0.2.152"
             manifest.write_text(json.dumps(data))
-            no_migration_checkpoint = subprocess.run(command, text=True, capture_output=True)
+            self.approve_upgrade(manifest)
+            no_migration_checkpoint = subprocess.run(command, text=True, capture_output=True, env=env)
             self.assertNotEqual(0, no_migration_checkpoint.returncode)
             self.assertIn("database migration checkpoint", no_migration_checkpoint.stderr)
 
     def test_rolling_upgrade_switches_restarts_and_probes_nodes_sequentially(self):
-        initialize = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        initialize = (UPGRADE_ROOT / "scripts/internal/operations.sh").read_text()
         rolling = initialize.split("  rolling-upgrade)", 1)[1].split(
             "  rolling-start)", 1
         )[0]
@@ -1066,8 +1109,8 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
 
     def test_release_and_database_include_squad_template_seed(self):
         build = (ROOT / "scripts/build-release.sh").read_text()
-        deploy = (ROOT / "scripts/deploy-via-cloud-assistant.sh").read_text()
-        initialize = (ROOT / "scripts/initialize-and-verify.sh").read_text()
+        deploy = (ROOT / "scripts/internal/release-transfer.sh").read_text()
+        initialize = (ROOT / "scripts/internal/operations.sh").read_text()
 
         seed_name = "autowonder-community-templates.sql"
         self.assertIn(seed_name, build)
@@ -1121,6 +1164,7 @@ printf 'contract=%s url_ready=%s\n' "$OSSUTIL_CONTRACT" "${OSSUTIL_PRESIGNED_URL
             manifest = self.valid_manifest(root / "manifest.json")
             data = json.loads(manifest.read_text())
             data["applicationBaseUrl"] = "http://example.invalid"
+            data["resources"]["alb_public_ipv4_addresses"] = ["198.51.100.10", "198.51.100.11"]
             data["acceptance"] = {
                 "databasePersistence": "passed",
                 "secretLogScan": "passed",
@@ -1166,6 +1210,107 @@ esac
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertFalse(handoff.exists())
+
+    @staticmethod
+    def write_cloud_profile(root):
+        path = root / "aliyun-config.json"
+        path.write_text(json.dumps({"profiles": [{
+            "name": "auto-wonder", "access_key_id": "fixture-id",
+            "access_key_secret": "fixture-secret", "sts_token": "fixture-token",
+        }]}))
+        path.chmod(0o600)
+        return path
+
+    def run_runtime_config(self, manifest, env_file):
+        root = manifest.parent
+        work = root / "tf"
+        work.mkdir(exist_ok=True)
+        binary_dir = root / "bin"
+        binary_dir.mkdir(exist_ok=True)
+        data = json.loads(manifest.read_text())
+        (work / "expected-tags.json").write_text(json.dumps(data["tags"]))
+        terraform = binary_dir / "terraform"
+        terraform.write_text('''#!/usr/bin/env bash
+set -eu
+work=${1#-chdir=}; shift
+case "$*" in
+  'output -json expected_tags') cat "$work/expected-tags.json";;
+  'output -raw application_access_key_id') printf 'terraform-app-id';;
+  'output -raw application_access_key_secret') printf 'terraform-app-secret';;
+  *) exit 1;;
+esac
+''')
+        terraform.chmod(0o755)
+        env = {**os.environ, "PATH": f"{binary_dir}:{os.environ['PATH']}",
+               "ALIBABA_CLOUD_CLI_CONFIG_FILE": str(self.write_cloud_profile(root))}
+        result = subprocess.run([
+            str(ROOT / "scripts/initialize-and-verify.sh"), "runtime-config",
+            "--manifest", str(manifest), "--env-file", str(env_file),
+            "--terraform-dir", str(work),
+        ], text=True, capture_output=True, env=env)
+        if result.returncode == 0:
+            values = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+            for prefix in ("OSS", "SLS"):
+                self.assertEqual("terraform-app-id", shlex.split(values[f"{prefix}_ACCESS_KEY_ID"])[0])
+                self.assertEqual("terraform-app-secret", shlex.split(values[f"{prefix}_ACCESS_KEY_SECRET"])[0])
+            self.assertNotIn("terraform-app-secret", result.stdout + result.stderr)
+            self.assertEqual(0o600, env_file.stat().st_mode & 0o777)
+        return result
+
+    def prepare_upgrade(self, manifest):
+        root = manifest.parent
+        binary_dir = root / "bin"
+        binary_dir.mkdir(exist_ok=True)
+        data = json.loads(manifest.read_text())
+        data["mode"] = "upgrade"
+        data["cloudProfile"] = "auto-wonder"
+        data["resources"]["vpc_id"] = "vpc-test"
+        data.setdefault("upgrade", {}).update(fromCommit="b" * 40, toCommit=data["repositoryCommit"])
+        manifest.write_text(json.dumps(data))
+        instances = [{"InstanceId": instance, "VpcAttributes": {"VpcId": "vpc-test"},
+                      "Tags": {"Tag": [{"TagKey": key, "TagValue": value}
+                                        for key, value in data["tags"].items()]}}
+                     for instance in data["resources"]["ecs_instance_ids"].values()]
+        (root / "cloud-inventory.json").write_text(json.dumps({"Instances": {"Instance": instances}}))
+        aliyun = binary_dir / "aliyun"
+        aliyun.write_text('''#!/usr/bin/env bash
+set -eu
+case "$1:$2" in
+  sts:GetCallerIdentity) printf '{"AccountId":"123456789"}\n';;
+  ecs:DescribeInstances)
+    shift 2
+    while (($#)); do
+      if [[ "$1" == --InstanceIds ]]; then
+        jq --argjson ids "$2" '.Instances.Instance |= map(select(.InstanceId as $id | $ids | index($id)))' "$FAKE_CLOUD_INVENTORY"
+        exit 0
+      fi
+      shift
+    done
+    cat "$FAKE_CLOUD_INVENTORY";;
+  *) exit 1;;
+esac
+''')
+        aliyun.chmod(0o755)
+        env = {**os.environ, "PATH": f"{binary_dir}:{os.environ['PATH']}",
+               "ALIBABA_CLOUD_CLI_CONFIG_FILE": str(self.write_cloud_profile(root)),
+               "FAKE_CLOUD_INVENTORY": str(root / "cloud-inventory.json")}
+        verified = subprocess.run([
+            "bash", str(UPGRADE_ROOT / "scripts/verify-deployment-targets.sh"),
+            "--manifest", str(manifest),
+        ], text=True, capture_output=True, env=env)
+        self.assertEqual(0, verified.returncode, verified.stderr)
+        self.approve_upgrade(manifest)
+        return env
+
+    def approve_upgrade(self, manifest):
+        fingerprint = subprocess.check_output([
+            sys.executable, "-B", str(UPGRADE_ROOT / "scripts/upgrade_plan.py"),
+            "fingerprint", "--manifest", str(manifest),
+        ], text=True).strip()
+        data = json.loads(manifest.read_text())
+        data["upgrade"]["planFingerprint"] = fingerprint
+        data["upgrade"]["approval"] = {"status": "approved", "planFingerprint": fingerprint}
+        manifest.write_text(json.dumps(data))
 
     @staticmethod
     def valid_manifest(path):

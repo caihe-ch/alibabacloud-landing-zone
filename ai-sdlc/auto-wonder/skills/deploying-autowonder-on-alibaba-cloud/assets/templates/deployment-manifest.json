@@ -3,6 +3,7 @@
   "mode": "new",
   "phase": "questionnaire",
   "status": "planned",
+  "cloudProfile": "auto-wonder",
   "region": "",
   "regionPreset": [
     "cn-zhangjiakou",
@@ -54,7 +55,6 @@
   "repositoryUrl": "",
   "repositoryRef": "community",
   "repositoryCommit": "",
-  "recommendedRuntimeVersion": "0.2.152",
   "executionMode": "unattended",
   "tags": {
     "Project": "AutoWonder",

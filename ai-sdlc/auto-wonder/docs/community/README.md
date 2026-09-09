@@ -92,6 +92,31 @@ its owner and administrator.
 
 ## Release Checks
 
+For a local release-image startup gate, target the exact pending-merge worktree:
+
+```bash
+./e2e-tests/verify.sh --start --project-root "$(pwd -P)" --mode image --keep-on-failure
+# Perform any release-specific browser/API checks, then:
+./e2e-tests/verify.sh --check --project-root "$(pwd -P)"
+./e2e-tests/verify.sh --clean-up --project-root "$(pwd -P)"
+```
+
+The lifecycle automatically compiles and tests the code, builds the final image,
+initializes a fresh schema, starts isolated MySQL/Redis/MinIO and Spring Boot,
+resolves host-port conflicts, and publishes log paths and a non-secret runtime
+manifest before returning control to the Agent. Credentials are available only
+in the printed mode-`0600` `runtime.env`. See
+[the Agent lifecycle guide](../../e2e-tests/AGENT_GUIDE.md).
+
+The release gate supports macOS and CentOS verification hosts. It automatically
+probes and installs Git, curl, Python 3, OpenSSL, JDK 21, Maven, Docker,
+Compose v2, and Buildx, then starts Docker Desktop or Docker Engine when needed.
+CentOS requires root or non-interactive sudo. Pass `--no-install` only for a
+detection-only run. MySQL, Redis, MinIO and its client are repository-declared
+image references pulled by Docker; the application image is built from the
+exact pending-merge worktree. Every run publishes `BOOTSTRAP_LOG` before work
+begins and ends with an explicit `LIFECYCLE|END|PASS` or `FAIL` record.
+
 Run the complete matrix in [verification.md](verification.md). A release requires
 the automated test and internal-reference gates, a Linux amd64 image build, an
 OSS upload/read/presign test, a persisted-secret round trip, and SLS delivery

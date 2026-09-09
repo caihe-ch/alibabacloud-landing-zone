@@ -27,6 +27,7 @@ require_command jq
 require_command aliyun
 require_command python3
 json_validate "$manifest"
+bash "$UPGRADE_DEPLOY_SKILL_DIR/scripts/bootstrap-control-host.sh" --manifest "$manifest" >/dev/null
 configure_cloud_profile "$manifest"
 region=$(json_string "$manifest" '.region')
 load_alicloud_profile_credentials "$region"

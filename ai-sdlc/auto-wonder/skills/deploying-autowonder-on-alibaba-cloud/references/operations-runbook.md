@@ -9,10 +9,16 @@ ad hoc cloud mutations.
 ## Common Rules
 
 1. Keep the manifest outside Git and set restrictive permissions.
-2. Use the local Alibaba Cloud credential chain. Select a known-good profile once
-   with `preflight.sh --profile <name>` when necessary; never change global CLI
-   configuration as part of a deployment. Export the selected region and pass
-   the CLI global region when an API has no request-level `RegionId`.
+2. Use only the dedicated Alibaba Cloud CLI profile `auto-wonder`. Preflight
+   probes STS through that profile and, when it is missing or expired, runs
+   `aliyun configure --profile auto-wonder --mode OAuth`, overwrites the profile
+   identity, and repeats STS before continuing. Clear ambient `ALICLOUD_*` and
+   `ALIBABA_CLOUD_*` credentials before loading this profile. Never select the CLI current or
+   `default` profile. Export the selected region and pass the CLI global region
+   when an API has no request-level `RegionId`.
+   Start every workflow, including a resume that skips phase 1, with
+   `scripts/bootstrap-control-host.sh --manifest <file>` so STS/OAuth validation
+   cannot be bypassed.
 3. Run host commands through Cloud Assistant. Poll every invocation to terminal
    status and require exit code zero; retain only sanitized output.
 4. Never put raw secret values in command content or output. V1 permits one
@@ -118,8 +124,11 @@ and application AK/SK only in a protected session. Encode the env file with
 key: it is required to read persisted `enc:v1:` values. `runtime-config` must
 write `AUTOWONDER_PUBLIC_BASE_URL` into this file. It derives a missing value
 from manifest `applicationBaseUrl`, while preserving an explicit domain/TLS URL.
-It also replaces any stale `AUTOWONDER_RUNTIME_RECOMMENDED_VERSION` with the
-manifest `recommendedRuntimeVersion`; the manifest is the deployment source of truth.
+It also derives `autowonder.runtime.recommended-version` from the exact pending
+source `src/main/resources/application.yml`, records the resolved value as
+manifest `recommendedRuntimeVersion`, and replaces any stale
+`AUTOWONDER_RUNTIME_RECOMMENDED_VERSION`. The source configuration is the source
+of truth; the generated manifest value is an audit and resume checkpoint.
 The sealed repository `VERSION` is also recorded in the manifest and written as
 `AUTOWONDER_VERSION`, which is displayed on the About page.
 Set application `OSS_ENDPOINT` to the regional intranet endpoint, for example
