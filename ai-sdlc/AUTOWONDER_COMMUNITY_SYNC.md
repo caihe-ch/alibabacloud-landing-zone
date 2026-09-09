@@ -31,6 +31,12 @@ tree mirror.
 7. Push only to the maintainer fork and open a pull request. Never push or merge
    directly to GitHub upstream `master`.
 
+If a boundary check finds a community-source defect, stop the GitHub sync. Fix
+the defect on an isolated internal branch, merge its reviewed change into
+`community`, fetch `origin/community` again, and restart from a newly pinned
+commit. Do not patch the GitHub mirror independently, and do not publish a
+commit that is merely based on `community` but has not been merged into it.
+
 ## 1. Pin both repositories
 
 Use two clean local checkouts: one for the internal AutoWonder repository and
@@ -39,8 +45,11 @@ one for this GitHub repository.
 ```bash
 set -euo pipefail
 
-INTERNAL_REPO=/path/to/internal/auto-wonder
-GITHUB_REPO=/path/to/alibabacloud-landing-zone
+: "${INTERNAL_REPO:?set INTERNAL_REPO to the internal AutoWonder checkout}"
+: "${GITHUB_REPO:?set GITHUB_REPO to the GitHub monorepo checkout}"
+
+INTERNAL_REPO=$(cd "$INTERNAL_REPO" && pwd -P)
+GITHUB_REPO=$(cd "$GITHUB_REPO" && pwd -P)
 
 git -C "$INTERNAL_REPO" fetch origin community
 git -C "$GITHUB_REPO" fetch origin master --prune
@@ -70,11 +79,19 @@ Choose a unique date and the pinned source's short commit ID:
 
 ```bash
 SOURCE_SHORT=$(git -C "$INTERNAL_REPO" rev-parse --short=9 "$SOURCE_COMMIT")
-BRANCH="sync/autowonder-community-${SOURCE_SHORT}-YYYYMMDD"
-WORKTREE=/path/to/isolated/worktrees/$BRANCH
+RUN_DATE=$(date +%Y%m%d)
+BRANCH="sync/autowonder-community-${SOURCE_SHORT}-${RUN_DATE}"
+WORKTREE_BASE=${WORKTREE_BASE:-"$(dirname "$GITHUB_REPO")/worktrees"}
+WORKTREE="$WORKTREE_BASE/autowonder-community-${SOURCE_SHORT}-${RUN_DATE}"
 
+mkdir -p "$WORKTREE_BASE"
 git -C "$GITHUB_REPO" worktree add "$WORKTREE" -b "$BRANCH" "$GITHUB_BASE"
 ```
+
+`INTERNAL_REPO`, `GITHUB_REPO`, and optionally `WORKTREE_BASE` are execution
+inputs, not repository constants. The operator or Agent supplies them for the
+current machine. Never commit a developer home directory or machine-specific
+absolute path into this runbook or a helper script.
 
 Run the current GitHub baseline verification from
 `$WORKTREE/ai-sdlc/auto-wonder` before replacing any file. Use the commands in
@@ -88,7 +105,7 @@ deletion scope:
 
 ```bash
 TARGET="$WORKTREE/ai-sdlc/auto-wonder"
-STAGE=$(mktemp -d "${TMPDIR:-/tmp}/autowonder-community-export.XXXXXX")
+STAGE=$(mktemp -d)
 
 test "$(git -C "$INTERNAL_REPO" rev-parse origin/community)" = "$SOURCE_COMMIT"
 test -d "$TARGET"
@@ -158,7 +175,7 @@ command for the verification process:
 
 ```bash
 brew install coreutils
-CHECKSUM_BIN=$(mktemp -d "${TMPDIR:-/tmp}/autowonder-test-tools.XXXXXX")
+CHECKSUM_BIN=$(mktemp -d)
 ln -s "$(brew --prefix coreutils)/bin/gsha256sum" "$CHECKSUM_BIN/sha256sum"
 PATH="$CHECKSUM_BIN:$PATH" python3 -m pytest tests -q
 ```
