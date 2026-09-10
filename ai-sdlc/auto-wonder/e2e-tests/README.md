@@ -8,44 +8,56 @@ register → login → workspace → this release's new endpoints.
 Unit tests being green does not mean the application starts. This directory
 exists because that gap can only be closed by running the thing.
 
-```
-e2e-tests/up.sh         # dependencies + fresh-volume schema verification
-e2e-tests/smoke.sh      # start the service, probe public endpoints, scan logs
-e2e-tests/authchain.sh  # walk a real authenticated chain
-e2e-tests/logscan.sh    # attribute every ERROR / WARN to the request that caused it
-e2e-tests/down.sh       # tear everything down and assert nothing is left
-```
-
-Run them in that order. Each one refuses to start if its predecessor has not run.
+Agents and release verification use `verify.sh` as the stable public interface.
+The lower-level scripts remain implementation details and focused developer
+diagnostics. See [AGENT_GUIDE.md](AGENT_GUIDE.md) for the complete Agent contract.
 
 ## Requirements
 
-Only these, and nothing is installed on the host:
+The supported verification hosts are macOS and CentOS. `--start` probes every
+capability and, by default, installs or starts what is missing:
 
-- `docker` with a reachable daemon, and `docker compose` v2
-- `bash`, `curl`, `python3`, `openssl`
+- macOS: Homebrew packages for Git, curl, Python 3, OpenSSL, JDK 21 and Maven;
+  Docker Desktop is installed as a cask and opened when its daemon is stopped;
+- CentOS: `dnf` is preferred and `yum` is the fallback; ordinary build tools and
+  JDK 21 are installed from RPM packages. If the distribution does not provide
+  OpenJDK 21, the script uses the official Eclipse Adoptium RPM repository and
+  Temurin 21. Docker CE, Compose v2 and Buildx use Docker's official CentOS
+  repository and `systemctl enable --now docker`;
+- CentOS installation requires root or already-authorized non-interactive sudo.
+
+The script itself must initially be runnable by Bash. A supported package manager
+and network access to its repositories and container registries are also
+required. Use `--no-install` for a read-only prerequisite check: missing or
+stopped dependencies then fail immediately with the recovery command.
 
 The harness never touches a host MySQL, Redis or object store. Every dependency
 runs in a container on its own network with its own volumes, so it can run beside
 anything else on the machine and can be run repeatedly.
 
+MySQL, Redis, MinIO and the MinIO client are image references declared by the
+repository's Compose/E2E configuration; Docker pulls them when they are absent.
+They are not embedded binary archives. The community application image is always
+built from the exact `--project-root` being tested.
+
 ## Quick start
 
-```sh
-mvn -B -DskipGitCommitId=true clean verify      # produces target/auto-wonder.jar
-export AW_E2E_PROJECT=aw-e2e-$(date +%s)        # a unique name = genuinely fresh volumes
-e2e-tests/up.sh
-e2e-tests/smoke.sh
-e2e-tests/authchain.sh
-e2e-tests/logscan.sh
-e2e-tests/down.sh
+```bash
+./e2e-tests/verify.sh --start --project-root "$(pwd -P)" --mode image --keep-on-failure
+# Perform task-specific browser/API exploration.
+./e2e-tests/verify.sh --check --project-root "$(pwd -P)"
+./e2e-tests/verify.sh --clean-up --project-root "$(pwd -P)"
 ```
 
-`AW_E2E_PROJECT` decides the volume names. `up.sh` asserts before starting that
-no volume or container for that project already exists, because the community
-compose file mounts the schema into `/docker-entrypoint-initdb.d` and MySQL only
-executes that directory when the data directory is **empty** — a reused volume
-silently skips the import and every later result would describe a stale database.
+The project root identifies the current run. It may be any pending-merge
+worktree; no branch switch or merge is required. The command prints every log
+path before starting long work, selects free host ports for all five services,
+and returns with the verified stack running for Agent exploration.
+
+Long work is framed by stable records such as `LIFECYCLE|START`,
+`STEP|BUILD|START`, `STEP|DOCKER_DAEMON|WAITING`, and exactly one final
+`LIFECYCLE|END|PASS` or `LIFECYCLE|END|FAIL`. `BOOTSTRAP_LOG` is printed and the
+file is created before host probing starts.
 
 ## Knobs
 
@@ -69,6 +81,7 @@ exporting it before running a script.
 | `AW_E2E_BUCKET` | `aw-e2e-autowonder` | object storage bucket |
 | `AW_E2E_JAR` | `target/auto-wonder.jar` | artefact under test |
 | `AW_E2E_SMOKE_STOP` | unset | set to `1` to stop the service when `smoke.sh` ends |
+| `AW_BOOTSTRAP_DOCKER_TIMEOUT` | `180` | seconds to wait for Docker Desktop |
 
 ## What is deliberately not modified
 
@@ -103,10 +116,16 @@ image is.
 non-interactive `PATH`. Every pull then fails with "error getting credentials".
 `aw_e2e_fix_credential_helper` reads that key and re-adds the helper directory.
 
-**Port collisions.** If `33060` or `63790` is already taken, the harness picks
-the next free port and records the choice in `resolved.env`. `smoke.sh` and
-`down.sh` replay that file rather than re-deriving ports, so all three scripts
-always agree.
+**Port collisions.** If MySQL `33060`, Redis `63790`, MinIO `9000`/`9001`, or
+Spring Boot `7001` is already taken, the harness picks a free host port and
+records the complete set in `runtime.json` and `resolved.env`. Later lifecycle
+commands replay that resolution rather than probing again.
+
+**Host bootstrap.** Reused and installed capability versions are recorded in
+`bootstrap-state.tsv`; installation and daemon diagnostics go to
+`logs/bootstrap.log`. Neither file contains application credentials. A failure
+reports a stable kind such as `INSTALL_DISABLED`, `INSTALL_FAILED`,
+`SUDO_UNAVAILABLE`, or `DOCKER_START_TIMEOUT` and preserves the log path.
 
 **Exported variables.** Compose reads the process *environment*, not the shell's
 variable table. Every knob `compose.e2e.yml` interpolates is therefore exported in
@@ -151,8 +170,8 @@ When the service fails to start, suspect the launch script before the product.
 Nothing secret is ever placed in a command argument, because argv is readable
 through `ps`. Concretely:
 
-- generated passwords and MinIO credentials live in `secrets.env`, mode 600, under
-  `$AW_E2E_STATE_DIR`, which `down.sh` deletes;
+- Agent connection credentials live in `runtime.env`, mode 0600; application
+  secrets remain in separate mode-0600 state files, all deleted by cleanup;
 - bearer tokens go into mode-600 curl config files used with `curl -K`, never
   into `-H` on the command line;
 - request bodies go to a mode-600 temp file used with `--data @file`;

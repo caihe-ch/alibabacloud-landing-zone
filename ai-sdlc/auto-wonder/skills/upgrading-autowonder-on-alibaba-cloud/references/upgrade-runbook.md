@@ -17,9 +17,12 @@ import the complete schema exactly once.
 Detect the control host first and run the deployment Skill's matching bootstrap
 adapter. The adapter checks all supported third-party dependencies and installs
 missing supported third-party dependencies without conversational confirmation,
-including Alibaba Cloud CLI. It must validate the recorded profile with `sts
-GetCallerIdentity`; a missing or expired identity triggers `aliyun configure
---profile <PROFILE> --mode OAuth` automatically, followed by another STS probe.
+including Alibaba Cloud CLI. It must use only the dedicated `auto-wonder`
+profile and validate it with `sts GetCallerIdentity`; a missing or expired
+identity triggers `aliyun configure --profile auto-wonder --mode OAuth`
+automatically, followed by another STS probe. Historical or missing manifest
+profiles are normalized to `auto-wonder`; never fall back to the CLI current or
+`default` profile.
 
 After OAuth, target verification is also the account deployment-presence probe.
 If STS succeeds but there is no manifest-owned AutoWonder deployment visible in
@@ -28,7 +31,7 @@ user to log into the Alibaba Cloud account that deployed AutoWonder in the
 browser. Stop until the user gives an equivalent natural-language confirmation
 that the browser login is complete, such as “已登录”, “登录好了”, or “已重新登录”.
 Do not require an exact confirmation phrase. That confirmation authorizes an
-automatic rerun of OAuth on the recorded profile to overwrite the previous CLI
+automatic rerun of OAuth on `auto-wonder` to overwrite the previous CLI
 login; repeat STS and target verification before continuing.
 
 Discovery and target verification are read-only with respect to cloud
@@ -104,7 +107,8 @@ summary. Persist only the allowlisted deployment identity and resource outputs.
 
 On every upgrade run, `refresh-upgrade-info` reuses `discovery.json` but executes
 Terraform output again. Before Terraform initialization, the wrapper validates
-STS and loads temporary credentials from the manifest-recorded CLI profile; it
+STS through the deployment bootstrap and loads temporary credentials from the
+`auto-wonder` CLI profile; it
 does not rely on ambient Alibaba Cloud credentials. It compares the prior set, current Terraform set, and
 the complete tagged cloud ECS set. Exact Terraform/cloud equality is required.
 A changed resource set fingerprint records added and removed nodes, makes newly
@@ -141,6 +145,46 @@ automatically.
 
 ## Deterministic Command Route
 
+### Release Baseline Recovery
+
+An active release ID is not necessarily a Git commit. New workspace deployments
+use a JAR content identity and seal `source.baseline`; historical deployments
+may have only the JAR and migration-archive hashes. Keep the real active identity
+in `deployment.activeCommit` and `upgrade.fromCommit` throughout the upgrade.
+
+1. Refresh targets and run active inventory. Every node must report the same
+   release directory, `jarSha256`, and `migrationsSha256`; missing artifacts or
+   content differences stop planning.
+2. When the active ID is a real Git object, compare that commit with the exact
+   target. Otherwise the planner reads the original sealed `auto-wonder.jar`
+   and `autowonder-migrations.tar.gz` from the recorded artifact directory.
+   It verifies their full SHA-256 values against the manifest and every live
+   node. For a historical release without a baseline, the JAR hash prefix must
+   also establish the recorded active release ID.
+3. Recover environment placeholders from the sealed JAR and published migration
+   checksums from the sealed archive. New deployments additionally retain the
+   complete source environment contract in `source.baseline`. Never use the
+   target source as the old database baseline.
+4. If the original release directory has moved, pass `--baseline-dir <folder>`
+   or `-BaselineDirectory <folder>` to the planner. This changes only where
+   evidence is read; it cannot override its checksums or release identity.
+   Missing evidence requires recovery of the original sealed artifacts before
+   continuing. Do not edit `activeCommit` to a guessed Git SHA.
+
+The planner preserves `deployment.activeReleaseBaseline` before a target build
+can replace `source` or `artifacts`. A failed build or transfer must not cause a
+subsequent plan to compare the target release against itself. Once database
+mutation has started, an unfinished upgrade must resume its existing reviewed
+plan; replanning must not erase the migration checkpoint or permit rollback.
+
+If a historical manifest has an empty `repositoryUrl`, only the repository
+allowlist in `scripts/upgrade_plan.py` is accepted: the AutoWonder internal
+repository or the official `aliyun/alibabacloud-landing-zone` repository. SSH
+and HTTPS spellings normalize to the same identity. All Git command failures
+stop planning; an unsuccessful diff is never an empty migration result.
+
+### Platform Commands
+
 For an explicitly requested same-version Skill validation where the operator
 forbids all Git inspection, replace the Git fetch/worktree planning route with:
 
@@ -153,6 +197,8 @@ The planner hashes the sorted current-workspace file set into a distinct release
 identity and the build wrapper verifies the same identity before building. It
 must not inspect `.git` or invoke Git, and it still uses all normal cloud target,
 approval, backup, staging, migration, rolling, and acceptance gates.
+The recorded active release version and verified sealed artifacts are required;
+any migration-file difference is rejected in this validation-only mode.
 
 Use protected local paths for the manifest and environment file. Never place
 their contents or secret values in command arguments or evidence.
@@ -162,6 +208,39 @@ including `-Manifest`, `-SourceDirectory`, `-EnvFile`, `-ReleaseDirectory`,
 `-Fingerprint`, `-Automatic`, and `-ForceRedeploy`. Use
 `upgrade-operations.ps1 <operation>` for phase operations. The phase order and
 confirmation gates below are identical on both platforms.
+
+Windows staging uploads the sealed JAR, migration archive, target systemd unit,
+and candidate environment through private OSS transfer. It validates downloaded
+hashes before installing files and records evidence for every node. The remote
+Python payload runs only on Linux ECS; Windows does not execute a local `.sh`.
+It accepts both existing migration archive layouts (`./V*.sql` from the POSIX
+builder and `migration/V*.sql` from the Windows builder), retaining the same
+archive hash and rejecting unsafe paths or links.
+When resuming a POSIX-staged release that lacks an in-directory systemd unit,
+Windows staging may add the verified target unit only after all existing release
+objects match their sealed hashes; a different existing file still blocks it.
+Backup includes the resolved release contents, environment and systemd unit,
+with a verified archive and mode `0600`. A retry for the same plan reuses the
+original verified backup instead of replacing it with a partly upgraded state.
+
+Validate repository changes locally with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
+  -s skills/upgrading-autowonder-on-alibaba-cloud/tests -v
+```
+
+The Linux payload tests exercise real file transfer, archive verification,
+backup/restore and migration control flow with service/database boundaries
+stubbed. They do not contact Alibaba Cloud. On a Windows host, also run the
+native PowerShell/ACL tests explicitly:
+
+```powershell
+python -B -m unittest discover -s skills/upgrading-autowonder-on-alibaba-cloud/tests -p test_windows_upgrade_gates.py -v
+```
+
+Missing PowerShell or Windows ACL support is reported as skipped coverage;
+passing static checks must not be reported as a Windows end-to-end upgrade.
 
 ```bash
 scripts/resolve-deployment.sh --search-root "$PROJECT_ROOT"
@@ -315,6 +394,16 @@ secrets, reject placeholder values, and run the same preflight validation used
 for a new deployment. The candidate must contain every newly required variable.
 Record its SHA-256 after final validation and require the staged file to match it.
 
+For every upgrade, read `autowonder.runtime.recommended-version` from the exact
+target commit's `src/main/resources/application.yml` (including the default in
+the `AUTOWONDER_RUNTIME_RECOMMENDED_VERSION` placeholder). Atomically upsert that
+value into the protected candidate as
+`AUTOWONDER_RUNTIME_RECOMMENDED_VERSION`, then bind the target-derived version
+and updated candidate hash to the plan. `runtime-config` must record a matching
+checkpoint. Stage must install that candidate on every ECS before rolling
+activation; both stage and a resumed rolling activation reject a missing,
+mismatched, or stale checkpoint.
+
 Distribute and atomically install the candidate on all nodes before activating
 the target application. Do not remove an old variable merely because the target
 no longer reads it; removal is a separate confirmed cleanup after acceptance.
@@ -368,9 +457,14 @@ Before any ECS environment, systemd unit, database, or active-release mutation,
 run `upgrade-backup`. It creates exactly one backup archive per ECS at
 `/opt/autowonder/upgrade-rollback-backup.tar.gz`, containing the complete active
 release, protected environment, systemd unit, release identity, and checksums.
-The archive is built and validated in a temporary path; a successful rename
-atomically overwrites the previous backup. A failed replacement leaves the old
-archive intact. Do not retain per-target upgrade snapshots elsewhere.
+The archive is built and validated in a temporary path. Retries of the same plan
+reuse the original verified archive, including when candidate configuration has
+already been installed. A new plan may atomically replace the slot only while
+the active release still matches its planned source. A failed replacement
+leaves the old archive intact. Staging and rollback require all target nodes and
+the current plan to match the backup evidence; rollback checks the recorded
+archive SHA-256 before extraction. Do not retain per-target upgrade snapshots
+elsewhere.
 
 Upload the sealed release through private OSS staging and install it under
 `/opt/autowonder/releases/<target-commit>/` without changing the active symlink.

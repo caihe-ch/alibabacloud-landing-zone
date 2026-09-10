@@ -47,6 +47,7 @@ PASS=0
 FAIL=0
 
 E2E_USER="aw-e2e-$(date +%s)"
+RUN_SUFFIX="${E2E_USER##*-}"
 # Newline-free so it can be interpolated into a JSON body without escaping.
 E2E_PASS="$(openssl rand -base64 18 | tr -d '\n')"
 printf 'AW_E2E_USER=%s\nAW_E2E_PASS=%s\n' "$E2E_USER" "$E2E_PASS" >"$OUT/user.env"
@@ -277,8 +278,10 @@ else
 fi
 
 # --- 4. create workspace -----------------------------------------------------
+WS_NAME="AW E2E Smoke Workspace $RUN_SUFFIX"
+WS_EDITED_NAME="$WS_NAME (edited)"
 api ws_create POST /api/workspaces "$CFG0" \
-  '{"name":"AW E2E Smoke Workspace","description":"created by e2e-tests/authchain.sh","background":"fresh-install smoke"}'
+  "{\"name\":\"$WS_NAME\",\"description\":\"created by e2e-tests/authchain.sh\",\"background\":\"fresh-install smoke\"}"
 check ws_create 200 true "creator becomes owner and administrator"
 WS_ID="$(json_get "$OUT/ws_create.json" data.id)"
 [[ -n "$WS_ID" ]] || { echo "FATAL: workspace creation returned no id"; exit 1; }
@@ -320,7 +323,7 @@ check st_summary 200 any "scheduled-task module enabled by the community default
 WS_VERSION="$(json_get "$OUT/ws_current.json" data.version)"
 [[ -n "$WS_VERSION" ]] || { echo "FATAL: no workspace version to send"; exit 1; }
 api ws_update PUT "/api/workspaces/$WS_ID" "$CFG1" \
-  "{\"name\":\"AW E2E Smoke Workspace (edited)\",\"description\":\"edited by authchain.sh\",\"version\":$WS_VERSION}"
+  "{\"name\":\"$WS_EDITED_NAME\",\"description\":\"edited by authchain.sh\",\"version\":$WS_VERSION}"
 check ws_update 200 true "NEW: workspace edit, optimistic-lock version=$WS_VERSION"
 api ws_current_after_edit GET /api/workspaces/current "$CFG1"
 echo "WS_NAME_AFTER_EDIT=$(json_get "$OUT/ws_current_after_edit.json" data.name)"
@@ -335,7 +338,7 @@ echo "WS_NAME_AFTER_EDIT=$(json_get "$OUT/ws_current_after_edit.json" data.name)
 #   (c) an active row blocks new creation with that name (11003).
 # Order matters: restoring *after* re-creating the same name is behaviour (b)'s
 # negative half, not a happy path, and asserting 200 there reports a false failure.
-DUP_NAME="AW E2E Dup Name Check"
+DUP_NAME="AW E2E Dup Name Check $RUN_SUFFIX"
 api ws_dup1 POST /api/workspaces "$CFG1" "{\"name\":\"$DUP_NAME\",\"description\":\"v051 probe A\"}"
 check ws_dup1 200 true "workspace A with the duplicate-probe name"
 WS_DUP="$(json_get "$OUT/ws_dup1.json" data.id)"
@@ -453,3 +456,4 @@ echo "VERDICT=$([[ "$FAIL" == 0 ]] && echo ALL_CHECKS_PASSED || echo SOME_CHECKS
 } 2>&1 | tee "$REPORT"
 
 log "authchain.sh done: report=$REPORT"
+aw_report_require_zero "$REPORT" FAIL_COUNT

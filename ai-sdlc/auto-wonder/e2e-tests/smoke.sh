@@ -41,15 +41,20 @@ fi
 
 run_dir="$AW_E2E_STATE_DIR/run"
 mkdir -p "$run_dir"
-app_log="$AW_E2E_STATE_DIR/app.log"
-run_env="$AW_E2E_STATE_DIR/app.env"
+AW_E2E_LOG_DIR="${AW_E2E_LOG_DIR:-$run_dir/logs}"
+mkdir -p "$AW_E2E_LOG_DIR"
+app_log="$AW_E2E_LOG_DIR/spring-boot-console.log"
+file_log="$AW_E2E_LOG_DIR/auto-wonder.log"
+run_env="${AW_E2E_RUNTIME_ENV:-$AW_E2E_STATE_DIR/app.env}"
 
 jar="${AW_E2E_JAR:-$REPO_ROOT/target/auto-wonder.jar}"
 [[ -f "$jar" ]] || die "artefact not found: $jar (build it first, or set AW_E2E_JAR)"
 
-base_url="http://127.0.0.1:${AW_E2E_APP_PORT}"
+RESOLVED_APP_PORT="${RESOLVED_APP_PORT:-$AW_E2E_APP_PORT}"
+RESOLVED_MINIO_PORT="${RESOLVED_MINIO_PORT:-$AW_E2E_MINIO_PORT}"
+base_url="http://127.0.0.1:${RESOLVED_APP_PORT}"
 log "artefact=$jar ($(wc -c <"$jar" | tr -d ' ') bytes)"
-log "base_url=$base_url mysql=127.0.0.1:$RESOLVED_MYSQL_PORT redis=127.0.0.1:$RESOLVED_REDIS_PORT minio=127.0.0.1:$AW_E2E_MINIO_PORT"
+log "base_url=$base_url mysql=127.0.0.1:$RESOLVED_MYSQL_PORT redis=127.0.0.1:$RESOLVED_REDIS_PORT minio=127.0.0.1:$RESOLVED_MINIO_PORT"
 
 # --- 1. the quoting trap, demonstrated --------------------------------------
 # Run in a subshell so the deliberately broken export cannot affect this script.
@@ -57,6 +62,7 @@ jdbc_full='jdbc:mysql://127.0.0.1:3306/autowonder?useUnicode=true&characterEncod
 trap_demo="$AW_E2E_STATE_DIR/env-quoting-trap.txt"
 trap_unquoted="$AW_E2E_STATE_DIR/.trap-unquoted.env"
 trap_quoted="$AW_E2E_STATE_DIR/.trap-quoted.env"
+probe_report="$AW_E2E_STATE_DIR/probes.txt"
 {
   echo "# why the env file is exported line-by-line instead of sourced"
   echo "FULL_LENGTH=${#jdbc_full}"
@@ -113,12 +119,12 @@ aw_e2e_generate_secrets
 umask 077
 {
   printf 'SPRING_PROFILES_ACTIVE=local\n'
-  printf 'SERVER_PORT=%s\n' "$AW_E2E_APP_PORT"
-  printf 'SPRING_DATASOURCE_URL=jdbc:mysql://127.0.0.1:%s/autowonder?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai\n' "$RESOLVED_MYSQL_PORT"
+  printf 'SERVER_PORT=7001\n'
+  printf 'SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/autowonder?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai\n'
   printf 'SPRING_DATASOURCE_USERNAME=autowonder\n'
   printf 'SPRING_DATASOURCE_PASSWORD=change-me\n'
-  printf 'REDIS_HOST=127.0.0.1\n'
-  printf 'REDIS_PORT=%s\n' "$RESOLVED_REDIS_PORT"
+  printf 'REDIS_HOST=redis\n'
+  printf 'REDIS_PORT=6379\n'
   printf 'AUTOWONDER_SECRET_MASTER_KEY=%s\n' "$(aw_e2e_secret AUTOWONDER_SECRET_MASTER_KEY)"
   printf 'AUTOWONDER_JWT_SECRET=%s\n' "$(aw_e2e_secret AUTOWONDER_JWT_SECRET)"
   printf 'AUTOWONDER_PUBLIC_BASE_URL=%s\n' "$base_url"
@@ -127,8 +133,8 @@ umask 077
   # exclusive; bucket names are shared and live under OSS_BUCKET.
   printf 'OSS_ENABLED=false\n'
   printf 'S3_ENABLED=true\n'
-  printf 'S3_ENDPOINT=http://127.0.0.1:%s\n' "$AW_E2E_MINIO_PORT"
-  printf 'S3_PUBLIC_ENDPOINT=http://127.0.0.1:%s\n' "$AW_E2E_MINIO_PORT"
+  printf 'S3_ENDPOINT=http://minio:9000\n'
+  printf 'S3_PUBLIC_ENDPOINT=http://127.0.0.1:%s\n' "$RESOLVED_MINIO_PORT"
   printf 'S3_REGION=us-east-1\n'
   printf 'S3_ACCESS_KEY_ID=%s\n' "$AW_E2E_MINIO_ROOT_USER"
   printf 'S3_ACCESS_KEY_SECRET=%s\n' "$(aw_e2e_secret AW_E2E_MINIO_ROOT_PASSWORD)"
@@ -146,27 +152,28 @@ while IFS= read -r env_line; do
   [[ -n "$env_line" ]] && export "$env_line"
 done <"$run_env"
 set +a
-log "exported JDBC URL length=${#SPRING_DATASOURCE_URL} (expected ${#jdbc_full} shape, port differs)"
+log "exported container JDBC URL length=${#SPRING_DATASOURCE_URL}"
 
 # --- 3. start ----------------------------------------------------------------
-if [[ -f "$AW_E2E_STATE_DIR/app.pid" ]] && kill -0 "$(cat "$AW_E2E_STATE_DIR/app.pid")" 2>/dev/null; then
-  die "a server is already running (pid $(cat "$AW_E2E_STATE_DIR/app.pid")); run down.sh first"
+AW_E2E_APP_IMAGE="${AW_E2E_APP_IMAGE:?set AW_E2E_APP_IMAGE to the image built by verify.sh}"
+AW_E2E_RUNTIME_ENV="$run_env"
+export AW_E2E_APP_IMAGE AW_E2E_RUNTIME_ENV AW_E2E_LOG_DIR RESOLVED_APP_PORT
+log "starting compose-owned server image=$AW_E2E_APP_IMAGE log=$app_log"
+if ! aw_e2e_compose up -d app >>"$AW_E2E_STATE_DIR/compose-up.log" 2>&1; then
+  tail -60 "$AW_E2E_STATE_DIR/compose-up.log"
+  die "compose application start failed"
 fi
-[[ "$(aw_e2e_port_listeners "$AW_E2E_APP_PORT")" == "0" ]] \
-  || die "port $AW_E2E_APP_PORT is already in use"
-
-log "starting server"
-( cd "$run_dir" && exec java -jar "$jar" ) >"$app_log" 2>&1 &
-app_pid=$!
-echo "$app_pid" >"$AW_E2E_STATE_DIR/app.pid"
-log "pid=$app_pid cwd=$run_dir log=$app_log"
+app_container_id="$(aw_e2e_compose ps -q app)"
+[[ -n "$app_container_id" ]] || die "compose returned no application container id"
+log "container=$app_container_id log=$app_log"
 
 # --- 4. wait for health ------------------------------------------------------
 health_url="$base_url/checkpreload.htm"
 ready=0
-for i in $(seq 1 180); do
-  if ! kill -0 "$app_pid" 2>/dev/null; then
-    log "server process exited during startup"
+startup_timeout="${AW_E2E_STARTUP_TIMEOUT:-180}"
+for i in $(seq 1 "$startup_timeout"); do
+  if [[ "$("$DOCKER" inspect -f '{{.State.Running}}' "$app_container_id" 2>/dev/null || true)" != "true" ]]; then
+    log "application container exited during startup"
     break
   fi
   code="$(curl -s -o "$AW_E2E_STATE_DIR/health.body" -w '%{http_code}' "$health_url" || true)"
@@ -175,13 +182,32 @@ for i in $(seq 1 180); do
     log "healthy after ${i}s: GET $health_url -> 200 $(cat "$AW_E2E_STATE_DIR/health.body")"
     break
   fi
+  if (( i % 10 == 0 )); then
+    printf 'PROGRESS|APPLICATION_START|elapsed=%ss|container=running|health=%s\n' "$i" "$code"
+  fi
   sleep 1
 done
 
 if [[ "$ready" != "1" ]]; then
+  diagnostic_log="${AW_STARTUP_DIAGNOSTIC_LOG:-$AW_E2E_LOG_DIR/startup-diagnostic.log}"
+  startup_failure_kind=STARTUP_TIMEOUT
+  if [[ "$("$DOCKER" inspect -f '{{.State.Running}}' "$app_container_id" 2>/dev/null || true)" != "true" ]]; then
+    startup_failure_kind=APPLICATION_EXITED
+  fi
+  printf 'STARTUP_FAILURE_KIND=%s\n' "$startup_failure_kind" >"$AW_E2E_STATE_DIR/startup-status.env"
+  {
+    echo "APPLICATION_CONTAINER=$app_container_id"
+    "$DOCKER" inspect "$app_container_id" 2>&1 || true
+    "$DOCKER" stats --no-stream "$app_container_id" 2>&1 || true
+    aw_e2e_compose ps 2>&1 || true
+  } >"$diagnostic_log"
+  if [[ "$("$DOCKER" inspect -f '{{.State.Running}}' "$app_container_id" 2>/dev/null || true)" == "true" ]]; then
+    "$DOCKER" kill --signal=QUIT "$app_container_id" >/dev/null 2>&1 || true
+    sleep 1
+  fi
   log "server did not become healthy; last 60 log lines follow"
   tail -60 "$app_log"
-  die "health check failed for $health_url (see $app_log)"
+  die "health check failed for $health_url (logs=$app_log diagnostics=$diagnostic_log)"
 fi
 
 # --- 5. public capability probes --------------------------------------------
@@ -205,7 +231,17 @@ probe() {
   probe capabilities /api/integrations/capabilities
   probe branding /api/platform/branding/public
   probe scheduled_task_capability /api/capabilities/scheduled-task
-} | tee "$AW_E2E_STATE_DIR/probes.txt"
+} | tee "$probe_report"
+
+aw_require_equal probe.capabilities_http 200 "$(aw_report_value "$probe_report" PROBE_capabilities_HTTP)"
+aw_json_require "$AW_E2E_STATE_DIR/probe-capabilities.json" success true
+aw_json_require "$AW_E2E_STATE_DIR/probe-capabilities.json" data.aoneEnabled false
+aw_require_equal probe.branding_http 200 "$(aw_report_value "$probe_report" PROBE_branding_HTTP)"
+aw_json_require "$AW_E2E_STATE_DIR/probe-branding.json" success true
+aw_json_require "$AW_E2E_STATE_DIR/probe-branding.json" data.communityEdition true
+aw_json_require "$AW_E2E_STATE_DIR/probe-branding.json" data.deploymentVersion "$version_from_file"
+aw_require_equal probe.scheduled_task_unauthenticated_http 401 \
+  "$(aw_report_value "$probe_report" PROBE_scheduled_task_capability_HTTP)"
 
 # --- 6. log scan -------------------------------------------------------------
 scan_logs() {
@@ -220,7 +256,7 @@ scan_logs() {
 {
   echo "# log scan at healthy state"
   scan_logs stdout "$app_log"
-  scan_logs file "$run_dir/logs/auto-wonder.log"
+  scan_logs file "$file_log"
   echo "# --- every ERROR line ---"
   grep -n ' ERROR ' "$app_log" 2>/dev/null | head -40 || echo "(none)"
   echo "# --- every WARN line ---"
@@ -230,10 +266,9 @@ scan_logs() {
 } | tee "$AW_E2E_STATE_DIR/log-scan.txt"
 
 if [[ "${AW_E2E_SMOKE_STOP:-0}" == "1" ]]; then
-  log "AW_E2E_SMOKE_STOP=1: stopping pid=$app_pid"
-  kill "$app_pid" 2>/dev/null || true
-  rm -f "$AW_E2E_STATE_DIR/app.pid"
+  log "AW_E2E_SMOKE_STOP=1: stopping compose application"
+  aw_e2e_compose stop app >/dev/null
 else
-  log "server left running (pid=$app_pid) for e2e-tests/authchain.sh"
+  log "server left running (container=$app_container_id) for Agent checks"
 fi
 log "smoke.sh done"

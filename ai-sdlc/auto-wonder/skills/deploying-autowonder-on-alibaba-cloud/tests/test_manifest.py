@@ -48,6 +48,7 @@ class ManifestContractTest(unittest.TestCase):
         self.assertEqual("new", manifest["mode"])
         self.assertEqual("questionnaire", manifest["phase"])
         self.assertEqual("planned", manifest["status"])
+        self.assertEqual("auto-wonder", manifest["cloudProfile"])
         self.assertEqual(
             {
                 "cn-zhangjiakou",
@@ -106,8 +107,8 @@ class ManifestContractTest(unittest.TestCase):
         self.assertTrue(REQUIRED_TAGS.issubset(self.manifest["tags"]))
         self.assertEqual("auto-wonder-prod", self.manifest["tags"]["Environment"])
 
-    def test_recommended_runtime_matches_current_server_contract(self):
-        self.assertEqual("0.2.152", self.manifest["recommendedRuntimeVersion"])
+    def test_template_does_not_pin_recommended_runtime_version(self):
+        self.assertNotIn("recommendedRuntimeVersion", self.manifest)
 
 
 if __name__ == "__main__":

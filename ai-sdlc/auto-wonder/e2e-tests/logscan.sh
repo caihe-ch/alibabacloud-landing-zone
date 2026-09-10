@@ -78,13 +78,17 @@ sort -u -o "$rid_map" "$rid_map"
 
 # --- 2. scan and attribute ----------------------------------------------------
 AW_E2E_APP_LOG="$APP_LOG" AW_E2E_FILE_LOG="$FILE_LOG" \
-AW_E2E_RID_MAP="$rid_map" AW_E2E_REPORT="$REPORT" python3 <<'PY'
+AW_E2E_RID_MAP="$rid_map" AW_E2E_REPORT="$REPORT" \
+AW_E2E_APP_LOG_START_LINE="${AW_E2E_APP_LOG_START_LINE:-0}" \
+AW_E2E_FILE_LOG_START_LINE="${AW_E2E_FILE_LOG_START_LINE:-0}" python3 <<'PY'
 import os, re, sys
 
 app_log = os.environ["AW_E2E_APP_LOG"]
 file_log = os.environ["AW_E2E_FILE_LOG"]
 rid_map_path = os.environ["AW_E2E_RID_MAP"]
 report = os.environ["AW_E2E_REPORT"]
+app_start = int(os.environ["AW_E2E_APP_LOG_START_LINE"])
+file_start = int(os.environ["AW_E2E_FILE_LOG_START_LINE"])
 
 calls = {}
 with open(rid_map_path) as fh:
@@ -110,8 +114,12 @@ def read_lines(path):
     with open(path, errors="replace") as fh:
         return fh.read().splitlines()
 
-app_lines = read_lines(app_log)
-file_lines = read_lines(file_log)
+app_all_lines = read_lines(app_log)
+file_all_lines = read_lines(file_log)
+app_start = app_start if 0 <= app_start <= len(app_all_lines) else 0
+file_start = file_start if 0 <= file_start <= len(file_all_lines) else 0
+app_lines = app_all_lines[app_start:]
+file_lines = file_all_lines[file_start:]
 
 # Anything at these levels anywhere in the line, including the file appender's
 # layout, so a diagnostic cannot slip past by being formatted differently.
@@ -135,8 +143,8 @@ attr_counts = {"ERROR": 0, "WARN": 0}
 stack = 0
 startup_banner = []
 
-for src, lines in (("stdout", app_lines), ("file", file_lines)):
-    for ln, line in enumerate(lines, 1):
+for src, lines, start in (("stdout", app_lines, app_start), ("file", file_lines, file_start)):
+    for ln, line in enumerate(lines, start + 1):
         if STACK.search(line):
             stack += 1
         if "Started Bootstrap" in line or "Tomcat started on port" in line:
@@ -160,8 +168,10 @@ with open(report, "w") as fh:
     w("# post-chain log scan with request-id attribution\n")
     w(f"APP_LOG={app_log}\n")
     w(f"APP_LOG_LINES={len(app_lines)}\n")
+    w(f"APP_LOG_START_LINE={app_start}\n")
     w(f"FILE_LOG={file_log}\n")
     w(f"FILE_LOG_LINES={len(file_lines)}\n")
+    w(f"FILE_LOG_START_LINE={file_start}\n")
     w(f"HARNESS_REQUEST_IDS={len(calls)}\n")
     w(f"ERROR_TOTAL={counts['ERROR']}\n")
     w(f"WARN_TOTAL={counts['WARN']}\n")
@@ -183,7 +193,7 @@ with open(report, "w") as fh:
     w(f"VERDICT={'CLEAN_ALL_DIAGNOSTICS_ATTRIBUTED' if ok else 'UNEXPLAINED_DIAGNOSTICS_PRESENT'}\n")
 
 print(open(report).read())
-sys.exit(0)
+sys.exit(0 if ok else 1)
 PY
 
 log "logscan.sh done: report=$REPORT"

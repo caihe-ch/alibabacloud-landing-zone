@@ -131,18 +131,31 @@ REMOTE_DB_PRELUDE
 
 case "$subcommand" in
   upgrade-inventory)
-    node_json='[]'; active_prefix=
+    atomic_jq "$manifest" '.upgradeInventory={status:"checking",nodes:[]}'
+    node_json='[]'; active_prefix= active_jar_sha= active_migrations_sha=
     for instance in "${instances[@]}"; do
       result=$(run_cloud "$instance" 'set -euo pipefail
 active=$(readlink -f /opt/autowonder/current)
 test -d "$active"
 release=${active##*/}
-printf "ACTIVE_RELEASE=%s\n" "$release"')
+test -f "$active/auto-wonder.jar"
+test -f "$active/autowonder-migrations.tar.gz"
+jar_sha=$(sha256sum "$active/auto-wonder.jar" | cut -d " " -f 1)
+migrations_sha=$(sha256sum "$active/autowonder-migrations.tar.gz" | cut -d " " -f 1)
+printf "ACTIVE_RELEASE=%s\nJAR_SHA256=%s\nMIGRATIONS_SHA256=%s\n" "$release" "$jar_sha" "$migrations_sha"')
       node_prefix=$(jq -r '.output' <<<"$result" | sed -n 's/^ACTIVE_RELEASE=//p' | tail -1)
+      node_jar_sha=$(jq -r '.output' <<<"$result" | sed -n 's/^JAR_SHA256=//p' | tail -1)
+      node_migrations_sha=$(jq -r '.output' <<<"$result" | sed -n 's/^MIGRATIONS_SHA256=//p' | tail -1)
       [[ "$node_prefix" =~ ^[0-9a-f]{12}$ ]] || die "active release directory is not an expected commit prefix"
+      [[ "$node_jar_sha" =~ ^[0-9a-f]{64}$ && "$node_migrations_sha" =~ ^[0-9a-f]{64}$ ]] || die "active release artifact hashes are unavailable"
       [[ -z "$active_prefix" || "$node_prefix" == "$active_prefix" ]] || die "ECS nodes run different active releases"
+      [[ -z "$active_jar_sha" || "$node_jar_sha" == "$active_jar_sha" ]] || die "ECS nodes have different active JAR content"
+      [[ -z "$active_migrations_sha" || "$node_migrations_sha" == "$active_migrations_sha" ]] || die "ECS nodes have different active migration archives"
       active_prefix=$node_prefix
-      node_json=$(jq --arg instance "$instance" --arg prefix "$node_prefix" '. + [{instanceId:$instance,activeCommitPrefix:$prefix}]' <<<"$node_json")
+      active_jar_sha=$node_jar_sha
+      active_migrations_sha=$node_migrations_sha
+      node_json=$(jq --arg instance "$instance" --arg prefix "$node_prefix" --arg jar "$node_jar_sha" --arg migrations "$node_migrations_sha" \
+        '. + [{instanceId:$instance,activeCommitPrefix:$prefix,jarSha256:$jar,migrationsSha256:$migrations}]' <<<"$node_json")
     done
     expected_active=$(resolve_active_commit_from_prefix "$manifest" "$active_prefix")
     atomic_jq "$manifest" --arg commit "$expected_active" --argjson nodes "$node_json" \
@@ -151,26 +164,50 @@ printf "ACTIVE_RELEASE=%s\n" "$release"')
   upgrade-backup)
     [[ $(jq -r '.mode // empty' "$manifest") == upgrade ]] || die "upgrade backup requires upgrade mode"
     [[ $(jq -r '.upgradeInventory.status // empty' "$manifest") == verified ]] || die "verified upgrade inventory is required before backup"
+    backup_plan=$(jq -er '.upgrade.planFingerprint | select(test("^[0-9a-f]{64}$"))' "$manifest")
+    backup_from=$(jq -er '.upgrade.fromCommit | select(test("^[0-9a-f]{40}$"))' "$manifest")
     backup_nodes='[]'
     for instance in "${instances[@]}"; do
-      result=$(run_cloud "$instance" 'set -euo pipefail
-backup_archive=/opt/autowonder/upgrade-rollback-backup.tar.gz
+      expected_backup_sha=$(jq -r --arg plan "$backup_plan" --arg instance "$instance" '
+        .upgrade.rollbackBackup | select(.planFingerprint == $plan) |
+        .nodes[]? | select(.instanceId == $instance and .status == "passed") | .sha256' "$manifest")
+      [[ -z "$expected_backup_sha" || "$expected_backup_sha" =~ ^[0-9a-f]{64}$ ]] || die "invalid recorded backup checksum"
+      result=$(run_cloud "$instance" "set -euo pipefail
+plan='$backup_plan'
+expected_release='${backup_from:0:12}'
+expected_sha='$expected_backup_sha'
+"'backup_archive=/opt/autowonder/upgrade-rollback-backup.tar.gz
 backup_tmp="$backup_archive.tmp.$$"
 backup_dir=$(mktemp -d /opt/autowonder/.upgrade-backup.XXXXXX)
 verify_dir=$(mktemp -d /opt/autowonder/.upgrade-backup-verify.XXXXXX)
 cleanup() { rm -rf "$backup_dir" "$verify_dir" "$backup_tmp"; }
 trap cleanup EXIT
+if test -n "$expected_sha"; then
+  test -f "$backup_archive"
+  test "$(sha256sum "$backup_archive" | awk "{print \$1}")" = "$expected_sha"
+fi
+if test -f "$backup_archive" && test "$(tar -xOf "$backup_archive" ./plan-fingerprint 2>/dev/null || true)" = "$plan"; then
+  tar -xzf "$backup_archive" -C "$verify_dir"
+  (cd "$verify_dir" && sha256sum -c CHECKSUMS >/dev/null)
+  test "$(cat "$verify_dir/release-name")" = "$expected_release"
+  backup_sha=$(sha256sum "$backup_archive" | awk "{print \$1}")
+  printf "BACKUP_STATUS=passed\nBACKUP_SHA256=%s\nACTIVE_RELEASE=%s\n" "$backup_sha" "$expected_release"
+  exit 0
+fi
+# An existing checkpoint may be reused, never silently replaced.
+test -z "$expected_sha"
 active=$(readlink -f /opt/autowonder/current)
 test -d "$active"
 test -f /etc/autowonder/autowonder.env
 test -f /etc/systemd/system/autowonder.service
 release_name=${active##*/}
-test -n "$release_name"
+test "$release_name" = "$expected_release"
 install -d -m 0700 "$backup_dir/release"
 cp -a "$active/." "$backup_dir/release/"
 install -m 0640 -o root -g root /etc/autowonder/autowonder.env "$backup_dir/autowonder.env"
 install -m 0644 -o root -g root /etc/systemd/system/autowonder.service "$backup_dir/autowonder.service"
 printf "%s\n" "$release_name" >"$backup_dir/release-name"
+printf "%s\n" "$plan" >"$backup_dir/plan-fingerprint"
 (cd "$backup_dir" && find . -type f ! -name CHECKSUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >CHECKSUMS)
 tar -C "$backup_dir" -czf "$backup_tmp" .
 tar -tzf "$backup_tmp" >/dev/null
@@ -186,23 +223,25 @@ printf "BACKUP_STATUS=passed\nBACKUP_SHA256=%s\nACTIVE_RELEASE=%s\n" "$backup_sh
       backup_status=$(sed -n 's/^BACKUP_STATUS=//p' <<<"$output" | tail -1)
       backup_sha=$(sed -n 's/^BACKUP_SHA256=//p' <<<"$output" | tail -1)
       active_release=$(sed -n 's/^ACTIVE_RELEASE=//p' <<<"$output" | tail -1)
-      [[ "$backup_status" == passed && "$backup_sha" =~ ^[0-9a-f]{64}$ ]] || die "upgrade backup result is invalid"
+      [[ "$backup_status" == passed && "$backup_sha" =~ ^[0-9a-f]{64}$ && "$active_release" == "${backup_from:0:12}" ]] || die "upgrade backup result is invalid"
       backup_nodes=$(jq --arg instance "$instance" --arg invocation "$invocation" --arg sha "$backup_sha" --arg release "$active_release" \
         '. + [{instanceId:$instance,invocationId:$invocation,sha256:$sha,activeRelease:$release,status:"passed"}]' <<<"$backup_nodes")
     done
     atomic_jq "$manifest" --argjson nodes "$backup_nodes" \
-      '.upgrade.rollbackBackup={status:"passed",path:"/opt/autowonder/upgrade-rollback-backup.tar.gz",retentionPerEcs:1,nodes:$nodes,fromCommit:.upgrade.fromCommit,targetCommit:.upgrade.toCommit,createdAt:(now|todateiso8601)} | .phase="upgrade-backup" | .status="ready"'
+      '.upgrade.rollbackBackup={status:"passed",path:"/opt/autowonder/upgrade-rollback-backup.tar.gz",retentionPerEcs:1,nodes:$nodes,planFingerprint:.upgrade.planFingerprint,fromCommit:.upgrade.fromCommit,targetCommit:.upgrade.toCommit,createdAt:(now|todateiso8601)} | .phase="upgrade-backup" | .status="ready"'
     ;;
   rollback-upgrade)
     [[ "$confirm_rollback" == true ]] || die "explicit rollback confirmation is required; rerun with --confirm-rollback only after the user confirms"
-    [[ $(jq -r '.upgrade.rollbackBackup.status // empty' "$manifest") == passed ]] || die "verified per-ECS rollback backup is required"
-    [[ $(jq -r '.upgrade.rollbackBackup.targetCommit // empty' "$manifest") == "$commit" ]] || die "rollback backup does not belong to the current upgrade target"
-    [[ $(jq -r '(.upgrade.databaseMigration.applied // []) | length' "$manifest") == 0 ]] || die "one-click application rollback is blocked after database migrations; use a reviewed recovery plan"
+    require_current_upgrade_backup "$manifest"
+    require_unmutated_database_for_rollback "$manifest"
     rollback_nodes='[]'
     for instance in "${instances[@]}"; do
-      if ! result=$(run_cloud "$instance" 'set -euo pipefail
-backup_archive=/opt/autowonder/upgrade-rollback-backup.tar.gz
+      expected_backup_sha=$(jq -er --arg instance "$instance" '.upgrade.rollbackBackup.nodes[] | select(.instanceId == $instance) | .sha256' "$manifest")
+      if ! result=$(run_cloud "$instance" "set -euo pipefail
+expected_sha='$expected_backup_sha'
+"'backup_archive=/opt/autowonder/upgrade-rollback-backup.tar.gz
 test -f "$backup_archive"
+test "$(sha256sum "$backup_archive" | awk "{print \$1}")" = "$expected_sha"
 restore_dir=$(mktemp -d /opt/autowonder/.upgrade-restore.XXXXXX)
 cleanup() { rm -rf "$restore_dir"; }
 trap cleanup EXIT
@@ -330,9 +369,9 @@ exit 1'); then
       unset value
     fi
     recommended_runtime_version=$(jq -er '
-      .recommendedRuntimeVersion // empty |
+      .upgrade.targetRecommendedRuntimeVersion // empty |
       select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"))
-    ' "$manifest") || die "recommendedRuntimeVersion must be a semantic version"
+    ' "$manifest") || die "target recommended runtime version is missing from the approved upgrade plan"
     normalized_env=$(mktemp "${env_file}.tmp.XXXXXX"); TEMP_FILES+=("$normalized_env")
     awk -v key="AUTOWONDER_RUNTIME_RECOMMENDED_VERSION" -v value="$recommended_runtime_version" '
       index($0, key "=") == 1 { if (!written) print key "=" value; written=1; next }
@@ -439,7 +478,7 @@ printf 'TABLE_COUNT=%s\\nTEMPLATE_COUNT=%s\\nPOSTCHECK=passed\\n' \"\$count\" \"
     [[ $(jq '[.upgrade.pendingMigrations[].riskOperations[]? | select(. == "DROP" or . == "TRUNCATE" or . == "RENAME")] | length' "$manifest") == 0 ]] || die "destructive migration detected; a maintenance workflow is required instead of rolling activation"
     [[ "$confirm_rolling_compatible" == true ]] || die "explicit active-version compatibility confirmation is required"
     [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "target commit must be an exact SHA"
-    atomic_jq "$manifest" '.upgrade.migrationApproved=true | .upgrade.databaseCompatibility={status:"rolling-compatible",rollingAllowed:true,destructive:false} | .upgrade.databaseMigration={status:"running",applied:[]}'
+    atomic_jq "$manifest" '.upgrade.migrationApproved=true | .upgrade.databaseMutationStarted=true | .upgrade.databaseCompatibility={status:"rolling-compatible",rollingAllowed:true,destructive:false} | .upgrade.databaseMigration={status:"running",applied:[]}'
 
     migration_remote="$remote_db_prelude
 release=/opt/autowonder/releases/$short_commit
@@ -511,6 +550,11 @@ printf 'MIGRATIONS_APPLIED=%s\\n' '$pending_count'"
     [[ $(jq -r '.mode // empty' "$manifest") == upgrade ]] || die "rolling upgrade requires upgrade mode"
     [[ $(jq -r '(.upgrade.blockedReasons // []) | length' "$manifest") == 0 ]] || die "upgrade plan has blocking findings"
     [[ $(jq -r '.deployment.lastRun.mode // empty' "$manifest") == stage-only ]] || die "stage-only release must be installed before rolling upgrade"
+    jq -e '
+      .runtimeConfig.prepared == true and
+      .runtimeConfig.recommendedRuntimeVersion == .upgrade.targetRecommendedRuntimeVersion and
+      .runtimeConfig.envSha256 == .deployment.lastRun.envSha256
+    ' "$manifest" >/dev/null || die "target runtime environment checkpoint is incomplete or stale"
     migration_status=$(jq -r '.upgrade.databaseMigration.status // empty' "$manifest")
     [[ "$migration_status" == passed || "$migration_status" == not-required ]] || die "database migration checkpoint is incomplete"
     if [[ "$migration_status" == passed ]]; then

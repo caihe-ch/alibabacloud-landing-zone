@@ -1,12 +1,14 @@
+#requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$Profile = 'default',
+    [string]$Profile = 'auto-wonder',
     [string]$Region = 'cn-beijing',
     [string]$ExpectedAccountId
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib.ps1')
+if ($Profile -ne 'auto-wonder') { throw 'Only the auto-wonder Alibaba Cloud CLI profile is allowed' }
 
 $requirements = [ordered]@{
     git = 'Git.Git'
@@ -63,15 +65,7 @@ foreach ($tool in $requirements.Keys) {
 
 $terraformCliConfig = & (Join-Path $PSScriptRoot 'configure-terraform-acceleration.ps1')
 
-try {
-    Import-AliyunCredential -Profile $Profile -Region $Region
-    $identity = Assert-AliyunIdentity -Profile $Profile -ExpectedAccountId $ExpectedAccountId
-} catch {
-    & (Get-AliyunExecutable) configure --profile $Profile --mode OAuth
-    if ($LASTEXITCODE -ne 0) { throw 'Alibaba Cloud OAuth login failed' }
-    Import-AliyunCredential -Profile $Profile -Region $Region
-    $identity = Assert-AliyunIdentity -Profile $Profile -ExpectedAccountId $ExpectedAccountId
-}
+$identity = Ensure-AutoWonderAliyunProfile -Region $Region -ExpectedAccountId $ExpectedAccountId
 
 [pscustomobject]@{
     platform = 'windows'

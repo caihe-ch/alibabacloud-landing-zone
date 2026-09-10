@@ -40,38 +40,41 @@ required for a community build and runtime.
    - the root `.agents/` directory is part of the community distribution; both
      `skills/` and `.agents/` must be synced to the external GitHub repository
      under `ai-sdlc/auto-wonder/`.
-5. Do not preserve a community difference when the new master implementation is
+5. The root `e2e-tests/` directory is a community-owned verification boundary
+   and is an explicit exception to rule 3. During an upstream sync, never copy,
+   merge, cherry-pick, restore, or otherwise import `origin/master` E2E files or
+   directories into `community`. Preserve the complete `e2e-tests/` tree from
+   the pre-sync community commit without modification. If the directory did not
+   exist in that commit, the sync must not introduce it from master. Community
+   E2E changes require a separate, intentional community-owned change and must
+   not be bundled into an upstream sync.
+6. Do not preserve a community difference when the new master implementation is
    already community-compatible.
-6. Do not silently drop a master feature to make a conflict easier to resolve.
-7. Preserve unrelated local and untracked files.
-8. Apply [docs-policy.md](docs-policy.md) to every upstream documentation change;
+7. Do not silently drop a master feature to make a conflict easier to resolve.
+8. Preserve unrelated local and untracked files.
+9. Apply [docs-policy.md](docs-policy.md) to every upstream documentation change;
    do not restore excluded development history in `community`.
-9. Review every upstream configuration or operational change against the
+10. Review every upstream configuration or operational change against the
    deployment Skill, environment templates, deployment scripts, and operator
    guidance. Update those assets in the same sync when their contract changes.
    Do not infer configuration completeness from a successfully merged properties
    class: compare every upstream configuration file and key explicitly.
-10. Complete an independent post-sync review before pushing. The reviewer must
+11. Complete an independent post-sync review before pushing. The reviewer must
     look for missed master behavior, incorrect conflict resolution, unintended
     community divergence, and incomplete external-repository output.
-11. When upstream changes database DDL, synchronize the corresponding immutable
+12. When upstream changes database DDL, synchronize the corresponding immutable
     incremental SQL into `docs/migration/`. Updating the full schema alone is not
     sufficient. Previously published migrations must not be modified, renamed,
     or deleted.
-12. After every sync, verify runtime and deployment version consistency across
-    all sources of truth. At minimum, confirm that these values agree:
-    - `application.yml` → `autowonder.runtime.recommended-version` default;
-    - `skills/deploying-autowonder-on-alibaba-cloud/assets/templates/deployment-manifest.json`
-      → `recommendedRuntimeVersion`;
-    - `skills/deploying-autowonder-on-alibaba-cloud/tests/test_manifest.py`;
-    - `skills/deploying-autowonder-on-alibaba-cloud/tests/test_script_contracts.py`;
-    - `skills/upgrading-autowonder-on-alibaba-cloud/tests/test_upgrade_info.py`
-      → `recommendedRuntimeVersion` fixtures and assertions.
-
-    Both deploy and upgrade Skills must reference the same runtime version so
-    that fresh deployments and upgrades converge to the correct executor release.
-    A mismatch means external deployments or upgrades will install an outdated
-    runtime version. Treat this as a blocking sync defect.
+13. After every sync, verify that `application.yml` →
+    `autowonder.runtime.recommended-version` remains the single source of truth
+    for the recommended runtime version. The deployment manifest template must
+    not hard-code that version. Both deploy and upgrade Skills must derive it
+    from the exact source release, validate it, record the resolved value in the
+    working manifest for audit and resume, and update
+    `AUTOWONDER_RUNTIME_RECOMMENDED_VERSION` before application activation or
+    restart. A missing, invalid, or independently maintained value is a blocking
+    sync defect.
 
 ## Conflict Decisions
 
@@ -92,15 +95,25 @@ conflict. Automatic merge success does not prove semantic compatibility.
 ```bash
 git status --short --branch
 git fetch origin master community --prune
+community_before_sync=$(git rev-parse HEAD)
 git rev-parse origin/master
 git log --oneline <recorded-baseline>..origin/master
 git diff --name-only <recorded-baseline>..origin/master
 git merge --no-ff origin/master
+git diff --exit-code "$community_before_sync" -- e2e-tests/
 ```
+
+The final command is a mandatory community E2E preservation gate. Any output or
+non-zero exit status means the upstream sync changed `e2e-tests/` and is a
+blocking defect. Restore the entire path to the exact pre-sync community tree
+(or remove it when it was absent before the sync), then rerun the gate. Do not
+resolve the failure by copying any part of `origin/master:e2e-tests/`.
 
 After the merge:
 
-1. Review master-only commits and every file changed on both sides.
+1. Review master-only commits and every file changed on both sides. Confirm that
+   `e2e-tests/` is identical to `$community_before_sync`; do not review or adapt
+   master E2E content for inclusion in community.
 2. Filter documentation through [docs-policy.md](docs-policy.md).
 3. Verify schema, configuration, encryption, OSS/SLS, optional integrations,
    frontend contracts, and tests.
@@ -141,7 +154,99 @@ After the merge:
    frontend tests/build, deployment Skill tests, and internal-reference scans.
    Run Maven verification and standalone frontend gates serially because both
    use the same `frontend/node_modules` directory.
-6. Run an independent sync review after conflict resolution and verification.
+6. **Mandatory Agent E2E lifecycle.** After merge/conflict resolution and the
+   static gates, but before advancing the synchronized baseline or pushing
+   `community`, run the final community image from the exact pending-merge
+   worktree:
+
+   ```bash
+   ./e2e-tests/verify.sh --start --project-root "$(pwd -P)" --mode image --keep-on-failure
+   ```
+
+   `--project-root` is always a filesystem path, never a branch name. The Agent
+   must not fetch, checkout, or merge as part of this command. The lifecycle
+   owns host prerequisite detection/installation, port-conflict resolution,
+   compilation, final-image construction, isolated MySQL/Redis/MinIO startup,
+   fresh-schema import and verification, Spring Boot startup, standard probes,
+   and cleanup. Follow [the Agent E2E guide](../../e2e-tests/AGENT_GUIDE.md)
+   rather than inventing alternate startup commands.
+
+   The Agent must perform this evidence loop:
+
+   1. Record the paths printed before long-running work begins. At minimum retain
+      `BOOTSTRAP_LOG`, `BUILD_LOG`, `IMAGE_BUILD_LOG`, `COMPOSE_LOG`,
+      `MYSQL_LOG`, `REDIS_LOG`, `MINIO_LOG`, `SPRING_BOOT_CONSOLE_LOG`,
+      `SPRING_BOOT_FILE_LOG`, `STARTUP_DIAGNOSTIC_LOG`, `FAILURE_REPORT`, and
+      `RESULT_JSON`. A log-path announcement is not a success result; wait for
+      the final `LIFECYCLE|END|PASS` or `LIFECYCLE|END|FAIL` record.
+   2. After `VERDICT=STARTED`, read `runtime.json` for the tested Git commit and
+      dirty state, application image, resolved platform/MySQL/Redis/MinIO ports,
+      URLs, Compose project/network, and log paths. Read only the individual
+      credential values needed for a check from `runtime.env`, which must have
+      mode `0600`. Never source or print that file, and never copy its values to
+      ordinary logs, chat, screenshots, reports, or command arguments.
+   3. Confirm service and health state through the standard lifecycle command:
+
+      ```bash
+      ./e2e-tests/verify.sh --status --project-root "$(pwd -P)"
+      ```
+
+      Inspect `compose.log` and the MySQL/Redis/MinIO logs for container state;
+      inspect `schema-verification.txt` and `probes.txt` under `RUN_STATE_DIR`
+      for database/schema and startup-probe evidence. For sync-specific DDL or
+      service changes, use the resolved connection metadata and credentials
+      without exposing them, and record the query/assertion result rather than
+      the secret-bearing command.
+   4. Perform the sync-specific human-style UI journey and/or API requests using
+      the platform URL in `runtime.json`. While exercising the platform, follow
+      Spring Boot output when useful:
+
+      ```bash
+      ./e2e-tests/verify.sh --logs --follow --project-root "$(pwd -P)"
+      ```
+
+      Correlate unexpected behavior with `spring-boot-console.log`,
+      `auto-wonder.log`, and `startup-diagnostic.log`; do not declare success
+      from an HTTP health response alone.
+   5. Run the mandatory final gate after all Agent-driven interaction:
+
+      ```bash
+      ./e2e-tests/verify.sh --check --project-root "$(pwd -P)"
+      ```
+
+      This rechecks health, executes the authenticated functional chain, checks
+      database-backed behavior, and scans ERROR/WARN records with request-ID
+      attribution. Success requires command exit 0, `VERDICT=PASS`, a passing
+      `result.json`, `FAIL_COUNT=0` in `authchain.txt`, and zero unattributed
+      ERROR/WARN records in `log-scan-attributed.txt`. `VERDICT=STARTED` alone is
+      never a release or synchronization verdict.
+   6. Always archive evidence and remove only this run's resources when analysis
+      is complete, whether startup/check passed or failed:
+
+      ```bash
+      ./e2e-tests/verify.sh --clean-up --project-root "$(pwd -P)"
+      ```
+
+      Verify the teardown report has zero owned containers, volumes, network,
+      and port listeners. If startup failed before Compose was attempted,
+      `STATE_ONLY` cleanup is expected and does not require Docker.
+
+      When investigation must pause before cleanup, stop only this run while
+      preserving its state, then resume analysis or clean it later:
+
+      ```bash
+      ./e2e-tests/verify.sh --stop --project-root "$(pwd -P)"
+      ```
+
+      `--stop` does not replace the final `--clean-up` requirement.
+
+   Add the run ID, tested commit/dirty state, resolved ports, Maven/test result,
+   image/startup result, schema result, Agent UI/API scenarios, authenticated
+   check counts, attributed and unattributed ERROR/WARN counts, final verdict,
+   evidence archive path, and cleanup residue counters to
+   [upstream-sync-log.md](upstream-sync-log.md). Any failure or unexplained
+   diagnostic is a blocking sync defect.
+7. Run an independent sync review after conflict resolution and verification.
    At minimum, the review must:
    - prove the fetched `origin/master` baseline is an ancestor of `community`;
    - compare the upstream changed-file list with the final master/community tree
@@ -150,14 +255,16 @@ After the merge:
      master behavior or unintended community behavior;
    - recheck community boundaries, deployment-asset impact, and documentation
      policy;
+   - prove `git diff --exit-code "$community_before_sync" -- e2e-tests/`
+     succeeds, so no master E2E file or directory entered the community tree;
    - verify the external-repository copy against `community` when external output
      is part of the sync.
 
    Fix all critical or important findings before moving the baseline or pushing.
-7. Update [upstream-sync-log.md](upstream-sync-log.md) with exact full commit IDs,
+8. Update [upstream-sync-log.md](upstream-sync-log.md) with exact full commit IDs,
    scope, conflict decisions, deployment-impact conclusion, independent-review
    conclusion, and verification results.
-8. Commit the log update separately, push `community`, and confirm local HEAD
+9. Commit the log update separately, push `community`, and confirm local HEAD
    equals `origin/community`.
 
 ## Required Release File
@@ -195,6 +302,8 @@ Record at least:
 - resulting merge commit;
 - important feature scope;
 - overlapping files and their decisions;
+- confirmation that the community `e2e-tests/` tree is byte-for-byte unchanged
+  from the pre-sync community commit and contains no imported master E2E assets;
 - decisions still requiring confirmation;
 - deployment Skill, deployment script, environment-template, and operator-doc
   impact, including an explicit no-change conclusion when applicable;

@@ -23,7 +23,7 @@ provider_installation {
 '@
 $temporary = "$configFile.$([guid]::NewGuid().ToString('N')).tmp"
 try {
-    Set-Content -LiteralPath $temporary -Value $content -Encoding utf8NoBOM
+    [IO.File]::WriteAllText($temporary, $content, (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $temporary -Destination $configFile -Force
 } finally {
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }

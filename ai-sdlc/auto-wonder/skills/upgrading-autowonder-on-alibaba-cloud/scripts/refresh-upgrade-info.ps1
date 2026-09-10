@@ -8,10 +8,9 @@ $ErrorActionPreference = 'Stop'
 $DeploySkill = Join-Path $PSScriptRoot '..\..\deploying-autowonder-on-alibaba-cloud'
 . (Join-Path $DeploySkill 'scripts\windows\lib.ps1')
 $manifestData = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
-$profile = if ($manifestData.cloudProfile) { [string]$manifestData.cloudProfile } else { 'default' }
+$profile = 'auto-wonder'
 $region = [string]$manifestData.region
-Import-AliyunCredential -Profile $profile -Region $region
-Assert-AliyunIdentity -Profile $profile | Out-Null
+Ensure-AutoWonderAliyunProfile -Region $region | Out-Null
 $protectedEnv = [string]$manifestData.localContext.protectedEnvFile
 if ($protectedEnv -and [IO.Path]::IsPathRooted($protectedEnv)) {
     $terraformConfig = Join-Path (Split-Path -Parent $protectedEnv) 'terraform.rc'

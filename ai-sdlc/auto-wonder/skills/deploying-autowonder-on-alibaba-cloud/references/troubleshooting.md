@@ -14,13 +14,14 @@ path, add a guessed suffix, adopt the bucket, or fall back to local state.
 
 ## Known Failure Patterns
 
-### Active Alibaba Cloud Profile Cannot Refresh
+### AutoWonder Alibaba Cloud Profile Cannot Refresh
 
 **Symptom:** identity preflight fails with a credential refresh HTTP error.
-**Cause:** the active local profile is stale while another existing profile is
-valid. **Safe fix:** verify account identity read-only and rerun preflight with
-`--profile <verified-name>`. **Unsafe:** rewriting global credentials or selecting
-a profile without matching account identity. **Resume:** preflight.
+**Cause:** the dedicated `auto-wonder` profile is missing or stale. **Safe fix:**
+let preflight run OAuth for `auto-wonder`, overwrite that profile's identity,
+and repeat the STS account check. **Unsafe:** falling back to the CLI current or
+`default` profile, or selecting another profile because it happens to be valid.
+**Resume:** preflight.
 
 ### Terraform Provider Distribution Is Unreachable
 

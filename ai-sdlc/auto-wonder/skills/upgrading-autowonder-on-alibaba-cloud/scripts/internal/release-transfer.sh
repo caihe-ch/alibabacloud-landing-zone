@@ -50,9 +50,11 @@ json_validate "$manifest"; reject_secret_keys "$manifest"
 if [[ "$stage_only" == true && $(jq -r '.mode // empty' "$manifest") == upgrade ]]; then
   [[ $(jq -r '.upgrade.environmentContractChecked // false' "$manifest") == true ]] || die "candidate upgrade environment must be checked by plan-upgrade.sh --env-file before staging"
   [[ $(jq -r '.upgrade.environmentValidated // false' "$manifest") == true ]] || die "candidate upgrade environment must be validated by plan-upgrade.sh --env-file before staging"
+  jq -e '
+    .runtimeConfig.prepared == true and
+    .runtimeConfig.recommendedRuntimeVersion == .upgrade.targetRecommendedRuntimeVersion
+  ' "$manifest" >/dev/null || die "target runtime environment must be prepared before staging"
   [[ $(jq -r '(.upgrade.blockedReasons // []) | length' "$manifest") == 0 ]] || die "blocked upgrade plan cannot be staged"
-  [[ $(jq -r '.upgrade.rollbackBackup.status // empty' "$manifest") == passed ]] || die "verified per-ECS rollback backup is required before upgrade staging"
-  [[ $(jq -r '.upgrade.rollbackBackup.targetCommit // empty' "$manifest") == $(jq -r '.repositoryCommit' "$manifest") ]] || die "rollback backup does not match the upgrade target"
 fi
 configure_cloud_profile "$manifest"
 region=$(json_string "$manifest" '.region'); deployment_id=$(json_string "$manifest" '.deploymentId')
@@ -61,6 +63,7 @@ if [[ "$transfer_scope" == upgrade ]]; then
   UPGRADE_SKILL_DIR=$(cd -- "$SCRIPT_DIR/../../../upgrading-autowonder-on-alibaba-cloud" && pwd)
   source "$UPGRADE_SKILL_DIR/scripts/upgrade-lib.sh"
   require_upgrade_approval "$manifest"
+  require_current_upgrade_backup "$manifest"
 fi
 bucket=$(jq -er '.resources.package_bucket // .resources.packageBucket // empty' "$manifest") || die "package bucket missing from inventory"
 all_instances=()

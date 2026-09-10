@@ -42,17 +42,7 @@ resolve_upgrade_project_source_dir() {
 }
 
 workspace_content_identity() {
-  local supplied=$1 root material
-  root=$(cd -- "$supplied" && pwd)
-  material=$(mktemp); TEMP_FILES+=("$material")
-  find "$root" -type f \
-    -not -path '*/.git/*' -not -path '*/target/*' -not -path '*/node_modules/*' \
-    -not -path '*/frontend/dist/*' -not -path '*/upgrade-info/*' \
-    -not -path '*/__pycache__/*' -not -name '.DS_Store' -print |
-    LC_ALL=C sort | while IFS= read -r file; do
-      printf '%s\t%s\n' "${file#"$root"/}" "$(sha256_file "$file")"
-    done >"$material"
-  sha256_file "$material" | cut -c1-40
+  python3 -B "$UPGRADE_SCRIPT_DIR/upgrade_plan.py" content-identity --source-dir "$1"
 }
 
 resolve_active_commit_from_prefix() {
@@ -79,15 +69,21 @@ resolve_active_commit_from_prefix() {
 }
 
 calculate_upgrade_plan_fingerprint() {
-  local manifest=$1 material
-  material=$(mktemp); TEMP_FILES+=("$material")
-  jq -cS '.upgrade | ({
-    fromCommit,toCommit,targetRef,remote,forceRedeploy,commits,changedFiles,
-    environment,pendingMigrations,blockedReasons,confirmationRequired,environmentContractChecked,
-    environmentPlanSha256,databaseDestructive:.databaseCompatibility.destructive,
-    targetVerificationFingerprint:.targetVerification.fingerprint
-  } + (if .resourceSetFingerprint then {resourceSetFingerprint} else {} end))' "$manifest" >"$material"
-  sha256_file "$material"
+  python3 -B "$UPGRADE_SCRIPT_DIR/upgrade_plan.py" fingerprint --manifest "$1"
+}
+
+upsert_candidate_runtime_recommended_version() {
+  local env_file=$1 version=$2 normalized
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || \
+    die "target recommended runtime version must be semantic"
+  normalized=$(mktemp "${env_file}.tmp.XXXXXX"); TEMP_FILES+=("$normalized")
+  awk -v key="AUTOWONDER_RUNTIME_RECOMMENDED_VERSION" -v value="$version" '
+    index($0, key "=") == 1 { if (!written) print key "=" value; written=1; next }
+    { print }
+    END { if (!written) print key "=" value }
+  ' "$env_file" >"$normalized"
+  chmod 600 "$normalized"
+  mv -f -- "$normalized" "$env_file"
 }
 
 calculate_target_verification_fingerprint() {
@@ -98,9 +94,11 @@ calculate_target_verification_fingerprint() {
     --arg vpcId "$(jq -r '.resources.vpc_id // empty' "$manifest")" \
     --argjson tags "$(jq -c '.resources.expected_tags // .tags // {}' "$manifest")" \
     --argjson manifestInstanceIds "$(jq -c '(.resources.ecs_instance_ids // .resources.ecsInstanceIds // {}) | [.[]] | unique | sort' "$manifest")" \
+    --arg tagVerificationMode "$(jq -r '.upgradeInfo.tagVerificationMode // empty' "$manifest")" \
     --argjson nodes "$nodes" \
     '{region:$region,deploymentId:$deploymentId,vpcId:$vpcId,tags:$tags,
-      manifestInstanceIds:$manifestInstanceIds,nodes:($nodes|sort_by(.instanceId))}' >"$material"
+      manifestInstanceIds:$manifestInstanceIds,nodes:($nodes|sort_by(.instanceId))} +
+      (if $tagVerificationMode != "" then {tagVerificationMode:$tagVerificationMode} else {} end)' >"$material"
   sha256_file "$material"
 }
 
@@ -138,6 +136,27 @@ require_upgrade_approval() {
   local manifest=$1
   require_current_target_verification "$manifest"
   require_upgrade_plan_approval "$manifest"
+}
+
+require_unmutated_database_for_rollback() {
+  jq -e '
+    (.upgrade.databaseMutationStarted != true) and
+    (((.upgrade.databaseMigration.applied // []) | length) == 0) and
+    ((.upgrade.databaseMigration.status // "pending") as $status |
+      (["running", "failed", "passed", "applied"] | index($status)) == null)
+  ' "$1" >/dev/null || die "application rollback is blocked after database migration starts; use a reviewed recovery plan"
+}
+
+require_current_upgrade_backup() {
+  jq -e '
+    (.resources.ecs_instance_ids // .resources.ecsInstanceIds | [.[]] | unique | sort) as $expected |
+    .upgrade as $upgrade | $upgrade.rollbackBackup as $backup |
+    ($expected | length) > 0 and $backup.status == "passed" and
+    $backup.planFingerprint == $upgrade.planFingerprint and
+    $backup.fromCommit == $upgrade.fromCommit and $backup.targetCommit == $upgrade.toCommit and
+    ($backup.nodes | length) == ($expected | length) and
+    ([$backup.nodes[] | select(.status == "passed" and (.sha256 | test("^[0-9a-f]{64}$"))) | .instanceId] | sort) == $expected
+  ' "$1" >/dev/null || die "verified per-ECS rollback backup must match the current plan and every target"
 }
 
 require_upgrade_acceptance_state() {

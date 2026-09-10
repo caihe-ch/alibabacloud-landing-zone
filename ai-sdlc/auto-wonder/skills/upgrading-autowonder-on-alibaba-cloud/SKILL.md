@@ -9,6 +9,13 @@ Upgrade an existing deployment created by `$deploying-autowonder-on-alibaba-clou
 Consume its sanitized manifest and live resource inventory; never recreate cloud
 resources, ask the user to retype ECS IDs, or infer targets from names alone.
 
+`deployment.activeCommit` is the immutable active **release identity** retained
+for compatibility; a workspace deployment uses a JAR content hash, not a Git
+commit. Never relabel that identity as a guessed commit. Both platform planners
+use `scripts/upgrade_plan.py` to compare a real Git baseline or verified sealed
+artifacts with the exact target Git commit. Read the runbook's release-baseline
+recovery procedure for historical workspace deployments.
+
 ## Trigger And Boundary
 
 When the operator explicitly prohibits all Git inspection and requests a
@@ -18,6 +25,9 @@ immutable release identity from the sorted current-workspace file set, excludes
 generated/build/VCS directories without reading VCS metadata, and retains the
 normal verification, approval, backup, staging, rollout, and acceptance gates.
 Never invoke a Git command in this mode.
+Require the recorded active release version and verified sealed baseline. This
+same-version mode rejects any migration-file difference; it must never hide
+pending migrations by substituting an empty migration list.
 On POSIX invoke every Skill shell entrypoint through `bash`; copied files may
 retain macOS quarantine metadata even when executable bits are present.
 The upgrade build wrapper must copy the versioned target systemd unit into the
@@ -106,7 +116,8 @@ Run these steps in order when upgrade starts:
 2. On every upgrade run, execute `scripts/refresh-upgrade-info.sh --manifest
    "$MANIFEST" --project-root <current-workspace>` (or the paired PowerShell
    adapter) before cloud verification or planning. The refresh entrypoint must
-   validate STS and load credentials from the manifest-recorded CLI profile
+   normalize `cloudProfile` to the dedicated `auto-wonder` CLI profile, validate
+   STS through the deployment bootstrap, and load that profile's credentials
    before initializing Terraform; never rely on ambient credentials. Reuse the recorded parsing
    rule, but always refresh Terraform outputs so newly scaled ECS nodes cannot be
    missed. Support local state and OSS remote state. Historical backend files may
@@ -118,12 +129,14 @@ Run these steps in order when upgrade starts:
    `.resources.ecs_instance_ids`, VPC/inventory data, and `.localContext` source,
    protected-env and Terraform-directory references from the refreshed working
    manifest. Treat its resource set fingerprint as part of the plan identity.
-4. Run the deployment skill's platform bootstrap with the recorded profile.
+4. Run the deployment skill's platform bootstrap with the fixed `auto-wonder`
+   profile. Never use the CLI current profile, `default`, or a historical
+   manifest profile.
    It probes `sts GetCallerIdentity`. If the CLI profile is missing, logged out,
-   or expired, automatically run `aliyun configure --profile <PROFILE> --mode
+   or expired, automatically run `aliyun configure --profile auto-wonder --mode
    OAuth` and then repeat STS validation. This also returns the session
    environment file; load it before later local phases.
-5. Verify the selected CLI profile with STS and compare the Terraform ECS set
+5. Verify the `auto-wonder` CLI profile with STS and compare the Terraform ECS set
    with the complete tagged cloud ECS set before any Cloud Assistant operation.
    Require exact set equality; do not verify only IDs already present in a cached
    manifest. Verify every ECS against the
@@ -139,7 +152,7 @@ Run these steps in order when upgrade starts:
    已登录。” Stop and wait. Accept “已登录”, “登录好了”, “已重新登录”, or an
    equivalent natural-language confirmation that the browser login is complete;
    do not require an exact confirmation phrase. Then automatically rerun OAuth
-   for the same recorded profile so it will overwrite the previous CLI login,
+   for `auto-wonder` so it will overwrite the previous CLI login,
    rerun `sts GetCallerIdentity`, and repeat target verification. Never continue
    with the previously verified wrong account.
 6. If refresh or live verification finds newly scaled ECS, update the working
@@ -153,7 +166,10 @@ Run these steps in order when upgrade starts:
    after the user supplies the top-level deployment folder, stop with one
    sanitized blocked report naming the missing fields and recovery evidence.
 8. Run `scripts/upgrade-operations.sh upgrade-inventory` to reconcile every
-   node's active release. Stop when nodes disagree or the manifest commit differs.
+   node's active release (the paired `.ps1` on Windows). Record each node's
+   `jarSha256` and `migrationsSha256` from the active release. Stop when nodes
+   disagree in identity or content, an archive is missing, or the manifest
+   identity differs. A workspace baseline must match these live artifact hashes.
 9. Never ask the user for a target Git ref. Fetch `origin/master`, verify that
    `origin` matches the manifest repository, and use an isolated clean detached
    worktree pinned to that exact remote commit. Resolve the AutoWonder project
@@ -169,6 +185,12 @@ Run these steps in order when upgrade starts:
    preserve every normal plan, approval, backup, staging, activation, and
    acceptance gate. If they differ, run the planner normally. Do not block
    because of Git ancestry and do not ask for a branch, tag, or commit.
+   For a workspace release, retain the active content identity and let the
+   planner recover its environment/migration baseline from hash-verified sealed
+   artifacts. An empty historical `repositoryUrl` is accepted only for the
+   explicit AutoWonder repository allowlist in the shared planner; never trust
+   an arbitrary local `origin`. A missing historical artifact is a blocked
+   recovery condition, not permission to change the active identity or skip DDL.
 10. Generate one consolidated plan covering source commits, changed features,
    environment keys, migrations and DDL risk, backup/compatibility gates, build,
    node order, acceptance, rollback boundary, and the plan fingerprint. When
@@ -199,12 +221,23 @@ every ECS:
 scripts/upgrade-operations.sh upgrade-backup --manifest "$MANIFEST"
 ```
 
-Each run keeps exactly one backup archive per ECS at
-`/opt/autowonder/upgrade-rollback-backup.tar.gz` and atomically overwrites the
-previous backup only after the replacement archive and checksums validate.
-Upgrade staging is blocked until this backup matches the approved target plan.
+Keep exactly one backup archive per ECS at
+`/opt/autowonder/upgrade-rollback-backup.tar.gz`. A retry of the same plan reuses
+the original verified archive; a new plan replaces it atomically only after
+the active release and replacement checksums validate. Staging and rollback
+require backup coverage of every target, bound to the current plan. Rollback
+also checks the recorded archive SHA-256 before restoring any files.
 Validate the candidate protected
 environment file with:
+
+On every upgrade, derive `autowonder.runtime.recommended-version` from the exact
+target source `src/main/resources/application.yml`, update
+`AUTOWONDER_RUNTIME_RECOMMENDED_VERSION` in the protected candidate environment,
+and bind its version and resulting file hash to the approved plan. The
+`runtime-config` checkpoint must match that target-derived version before stage;
+stage installs the candidate on every ECS before any rolling restart. A resumed
+stage or rolling activation must revalidate this checkpoint and cannot reuse a
+historical manifest runtime version.
 
 ```bash
 scripts/upgrade-operations.sh runtime-config \
@@ -246,7 +279,8 @@ scripts/upgrade-operations.sh rollback-upgrade \
 
 The command restores the backed-up release, protected environment, and systemd
 unit sequentially on every ECS and verifies local health. It is blocked after
-database migrations; those require a separately reviewed recovery plan and are
+database mutation starts, including a failed or interrupted migration; those
+require a separately reviewed recovery plan and are
 never reversed automatically.
 
 ## Resource Handoff Contract
@@ -254,7 +288,7 @@ never reversed automatically.
 The deployment manifest is the source of truth. New deployments and every
 Terraform inventory refresh must preserve at least:
 
-- deployment ID, environment, region, selected CLI profile, repository URL, and
+- deployment ID, environment, region, `cloudProfile: "auto-wonder"`, repository URL, and
   exact active commit;
 - ECS IDs plus VPC, VSwitch, private IP, expected tag, ALB, RDS, Redis, OSS, and
   SLS inventory where available;
@@ -262,6 +296,10 @@ Terraform inventory refresh must preserve at least:
   values;
 - Terraform state reference and inventory timestamp;
 - release hashes, Cloud Assistant invocation IDs, acceptance, and upgrade state.
+- `source.baseline` with its release identity, sealed artifact hashes,
+  environment contract and migration checksums; preserve the previous active
+  baseline during an unfinished upgrade even if the target build replaces
+  `source` and `artifacts`.
 
 Planned Terraform scale-out remains a deployment operation. After its inventory
 refresh and node initialization complete, the manifest contains the expanded ECS
@@ -269,8 +307,10 @@ set; the next upgrade automatically verifies and targets the complete set.
 
 ## Safety Rules
 
-- Use only the CLI profile and region recorded by deployment; refresh OAuth/STS
-  before cloud API calls. Never place AK/SK/STS values in the manifest or output.
+- Use only the dedicated `auto-wonder` CLI profile and the region recorded by
+  deployment; normalize historical or missing `cloudProfile` values and refresh
+  OAuth/STS before cloud API calls. Never place AK/SK/STS values in the manifest
+  or output.
 - A manifest is not sufficient by itself: verify live ECS identity and tags
   before planning and automatically refresh that read-only verification before
   every mutation. An unchanged target fingerprint preserves approval; any target
